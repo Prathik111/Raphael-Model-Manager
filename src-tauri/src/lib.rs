@@ -415,11 +415,8 @@ async fn download_file(
         if let Some(expected) = expected_sha256 {
             if let Ok(existing_hash) = sha256_file(&path) {
                 if existing_hash.eq_ignore_ascii_case(expected) {
-                    return Ok((
-                        path,
-                        fs::metadata(&path)?.len() as i64,
-                        existing_hash,
-                    ));
+                    let existing_size = fs::metadata(&path)?.len() as i64;
+                    return Ok((path, existing_size, existing_hash));
                 }
             }
         }
@@ -483,7 +480,6 @@ async fn download_file(
     Ok((path, total, actual_sha256))
 }
 
-#[tauri::command]
 #[tauri::command]
 async fn install_civitai_model(
     app: State<'_, AppStateInner>,
@@ -895,10 +891,30 @@ fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
                 Err(_) => return,
             };
 
-            match statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
-                Ok(rows) => rows.filter_map(Result::ok).collect(),
+            let mut rows = match statement.query([]) {
+                Ok(value) => value,
                 Err(_) => return,
+            };
+
+            let mut collected = Vec::new();
+            loop {
+                match rows.next() {
+                    Ok(Some(row)) => {
+                        let id: i64 = match row.get(0) {
+                            Ok(value) => value,
+                            Err(_) => return,
+                        };
+                        let path: String = match row.get(1) {
+                            Ok(value) => value,
+                            Err(_) => return,
+                        };
+                        collected.push((id, path));
+                    }
+                    Ok(None) => break,
+                    Err(_) => return,
+                }
             }
+            collected
         };
 
         for (id, path) in paths {
