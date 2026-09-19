@@ -500,6 +500,132 @@ fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn test_state(app_data: PathBuf, models_root: PathBuf) -> AppStateInner {
+        AppStateInner {
+            app_data,
+            models_root: Arc::new(RwLock::new(Some(models_root))),
+            watcher: Arc::new(Mutex::new(None)),
+            scan_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    #[test]
+    fn model_extensions_are_detected() {
+        assert!(is_model_file(Path::new("model.safetensors")));
+        assert!(is_model_file(Path::new("model.GGUF")));
+        assert!(is_model_file(Path::new("model.onnx")));
+        assert!(!is_model_file(Path::new("preview.png")));
+        assert!(!is_model_file(Path::new("README.txt")));
+    }
+
+    #[test]
+    fn nested_comfyui_roots_are_classified() {
+        let root = PathBuf::from(r"C:\ComfyUI\models");
+        assert_eq!(
+            file_type_from_path(&root.join(r"loras\characters\megumin\megumin.safetensors"), &root),
+            "LoRA"
+        );
+        assert_eq!(
+            file_type_from_path(&root.join(r"checkpoints\anime\model.safetensors"), &root),
+            "Checkpoint"
+        );
+        assert_eq!(
+            file_type_from_path(&root.join(r"controlnet\depth\model.safetensors"), &root),
+            "ControlNet"
+        );
+        assert_eq!(
+            file_type_from_path(&root.join(r"anything\else\model.gguf"), &root),
+            "Other"
+        );
+    }
+
+    #[test]
+    fn civitai_urls_parse_model_and_version() {
+        assert_eq!(
+            model_id_and_version("https://civitai.com/models/12345?modelVersionId=67890").unwrap(),
+            (12345, Some(67890))
+        );
+        assert_eq!(
+            model_id_and_version("https://civitai.com/models/12345").unwrap(),
+            (12345, None)
+        );
+        assert!(model_id_and_version("https://example.com/models/12345").is_err());
+        assert!(model_id_and_version("https://civitai.com/images/12345").is_err());
+    }
+
+    #[test]
+    fn civitai_types_map_to_comfyui_folders() {
+        assert_eq!(civitai_type_to_folder("Checkpoint"), "checkpoints");
+        assert_eq!(civitai_type_to_folder("LORA"), "loras");
+        assert_eq!(civitai_type_to_folder("LoCon"), "loras");
+        assert_eq!(civitai_type_to_folder("TextualInversion"), "embeddings");
+        assert_eq!(civitai_type_to_folder("Upscaler"), "upscale_models");
+        assert_eq!(civitai_type_to_folder("UnknownType"), "other");
+    }
+
+    #[test]
+    fn html_description_is_stripped_without_panicking() {
+        assert_eq!(
+            strip_html("<p>Hello &amp; world</p><strong>Raphael</strong>"),
+            "Hello & worldRaphael"
+        );
+    }
+
+    #[test]
+    fn recursive_scan_indexes_nested_models_and_removes_deleted_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let root = temp.path().join("models");
+        fs::create_dir_all(root.join("loras/characters/Megumin")).unwrap();
+        fs::create_dir_all(root.join("checkpoints/anime")).unwrap();
+        fs::write(root.join("loras/characters/Megumin/megumin.safetensors"), b"fake-lora").unwrap();
+        fs::write(root.join("checkpoints/anime/model.safetensors"), b"fake-checkpoint").unwrap();
+        fs::write(root.join("loras/characters/Megumin/preview.png"), b"not-a-model").unwrap();
+
+        let state = test_state(app_data.clone(), root.clone());
+        scan_root(&state, &root).unwrap();
+
+        let db = open_db(&app_data).unwrap();
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 2);
+
+        let lora_type: String = db.query_row(
+            "SELECT model_type FROM models WHERE relative_path LIKE '%megumin.safetensors'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(lora_type, "LoRA");
+
+        fs::remove_file(root.join("checkpoints/anime/model.safetensors")).unwrap();
+        scan_root(&state, &root).unwrap();
+
+        let count_after_delete: i64 =
+            db.query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0)).unwrap();
+        assert_eq!(count_after_delete, 1);
+    }
+
+    #[test]
+    fn database_schema_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = open_db(temp.path()).unwrap();
+        drop(first);
+        let second = open_db(temp.path()).unwrap();
+        let tables: i64 = second
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('settings','models','images')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 3);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
