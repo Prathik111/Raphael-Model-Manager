@@ -32,7 +32,9 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - run: npm install
       - run: npm run prepare:reference
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
       - run: cargo check --manifest-path src-tauri/Cargo.toml
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
   windows-package:
