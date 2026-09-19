@@ -1,0 +1,6 @@
+node_modules/
+dist/
+target/
+public/reference/
+*.log
+npm-debug.log*
