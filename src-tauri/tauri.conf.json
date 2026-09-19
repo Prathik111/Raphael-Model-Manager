@@ -39,6 +39,9 @@
       "msi",
       "nsis"
     ],
+    "icon": [
+      "icons/icon.ico"
+    ],
     "category": "Utility",
     "shortDescription": "ComfyUI and Civitai model manager",
     "longDescription": "Local-first ComfyUI model manager with Civitai installation, metadata, prompts and offline gallery caching.",
