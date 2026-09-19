@@ -32,6 +32,9 @@ keyring = { version = "3.6", features = ["windows-native"] }
 thiserror = "2"
 urlencoding = "2.1"
 
+[dev-dependencies]
+tempfile = "3.23"
+
 [profile.release]
 codegen-units = 1
 lto = true
