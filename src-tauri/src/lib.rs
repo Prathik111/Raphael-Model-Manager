@@ -444,39 +444,381 @@ async fn download_file(
 }
 
 #[tauri::command]
-async fn install_civitai_model(app:State<'_,AppStateInner>, handle:AppHandle, url:String)->AppResult<ModelRecord>{
-    let (model,version)=fetch_model_and_version(&app,&url).await?; let version_id=version.get("id").and_then(Value::as_i64); if let Some(vid)=version_id { let c0=open_db(&app.app_data)?; if let Ok(existing_id)=c0.query_row("SELECT id FROM models WHERE civitai_version_id=?1 AND path IS NOT NULL",[vid],|r|r.get::<_,i64>(0)){ return model_by_id(&c0,existing_id); } } let typ=model.get("type").and_then(Value::as_str).unwrap_or("Other").to_string(); let (dl,_,_)=selected_file(&version).ok_or_else(||AppError::Api("No downloadable public file found".into()))?; let root=app.models_root.read().unwrap().clone().ok_or_else(||AppError::Invalid("Choose your ComfyUI models folder first".into()))?; let target=root.join(civitai_type_to_folder(&typ)); let (path,size,hash)=download_file(&app,&dl,&target,&filename,sha256.as_deref()).await?;
-    let hash=sha256_file(&path).ok(); let c=open_db(&app.app_data)?; let rel=path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().replace("\\","/"); let tags=json_strings(model.get("tags")); let activation=json_strings(version.get("trainedWords")); let desc=model.get("description").and_then(Value::as_str).map(strip_html); let creator=model.get("creator").and_then(|v|v.get("username")).and_then(Value::as_str).map(str::to_string); let mid=model.get("id").and_then(Value::as_i64); let vid=version.get("id").and_then(Value::as_i64); let vname=version.get("name").and_then(Value::as_str).map(str::to_string); let base=version.get("baseModel").and_then(Value::as_str).map(str::to_string);
-    c.execute("INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(path) DO UPDATE SET size_bytes=excluded.size_bytes,modified_at=excluded.modified_at,civitai_model_id=excluded.civitai_model_id,civitai_version_id=excluded.civitai_version_id,civitai_url=excluded.civitai_url,civitai_name=excluded.civitai_name,version_name=excluded.version_name,base_model=excluded.base_model,creator=excluded.creator,description=excluded.description,tags_json=excluded.tags_json,activation_json=excluded.activation_json,source_hash=excluded.source_hash,updated_at=excluded.updated_at",params![path.to_string_lossy(),rel,path.file_name().unwrap_or_default().to_string_lossy(),typ,size,mtime(&path),mid,vid,url,model.get("name").and_then(Value::as_str),vname,base,creator,desc,serde_json::to_string(&tags).unwrap(),serde_json::to_string(&activation).unwrap(),hash,now()])?;
-    let rec=model_by_id(&c,c.query_row("SELECT id FROM models WHERE path=?1",[path.to_string_lossy().to_string()],|r|r.get(0))?)?; let _=handle.emit("models-changed",()); let _=sync_gallery_inner(app.inner().clone(),rec.id,handle.clone(),true).await; Ok(rec)
-}
+#[tauri::command]
+async fn install_civitai_model(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    url: String,
+) -> AppResult<ModelRecord> {
+    let (model, version) = fetch_model_and_version(&app, &url).await?;
+    let version_id = version.get("id").and_then(Value::as_i64);
 
-fn parse_meta(meta:&Value,key:&str)->Option<String>{meta.get(key).and_then(Value::as_str).map(str::to_string)}
-async fn sync_gallery_inner(app:AppStateInner, model_id:i64, handle:AppHandle, force: bool)->AppResult<()> {
-    { let c=open_db(&app.app_data)?; let cached:i64=c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1",[model_id],|r|r.get(0))?; let missing:i64=c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1 AND local_path IS NULL",[model_id],|r|r.get(0))?; if !force && cached>0 && missing==0 { return Ok(()); } }
-    let model=model_by_id(&open_db(&app.app_data)?,model_id)?; let civitai_id=match model.civitai_model_id{Some(x)=>x,None=>return Ok(())}; let cache=cache_root(&app.app_data).join(civitai_id.to_string()); fs::create_dir_all(&cache)?; let mut cursor:Option<String>=None; let client=civitai_client(&app)?;
-    loop {
-        let mut url=format!("{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true"); if let Some(c)=&cursor{url.push_str("&cursor=");url.push_str(&urlencoding::encode(c));}
-        let mut req=client.get(&url); if let Some(t)=token(){req=req.bearer_auth(t);} let res=req.send().await?; if !res.status().is_success(){return Err(AppError::Api(format!("Image API returned {}",res.status())))} let body:CivitaiEnvelope=res.json().await?; let db=open_db(&app.app_data)?;
-        for img in body.items { let iid=match img.get("id").and_then(Value::as_i64){Some(x)=>x,None=>continue}; let remote=img.get("url").and_then(Value::as_str).unwrap_or(""); let ext=remote.split('?').next().and_then(|x|Path::new(x).extension()).and_then(|x|x.to_str()).unwrap_or("jpg"); let local=cache.join(format!("{}.{}",iid,ext)); let thumb=cache.join(format!("{}_thumb.webp",iid));
-            let mut local_path=None; if local.exists(){local_path=Some(local.to_string_lossy().to_string())} else if !remote.is_empty(){ if let Ok(resp)=client.get(remote).send().await { if let Ok(resp)=resp.error_for_status() { if let Ok(bytes)=resp.bytes().await { let _=fs::write(&local,&bytes); local_path=Some(local.to_string_lossy().to_string()); } } } }
-            if local_path.is_some() && !thumb.exists(){ if let Some(lp)=&local_path { if let Ok(im)=image::open(lp){let t=im.resize(420,420,FilterType::Triangle); let _=t.save_with_format(&thumb,image::ImageFormat::WebP); } } }
-            let meta=img.get("meta").cloned().unwrap_or(Value::Null); let prompt=parse_meta(&meta,"prompt"); let neg=parse_meta(&meta,"negativePrompt").or_else(||parse_meta(&meta,"Negative prompt")); let sampler=parse_meta(&meta,"sampler").or_else(||parse_meta(&meta,"Sampler")); let steps=meta.get("steps").and_then(Value::as_i64); let cfg=meta.get("cfgScale").or_else(||meta.get("cfg")).and_then(Value::as_f64); let seed=meta.get("seed").and_then(Value::as_i64); let width=img.get("width").and_then(Value::as_i64); let height=img.get("height").and_then(Value::as_i64);
-            db.execute("INSERT INTO images(model_id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(model_id,civitai_image_id) DO UPDATE SET local_path=excluded.local_path,thumbnail_path=excluded.thumbnail_path,width=excluded.width,height=excluded.height,prompt=excluded.prompt,negative_prompt=excluded.negative_prompt,steps=excluded.steps,cfg=excluded.cfg,sampler=excluded.sampler,seed=excluded.seed,meta_json=excluded.meta_json",params![model_id,iid,local_path,if thumb.exists(){Some(thumb.to_string_lossy().to_string())}else{None::<String>},width,height,prompt,neg,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap()])?;
+    if let Some(vid) = version_id {
+        let c0 = open_db(&app.app_data)?;
+        if let Ok(existing_id) = c0.query_row(
+            "SELECT id FROM models WHERE civitai_version_id=?1 AND path IS NOT NULL",
+            [vid],
+            |r| r.get::<_, i64>(0),
+        ) {
+            return model_by_id(&c0, existing_id);
         }
-        cursor=body.metadata.and_then(|m|m.get("nextCursor").and_then(Value::as_str).map(str::to_string)); if cursor.is_none(){break;}
     }
-    if let Ok(c)=open_db(&app.app_data){let bytes=dir_size(&cache_root(&app.app_data));let _=put_setting(&c,"cache_bytes",&bytes.to_string());}
-    let _=handle.emit("models-changed",()); Ok(())
-}
 
+    let typ = model
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("Other")
+        .to_string();
+    let (dl, _, filename, sha256) = selected_file(&version)
+        .ok_or_else(|| AppError::Api("No downloadable public file found for this version".into()))?;
+
+    let root = app
+        .models_root
+        .read()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
+
+    let target = root.join(civitai_type_to_folder(&typ));
+    let (path, size, hash) =
+        download_file(&app, &dl, &target, &filename, sha256.as_deref()).await?;
+
+    let rel = path
+        .strip_prefix(&root)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .replace("\\", "/");
+    let tags = json_strings(model.get("tags"));
+    let activation = json_strings(version.get("trainedWords"));
+    let desc = model
+        .get("description")
+        .and_then(Value::as_str)
+        .map(strip_html);
+    let creator = model
+        .get("creator")
+        .and_then(|v| v.get("username"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mid = model.get("id").and_then(Value::as_i64);
+    let vid = version.get("id").and_then(Value::as_i64);
+    let vname = version.get("name").and_then(Value::as_str).map(str::to_string);
+    let base = version
+        .get("baseModel")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let rec = {
+        let c = open_db(&app.app_data)?;
+        c.execute(
+            "INSERT INTO models(
+                path,relative_path,filename,model_type,size_bytes,modified_at,
+                civitai_model_id,civitai_version_id,civitai_url,civitai_name,
+                version_name,base_model,creator,description,tags_json,
+                activation_json,source_hash,updated_at
+             )
+             VALUES(
+                ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18
+             )
+             ON CONFLICT(path) DO UPDATE SET
+                size_bytes=excluded.size_bytes,
+                modified_at=excluded.modified_at,
+                civitai_model_id=excluded.civitai_model_id,
+                civitai_version_id=excluded.civitai_version_id,
+                civitai_url=excluded.civitai_url,
+                civitai_name=excluded.civitai_name,
+                version_name=excluded.version_name,
+                base_model=excluded.base_model,
+                creator=excluded.creator,
+                description=excluded.description,
+                tags_json=excluded.tags_json,
+                activation_json=excluded.activation_json,
+                source_hash=excluded.source_hash,
+                updated_at=excluded.updated_at",
+            params![
+                path.to_string_lossy(),
+                rel,
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                typ,
+                size,
+                mtime(&path),
+                mid,
+                vid,
+                url,
+                model.get("name").and_then(Value::as_str),
+                vname,
+                base,
+                creator,
+                desc,
+                serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
+                hash,
+                now()
+            ],
+        )?;
+
+        let id = c.query_row(
+            "SELECT id FROM models WHERE path=?1",
+            [path.to_string_lossy().to_string()],
+            |r| r.get(0),
+        )?;
+        model_by_id(&c, id)?
+    };
+
+    let _ = handle.emit("models-changed", ());
+    let _ = sync_gallery_inner(app.inner().clone(), rec.id, handle.clone(), true).await;
+    Ok(rec)
+}
+fn parse_meta(meta:&Value,key:&str)->Option<String>{meta.get(key).and_then(Value::as_str).map(str::to_string)}
+async fn sync_gallery_inner(
+    app: AppStateInner,
+    model_id: i64,
+    handle: AppHandle,
+    force: bool,
+) -> AppResult<()> {
+    {
+        let c = open_db(&app.app_data)?;
+        let cached: i64 =
+            c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1", [model_id], |r| {
+                r.get(0)
+            })?;
+        let missing: i64 = c.query_row(
+            "SELECT COUNT(*) FROM images WHERE model_id=?1 AND local_path IS NULL",
+            [model_id],
+            |r| r.get(0),
+        )?;
+        if !force && cached > 0 && missing == 0 {
+            return Ok(());
+        }
+    }
+
+    let model = {
+        let c = open_db(&app.app_data)?;
+        model_by_id(&c, model_id)?
+    };
+
+    let civitai_id = match model.civitai_model_id {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+
+    let cache = cache_root(&app.app_data).join(civitai_id.to_string());
+    fs::create_dir_all(&cache)?;
+    let mut cursor: Option<String> = None;
+    let client = civitai_client(&app)?;
+
+    loop {
+        let mut url = format!(
+            "{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true"
+        );
+        if let Some(c) = &cursor {
+            url.push_str("&cursor=");
+            url.push_str(&urlencoding::encode(c));
+        }
+
+        let mut req = client.get(&url);
+        if let Some(t) = token() {
+            req = req.bearer_auth(t);
+        }
+
+        let res = req.send().await?;
+        if !res.status().is_success() {
+            return Err(AppError::Api(format!(
+                "Image API returned {}",
+                res.status()
+            )));
+        }
+
+        let body: CivitaiEnvelope = res.json().await?;
+
+        for img in body.items {
+            let iid = match img.get("id").and_then(Value::as_i64) {
+                Some(x) => x,
+                None => continue,
+            };
+
+            let remote = img.get("url").and_then(Value::as_str).unwrap_or("");
+            let ext = remote
+                .split('?')
+                .next()
+                .and_then(|x| Path::new(x).extension())
+                .and_then(|x| x.to_str())
+                .unwrap_or("jpg");
+
+            let local = cache.join(format!("{iid}.{ext}"));
+            let thumb = cache.join(format!("{iid}_thumb.webp"));
+
+            let local_path = if local.exists() {
+                Some(local.to_string_lossy().to_string())
+            } else if !remote.is_empty() {
+                match client.get(remote).send().await {
+                    Ok(resp) => match resp.error_for_status() {
+                        Ok(resp) => match resp.bytes().await {
+                            Ok(bytes) if fs::write(&local, &bytes).is_ok() => {
+                                Some(local.to_string_lossy().to_string())
+                            }
+                            _ => None,
+                        },
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(lp) = &local_path {
+                if !thumb.exists() {
+                    if let Ok(im) = image::open(lp) {
+                        let t = im.resize(420, 420, FilterType::Triangle);
+                        let _ = t.save_with_format(&thumb, image::ImageFormat::WebP);
+                    }
+                }
+            }
+
+            let meta = img.get("meta").cloned().unwrap_or(Value::Null);
+            let prompt = parse_meta(&meta, "prompt");
+            let neg = parse_meta(&meta, "negativePrompt")
+                .or_else(|| parse_meta(&meta, "Negative prompt"));
+            let sampler = parse_meta(&meta, "sampler")
+                .or_else(|| parse_meta(&meta, "Sampler"));
+            let steps = meta.get("steps").and_then(Value::as_i64);
+            let cfg = meta
+                .get("cfgScale")
+                .or_else(|| meta.get("cfg"))
+                .and_then(Value::as_f64);
+            let seed = meta.get("seed").and_then(Value::as_i64);
+            let width = img.get("width").and_then(Value::as_i64);
+            let height = img.get("height").and_then(Value::as_i64);
+
+            let c = open_db(&app.app_data)?;
+            c.execute(
+                "INSERT INTO images(
+                    model_id,civitai_image_id,local_path,thumbnail_path,width,height,
+                    prompt,negative_prompt,steps,cfg,sampler,seed,meta_json
+                 )
+                 VALUES(
+                    ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13
+                 )
+                 ON CONFLICT(model_id,civitai_image_id) DO UPDATE SET
+                    local_path=excluded.local_path,
+                    thumbnail_path=excluded.thumbnail_path,
+                    width=excluded.width,
+                    height=excluded.height,
+                    prompt=excluded.prompt,
+                    negative_prompt=excluded.negative_prompt,
+                    steps=excluded.steps,
+                    cfg=excluded.cfg,
+                    sampler=excluded.sampler,
+                    seed=excluded.seed,
+                    meta_json=excluded.meta_json",
+                params![
+                    model_id,
+                    iid,
+                    local_path,
+                    if thumb.exists() {
+                        Some(thumb.to_string_lossy().to_string())
+                    } else {
+                        None::<String>
+                    },
+                    width,
+                    height,
+                    prompt,
+                    neg,
+                    steps,
+                    cfg,
+                    sampler,
+                    seed,
+                    serde_json::to_string(&meta).unwrap_or_else(|_| "null".into()),
+                ],
+            )?;
+        }
+
+        cursor = body
+            .metadata
+            .and_then(|m| m.get("nextCursor").and_then(Value::as_str).map(str::to_string));
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    if let Ok(c) = open_db(&app.app_data) {
+        let bytes = dir_size(&cache_root(&app.app_data));
+        let _ = put_setting(&c, "cache_bytes", &bytes.to_string());
+    }
+
+    let _ = handle.emit("models-changed", ());
+    Ok(())
+}
 #[tauri::command]
 async fn sync_model_gallery(app:State<'_,AppStateInner>,handle:AppHandle,id:i64)->AppResult<()> { let state=app.inner().clone(); tauri::async_runtime::spawn(async move {let _=sync_gallery_inner(state,id,handle,false).await;}); Ok(()) }
 #[tauri::command]
-async fn refresh_model_civitai(app:State<'_,AppStateInner>,handle:AppHandle,id:i64)->AppResult<ModelRecord>{
-    let current=model_by_id(&open_db(&app.app_data)?,id)?; let url=current.civitai_url.clone().ok_or_else(||AppError::Invalid("This model is not linked to Civitai".into()))?; let (model,version)=fetch_model_and_version(&app,&url).await?; let tags=json_strings(model.get("tags")); let activation=json_strings(version.get("trainedWords")); let desc=model.get("description").and_then(Value::as_str).map(strip_html); let creator=model.get("creator").and_then(|v|v.get("username")).and_then(Value::as_str).map(str::to_string); let c=open_db(&app.app_data)?; c.execute("UPDATE models SET civitai_model_id=?2,civitai_version_id=?3,civitai_name=?4,version_name=?5,base_model=?6,creator=?7,description=?8,tags_json=?9,activation_json=?10,updated_at=?11 WHERE id=?1",params![id,model.get("id").and_then(Value::as_i64),version.get("id").and_then(Value::as_i64),model.get("name").and_then(Value::as_str),version.get("name").and_then(Value::as_str),version.get("baseModel").and_then(Value::as_str),creator,desc,serde_json::to_string(&tags).unwrap(),serde_json::to_string(&activation).unwrap(),now()])?; let rec=model_by_id(&c,id)?; let _=sync_gallery_inner(app.inner().clone(),id,handle.clone(),true).await; let _=handle.emit("models-changed",()); Ok(rec)
-}
+#[tauri::command]
+async fn refresh_model_civitai(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+) -> AppResult<ModelRecord> {
+    let current = {
+        let c = open_db(&app.app_data)?;
+        model_by_id(&c, id)?
+    };
 
+    let url = current
+        .civitai_url
+        .clone()
+        .ok_or_else(|| AppError::Invalid("This model is not linked to Civitai".into()))?;
+
+    let (model, version) = fetch_model_and_version(&app, &url).await?;
+    let tags = json_strings(model.get("tags"));
+    let activation = json_strings(version.get("trainedWords"));
+    let desc = model
+        .get("description")
+        .and_then(Value::as_str)
+        .map(strip_html);
+    let creator = model
+        .get("creator")
+        .and_then(|v| v.get("username"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let rec = {
+        let c = open_db(&app.app_data)?;
+        c.execute(
+            "UPDATE models
+             SET civitai_model_id=?2,
+                 civitai_version_id=?3,
+                 civitai_name=?4,
+                 version_name=?5,
+                 base_model=?6,
+                 creator=?7,
+                 description=?8,
+                 tags_json=?9,
+                 activation_json=?10,
+                 updated_at=?11
+             WHERE id=?1",
+            params![
+                id,
+                model.get("id").and_then(Value::as_i64),
+                version.get("id").and_then(Value::as_i64),
+                model.get("name").and_then(Value::as_str),
+                version.get("name").and_then(Value::as_str),
+                version.get("baseModel").and_then(Value::as_str),
+                creator,
+                desc,
+                serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
+                now()
+            ],
+        )?;
+        model_by_id(&c, id)?
+    };
+
+    let _ = sync_gallery_inner(app.inner().clone(), id, handle.clone(), true).await;
+    let _ = handle.emit("models-changed", ());
+    Ok(rec)
+}
 fn storage_stats_inner(app_data:&Path)->AppResult<StorageStats>{let c=open_db(app_data)?;let total:i64=c.query_row("SELECT COALESCE(SUM(size_bytes),0) FROM models",[],|r|r.get(0))?;let cached=match setting(&c,"cache_bytes")?{Some(v)=>v.parse::<i64>().unwrap_or(0),None=>{let v=dir_size(&cache_root(app_data));let _=put_setting(&c,"cache_bytes",&v.to_string());v}};let mut stmt=c.prepare("SELECT model_type,COUNT(*),COALESCE(SUM(size_bytes),0) FROM models GROUP BY model_type ORDER BY model_type")?;let categories=stmt.query_map([],|r|Ok(CategoryStats{r#type:r.get(0)?,count:r.get(1)?,bytes:r.get(2)?}))?.filter_map(Result::ok).collect();Ok(StorageStats{total_model_bytes:total,cached_bytes:cached,categories})}
 fn dir_size(path:&Path)->i64{if !path.exists(){return 0} WalkDir::new(path).into_iter().filter_map(Result::ok).filter_map(|e|e.metadata().ok()).filter(|m|m.is_file()).map(|m|m.len() as i64).sum()}
 #[tauri::command]
