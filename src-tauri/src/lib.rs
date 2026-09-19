@@ -410,10 +410,50 @@ async fn download_file(
         .unwrap_or("model.safetensors")
         .to_string();
 
-    let path = target_dir.join(safe_name);
+    let mut path = target_dir.join(&safe_name);
+    if path.exists() {
+        if let Some(expected) = expected_sha256 {
+            if let Ok(existing_hash) = sha256_file(&path) {
+                if existing_hash.eq_ignore_ascii_case(expected) {
+                    return Ok((
+                        path,
+                        fs::metadata(&path)?.len() as i64,
+                        existing_hash,
+                    ));
+                }
+            }
+        }
+
+        let source_name = Path::new(&safe_name);
+        let stem = source_name
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .unwrap_or("model");
+        let extension = source_name
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or("");
+        let mut index = 1u32;
+        loop {
+            let candidate_name = if extension.is_empty() {
+                format!("{stem} ({index})")
+            } else {
+                format!("{stem} ({index}).{extension}")
+            };
+            let candidate = target_dir.join(candidate_name);
+            if !candidate.exists() {
+                path = candidate;
+                break;
+            }
+            index += 1;
+        }
+    }
+
     let partial = path.with_extension(format!(
         "{}.part",
-        path.extension().and_then(|x| x.to_str()).unwrap_or("bin")
+        path.extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or("bin")
     ));
     let mut file = File::create(&partial)?;
     let mut stream = res.bytes_stream();
@@ -752,8 +792,18 @@ async fn sync_gallery_inner(
     Ok(())
 }
 #[tauri::command]
-async fn sync_model_gallery(app:State<'_,AppStateInner>,handle:AppHandle,id:i64)->AppResult<()> { let state=app.inner().clone(); tauri::async_runtime::spawn(async move {let _=sync_gallery_inner(state,id,handle,false).await;}); Ok(()) }
-#[tauri::command]
+async fn sync_model_gallery(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+) -> AppResult<()> {
+    let state = app.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = sync_gallery_inner(state, id, handle, true).await;
+    });
+    Ok(())
+}
+
 #[tauri::command]
 async fn refresh_model_civitai(
     app: State<'_, AppStateInner>,
