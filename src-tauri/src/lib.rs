@@ -339,7 +339,7 @@ async fn preview_civitai_import(app:State<'_,AppStateInner>,url:String)->AppResu
 }
 
 async fn download_file(app:&AppStateInner, url:&str, target_dir:&Path)->AppResult<(PathBuf,i64)> {
-    fs::create_dir_all(target_dir)?; let client=civitai_client(app).await?; let mut req=client.get(url); if let Some(t)=token(){req=req.bearer_auth(t);} let res=req.send().await?; if !res.status().is_success(){return Err(AppError::Api(format!("Download failed: {}",res.status())))}
+    fs::create_dir_all(target_dir)?; let client=civitai_client(app)?; let mut req=client.get(url); if let Some(t)=token(){req=req.bearer_auth(t);} let res=req.send().await?; if !res.status().is_success(){return Err(AppError::Api(format!("Download failed: {}",res.status())))}
     let name=res.headers().get(header::CONTENT_DISPOSITION).and_then(|v|v.to_str().ok()).and_then(|s|s.split("filename=").nth(1)).map(|s|s.trim().trim_matches('"').trim_matches('\'').to_string()).filter(|s|!s.is_empty()).unwrap_or_else(||url.rsplit('/').next().unwrap_or("model.safetensors").split('?').next().unwrap_or("model.safetensors").to_string());
     let path=target_dir.join(name); let partial=path.with_extension(format!("{}.part",path.extension().and_then(|x|x.to_str()).unwrap_or("bin"))); let mut file=File::create(&partial)?; let mut stream=res.bytes_stream(); let mut total=0i64; while let Some(chunk)=stream.next().await {let b=chunk?; total+=b.len() as i64; file.write_all(&b)?;} file.flush()?; fs::rename(&partial,&path)?; Ok((path,total))
 }
