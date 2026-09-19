@@ -125,6 +125,7 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
     c.busy_timeout(Duration::from_secs(5))?;
     c.execute_batch(r#"
       PRAGMA journal_mode=WAL;
+      PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS models (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,7 +260,7 @@ fn model_by_id(c: &Connection, id: i64) -> AppResult<ModelRecord> {
     Ok(c.query_row("SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,updated_at FROM models WHERE id=?1", [id], model_from_row)?)
 }
 
-async fn civitai_client(_app: &AppStateInner) -> AppResult<Client> {
+fn civitai_client(_app: &AppStateInner) -> AppResult<Client> {
     let mut b=Client::builder().user_agent(USER_AGENT);
     let _ = &mut b;
     Ok(b.build()?)
@@ -268,7 +269,7 @@ fn token() -> Option<String> {
     keyring::Entry::new("Raphael Model Manager", "civitai").ok().and_then(|e| e.get_password().ok())
 }
 async fn api_get(app: &AppStateInner, url: &str) -> AppResult<Value> {
-    let client=civitai_client(app).await?;
+    let client=civitai_client(app)?;
     let mut req=client.get(url);
     if let Some(t)=token(){ req=req.bearer_auth(t); }
     let res=req.send().await?;
@@ -354,7 +355,7 @@ async fn install_civitai_model(app:State<'_,AppStateInner>, handle:AppHandle, ur
 fn parse_meta(meta:&Value,key:&str)->Option<String>{meta.get(key).and_then(Value::as_str).map(str::to_string)}
 async fn sync_gallery_inner(app:AppStateInner, model_id:i64, handle:AppHandle)->AppResult<()> {
     { let c=open_db(&app.app_data)?; let cached:i64=c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1",[model_id],|r|r.get(0))?; let missing:i64=c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1 AND local_path IS NULL",[model_id],|r|r.get(0))?; if cached>0 && missing==0 { return Ok(()); } }
-    let model=model_by_id(&open_db(&app.app_data)?,model_id)?; let civitai_id=match model.civitai_model_id{Some(x)=>x,None=>return Ok(())}; let cache=cache_root(&app.app_data).join(civitai_id.to_string()); fs::create_dir_all(&cache)?; let mut cursor:Option<String>=None; let client=civitai_client(&app).await?;
+    let model=model_by_id(&open_db(&app.app_data)?,model_id)?; let civitai_id=match model.civitai_model_id{Some(x)=>x,None=>return Ok(())}; let cache=cache_root(&app.app_data).join(civitai_id.to_string()); fs::create_dir_all(&cache)?; let mut cursor:Option<String>=None; let client=civitai_client(&app)?;
     loop {
         let mut url=format!("{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true"); if let Some(c)=&cursor{url.push_str("&cursor=");url.push_str(&urlencoding::encode(c));}
         let mut req=client.get(&url); if let Some(t)=token(){req=req.bearer_auth(t);} let res=req.send().await?; if !res.status().is_success(){return Err(AppError::Api(format!("Image API returned {}",res.status())))} let body:CivitaiEnvelope=res.json().await?; let db=open_db(&app.app_data)?;
@@ -390,29 +391,27 @@ fn is_civitai_token_set()->bool{keyring::Entry::new("Raphael Model Manager","civ
 
 fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let connection = match open_db(&app.app_data) {
-            Ok(value) => value,
-            Err(_) => return,
-        };
+        let paths: Vec<(i64, String)> = {
+            let connection = match open_db(&app.app_data) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
 
-        let mut statement = match connection.prepare(
-            "SELECT id, path FROM models WHERE civitai_model_id IS NULL AND source_hash IS NULL",
-        ) {
-            Ok(value) => value,
-            Err(_) => return,
-        };
+            let mut statement = match connection.prepare(
+                "SELECT id, path FROM models WHERE civitai_model_id IS NULL AND source_hash IS NULL",
+            ) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
 
-        let paths: Vec<(i64, String)> = match statement.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        }) {
-            Ok(rows) => rows.filter_map(Result::ok).collect(),
-            Err(_) => return,
+            match statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
+                Ok(rows) => rows.filter_map(Result::ok).collect(),
+                Err(_) => return,
+            }
         };
-        drop(statement);
-        drop(connection);
 
         for (id, path) in paths {
-            let client = match civitai_client(&app).await {
+            let client = match civitai_client(&app) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
@@ -463,7 +462,9 @@ fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
                 .cloned()
                 .unwrap_or_else(|| json!([]));
             let civitai_url = match (model_id, version_id) {
-                (Some(mid), Some(vid)) => Some(format!("https://civitai.com/models/{mid}?modelVersionId={vid}")),
+                (Some(mid), Some(vid)) => {
+                    Some(format!("https://civitai.com/models/{mid}?modelVersionId={vid}"))
+                }
                 _ => None,
             };
 
