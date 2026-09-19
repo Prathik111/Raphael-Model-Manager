@@ -339,8 +339,8 @@ fn set_models_root(app: State<AppStateInner>, handle: AppHandle, path:String)->A
     let c=open_db(&app.app_data)?; put_setting(&c,"models_root",&path)?; *app.models_root.write().unwrap()=Some(root.clone());
     if let Some(old)=app.watcher.lock().unwrap().take(){ drop(old); }
     let app_clone=app.inner().clone(); let handle_clone=handle.clone();
-    let mut watcher=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{ if let Ok(e)=res { match e.kind { EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => { std::thread::sleep(Duration::from_millis(120)); recursive_scan_and_emit(app_clone.clone(),handle_clone.clone()); }, _=>{} } } }).map_err(|e|AppError::Io(io::Error::new(io::ErrorKind::Other,e.to_string())))?;
-    watcher.watch(&root,RecursiveMode::Recursive).map_err(|e|AppError::Io(io::Error::new(io::ErrorKind::Other,e.to_string())))?; *app.watcher.lock().unwrap()=Some(watcher);
+    let mut watcher=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{ if let Ok(e)=res { match e.kind { EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => { std::thread::sleep(Duration::from_millis(120)); recursive_scan_and_emit(app_clone.clone(),handle_clone.clone()); }, _=>{} } } }).map_err(|e|AppError::Io(io::Error::other(e.to_string())))?;
+    watcher.watch(&root,RecursiveMode::Recursive).map_err(|e|AppError::Io(io::Error::other(e.to_string())))?; *app.watcher.lock().unwrap()=Some(watcher);
     scan_root(&app,&root)?; let _=handle.emit("models-changed",()); spawn_hash_enrichment(app.inner().clone(),handle.clone()); Ok(AppStateResponse{models_root:Some(path),storage:storage_stats_inner(&app.app_data)?})
 }
 #[tauri::command]
