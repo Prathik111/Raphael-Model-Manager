@@ -12,7 +12,7 @@ use std::{
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use thiserror::Error;
@@ -228,7 +228,7 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
             c.execute("UPDATE models SET modified_at=?2, updated_at=?3 WHERE path=?1", params![path_s, modified, now()])?;
             continue;
         }
-        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\','/');
+        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace("\\","/");
         let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let mtype = file_type_from_path(&path, root);
         let hash: Option<String> = None;
@@ -259,7 +259,7 @@ fn model_by_id(c: &Connection, id: i64) -> AppResult<ModelRecord> {
     Ok(c.query_row("SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,updated_at FROM models WHERE id=?1", [id], model_from_row)?)
 }
 
-async fn civitai_client(app: &AppStateInner) -> AppResult<Client> {
+async fn civitai_client(_app: &AppStateInner) -> AppResult<Client> {
     let mut b=Client::builder().user_agent(USER_AGENT);
     let _ = &mut b;
     Ok(b.build()?)
@@ -462,8 +462,10 @@ fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
                 .get("trainedWords")
                 .cloned()
                 .unwrap_or_else(|| json!([]));
-            let civitai_url = version_id
-                .map(|vid| format!("https://civitai.com/models/{model_id}?modelVersionId={vid}"));
+            let civitai_url = match (model_id, version_id) {
+                (Some(mid), Some(vid)) => Some(format!("https://civitai.com/models/{mid}?modelVersionId={vid}")),
+                _ => None,
+            };
 
             if let Ok(db) = open_db(&app.app_data) {
                 let _ = db.execute(
