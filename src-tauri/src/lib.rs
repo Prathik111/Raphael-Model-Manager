@@ -388,7 +388,114 @@ fn set_civitai_token(token:String)->AppResult<()>{let e=keyring::Entry::new("Rap
 #[tauri::command]
 fn is_civitai_token_set()->bool{keyring::Entry::new("Raphael Model Manager","civitai").ok().and_then(|e|e.get_password().ok()).map(|x|!x.trim().is_empty()).unwrap_or(false)}
 
-fn spawn_hash_enrichment(app:AppStateInner,handle:AppHandle){tauri::async_runtime::spawn(async move{let c=match open_db(&app.app_data){Ok(x)=>x,Err(_)=>return};let paths:Vec<(i64,String)>=match c.prepare("SELECT id,path FROM models WHERE civitai_model_id IS NULL AND source_hash IS NULL"){Ok(mut s)=>s.query_map([],|r|Ok((r.get(0)?,r.get(1)?))).map(|it|it.filter_map(Result::ok).collect()).unwrap_or_default(),Err(_)=>return};drop(c);for (id,path) in paths{let client=match civitai_client(&app).await{Ok(x)=>x,Err(_)=>continue};let hash=match sha256_file(Path::new(&path)){Ok(x)=>x,Err(_)=>continue}; if let Ok(c0)=open_db(&app.app_data){let _=c0.execute("UPDATE models SET source_hash=?2,updated_at=?3 WHERE id=?1",params![id,hash,now()]);} let url=format!("{API_BASE}/model-versions/by-hash/{hash}");let mut req=client.get(url);if let Some(t)=token(){req=req.bearer_auth(t);}if let Ok(res)=req.send().await{if res.status().is_success(){if let Ok(v)=res.json::<Value>().await{if let Ok(c)=open_db(&app.app_data){let mid=v.get("modelId").and_then(Value::as_i64);let vid=v.get("id").and_then(Value::as_i64);let mname=v.get("model").and_then(|m|m.get("name")).and_then(Value::as_str).or_else(||v.get("modelName").and_then(Value::as_str));let base=v.get("baseModel").and_then(Value::as_str);let tags=v.get("model").and_then(|m|m.get("tags")).cloned().unwrap_or_else(||json!([]));let activation=v.get("trainedWords").cloned().unwrap_or_else(||json!([]));let url2=vid.map(|x|format!("https://civitai.com/models/{mid}?modelVersionId={x}"));let _=c.execute("UPDATE models SET civitai_model_id=?2,civitai_version_id=?3,civitai_url=?4,civitai_name=?5,version_name=?6,base_model=?7,tags_json=?8,activation_json=?9,updated_at=?10 WHERE id=?1",params![id,mid,vid,url2,mname,v.get("name").and_then(Value::as_str),base,serde_json::to_string(&tags).unwrap(),serde_json::to_string(&activation).unwrap(),now()]);let _=handle.emit("models-changed",());}}}}}}
+fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let connection = match open_db(&app.app_data) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+
+        let mut statement = match connection.prepare(
+            "SELECT id, path FROM models WHERE civitai_model_id IS NULL AND source_hash IS NULL",
+        ) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+
+        let paths: Vec<(i64, String)> = match statement.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        }) {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(_) => return,
+        };
+        drop(statement);
+        drop(connection);
+
+        for (id, path) in paths {
+            let client = match civitai_client(&app).await {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let hash = match sha256_file(Path::new(&path)) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            if let Ok(db) = open_db(&app.app_data) {
+                let _ = db.execute(
+                    "UPDATE models SET source_hash=?2, updated_at=?3 WHERE id=?1",
+                    params![id, hash, now()],
+                );
+            }
+
+            let url = format!("{API_BASE}/model-versions/by-hash/{hash}");
+            let mut request = client.get(url);
+            if let Some(t) = token() {
+                request = request.bearer_auth(t);
+            }
+
+            let response = match request.send().await {
+                Ok(value) if value.status().is_success() => value,
+                _ => continue,
+            };
+
+            let version: Value = match response.json().await {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let model_id = version.get("modelId").and_then(Value::as_i64);
+            let version_id = version.get("id").and_then(Value::as_i64);
+            let model_name = version
+                .get("model")
+                .and_then(|m| m.get("name"))
+                .and_then(Value::as_str)
+                .or_else(|| version.get("modelName").and_then(Value::as_str));
+            let base_model = version.get("baseModel").and_then(Value::as_str);
+            let tags = version
+                .get("model")
+                .and_then(|m| m.get("tags"))
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let activation = version
+                .get("trainedWords")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let civitai_url = version_id
+                .map(|vid| format!("https://civitai.com/models/{model_id}?modelVersionId={vid}"));
+
+            if let Ok(db) = open_db(&app.app_data) {
+                let _ = db.execute(
+                    "UPDATE models
+                     SET civitai_model_id=?2,
+                         civitai_version_id=?3,
+                         civitai_url=?4,
+                         civitai_name=?5,
+                         version_name=?6,
+                         base_model=?7,
+                         tags_json=?8,
+                         activation_json=?9,
+                         updated_at=?10
+                     WHERE id=?1",
+                    params![
+                        id,
+                        model_id,
+                        version_id,
+                        civitai_url,
+                        model_name,
+                        version.get("name").and_then(Value::as_str),
+                        base_model,
+                        serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
+                        serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
+                        now()
+                    ],
+                );
+            }
+
+            let _ = handle.emit("models-changed", ());
+        }
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
