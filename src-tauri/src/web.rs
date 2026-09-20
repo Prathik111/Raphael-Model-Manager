@@ -17,7 +17,7 @@ use tokio::{net::TcpListener, sync::oneshot};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
 use crate::{
-    add_subfolder_tags, delete_model, get_app_state, get_library_counts, get_model_images, get_storage_stats,
+    add_subfolder_tags, clear_download_progress, delete_model, get_app_state, get_download_progress, get_library_counts, get_model_images, get_storage_stats,
     get_tags, install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
     refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
     set_model_tags, set_model_type, sync_model_gallery,
@@ -306,8 +306,10 @@ async fn command_handler(
                 args.selected_type,
             )
             .await
-            .map(|value: ModelRecord| serde_json::to_value(value).unwrap_or(Value::Null))
+            .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
+        "get_download_progress" => serde_json::to_value(get_download_progress(handle.state())).map_err(|e| AppError::Invalid(e.to_string())),
+        "clear_download_progress" => clear_download_progress(handle.state()).and_then(|_| Ok(Value::Null)),
         "link_model_civitai" => {
             let args: LinkArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             link_model_civitai(handle.state(), handle.clone(), args.id, args.url)
