@@ -2253,21 +2253,64 @@ fn get_model_images(app: State<AppStateInner>, id: i64, limit: Option<i64>) -> A
     Ok(ModelImagesResponse { has_more: images.len() as i64 >= limit, images })
 }
 #[tauri::command]
-async fn preview_civitai_import(app:State<'_,AppStateInner>,url:String)->AppResult<CivitaiImportPreview>{
-    let (model,version)=fetch_model_and_version(&app,&url).await?; let (dl,size,filename,sha256)=selected_file(&version).ok_or_else(||AppError::Api("No downloadable public file found for this version".into()))?;
-    let root=app.models_root.read().unwrap().clone().ok_or_else(||AppError::Invalid("Choose your ComfyUI models folder first".into()))?; let typ=model.get("type").and_then(Value::as_str).unwrap_or("Other"); let target=root.join(civitai_type_to_folder(typ));
-    let activation=json_strings(version.get("trainedWords"));
-    let mid=model.get("id").and_then(Value::as_i64);
-    let thumb=match mid {
-        Some(model_id)=>{
-            let _guard=app.cache_lock.lock().await;
-            let result=ensure_model_thumbnail(&app,model_id,&model,&version,&url).await?;
-            let _=enforce_cache_limit_inner(&app.app_data);
+async fn preview_civitai_import_inner(app: &AppStateInner, url: String) -> AppResult<CivitaiImportPreview> {
+    let (model, version) = fetch_model_and_version(app, &url).await?;
+    let (dl, size, filename, sha256) = selected_file(&version)
+        .ok_or_else(|| AppError::Api("No downloadable public file found for this version".into()))?;
+    let root = app
+        .models_root
+        .read()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
+    let typ = model.get("type").and_then(Value::as_str).unwrap_or("Other");
+    let target = root.join(civitai_type_to_folder(typ));
+    let activation = json_strings(version.get("trainedWords"));
+    let mid = model.get("id").and_then(Value::as_i64);
+    let thumb = match mid {
+        Some(model_id) => {
+            let _guard = app.cache_lock.lock().await;
+            let result = ensure_model_thumbnail(app, model_id, &model, &version, &url).await?;
+            let _ = enforce_cache_limit_inner(&app.app_data);
             result
-        },
-        None=>None
+        }
+        None => None,
     };
-    Ok(CivitaiImportPreview{model:json!({"id":model.get("id"),"name":model.get("name"),"type":typ,"description":model.get("description"),"tags":model.get("tags"),"creator":model.get("creator").and_then(|v|v.get("username")),"thumbnail_path":thumb}),version:json!({"id":version.get("id"),"name":version.get("name"),"base_model":version.get("baseModel"),"download_url":dl,"filename":filename,"size_bytes":size,"sha256":sha256,"activation_prompts":activation}),target_directory:target.to_string_lossy().to_string(),thumbnail_path:thumb,images_count_hint:version.get("images").and_then(Value::as_array).map(|x|x.len() as i64)})
+    Ok(CivitaiImportPreview {
+        model: json!({
+            "id": model.get("id"),
+            "name": model.get("name"),
+            "type": typ,
+            "description": model.get("description"),
+            "tags": model.get("tags"),
+            "creator": model.get("creator").and_then(|v| v.get("username")),
+            "thumbnail_path": thumb
+        }),
+        version: json!({
+            "id": version.get("id"),
+            "name": version.get("name"),
+            "base_model": version.get("baseModel"),
+            "download_url": dl,
+            "filename": filename,
+            "size_bytes": size,
+            "sha256": sha256,
+            "activation_prompts": activation
+        }),
+        target_directory: target.to_string_lossy().to_string(),
+        thumbnail_path: thumb,
+        images_count_hint: version
+            .get("images")
+            .and_then(Value::as_array)
+            .map(|x| x.len() as i64),
+    })
+}
+
+#[tauri::command]
+async fn preview_civitai_import(
+    app: State<'_, AppStateInner>,
+    url: String,
+) -> AppResult<CivitaiImportPreview> {
+    preview_civitai_import_inner(app.inner(), url).await
 }
 
 #[allow(clippy::too_many_arguments)]
