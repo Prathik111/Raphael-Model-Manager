@@ -1076,29 +1076,6 @@ async fn download_file(
         p.error = None;
     });
 
-    let header_name = res
-        .headers()
-        .get(header::CONTENT_DISPOSITION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split("filename=").nth(1))
-        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string());
-
-    let raw_name = if !preferred_name.is_empty() {
-        preferred_name.to_string()
-    } else {
-        header_name
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                url.rsplit('/')
-                    .next()
-                    .unwrap_or("model.safetensors")
-                    .split('?')
-                    .next()
-                    .unwrap_or("model.safetensors")
-                    .to_string()
-            })
-    };
-
     let path = path;
     let partial = path.with_extension(format!(
         "{}.part",
@@ -1403,7 +1380,7 @@ async fn sync_gallery_inner(
         let c = open_db(&app.app_data)?;
         c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1", [model_id], |r| r.get(0))?
     };
-    let has_more;
+    let mut has_more = false;
     loop {
         let mut url = format!("{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true");
         if let Some(c) = &cursor { url.push_str("&cursor="); url.push_str(&urlencoding::encode(c)); }
