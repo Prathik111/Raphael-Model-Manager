@@ -5,7 +5,6 @@ import type {
   AppState,
   CivitaiImportPreview,
   DownloadProgress,
-  ModelImage,
   ModelRecord,
   StorageStats,
   LibraryCounts,
