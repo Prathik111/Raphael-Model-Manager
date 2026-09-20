@@ -809,7 +809,7 @@ fn reset_model_cover(
 
     if let Some(path) = old_cover {
         let cover = PathBuf::from(path);
-        if cover.starts_with(app.app_data) && cover.is_file() {
+        if cover.starts_with(&app.app_data) && cover.is_file() {
             let _ = fs::remove_file(cover);
         }
     }
