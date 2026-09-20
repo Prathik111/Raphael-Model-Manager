@@ -1348,10 +1348,8 @@ function App() {
     };
 
     void primePagination();
-    const timer=window.setInterval(()=>void loadImages(),2000);
     return ()=>{
       cancelled=true;
-      window.clearInterval(timer);
     };
   },[selectedId, selected?.civitai_model_id]);
   useEffect(()=>{const t=setTimeout(()=>refresh(),180); return ()=>clearTimeout(t);},[query,type,sort,activeTags]);
