@@ -33,7 +33,7 @@ function Setup({ onReady }: { onReady: (state: AppState)=>void }) {
 
 function ModelCard({ model, selected, onClick }: { model: ModelRecord; selected: boolean; onClick: ()=>void }) {
   return <button className={`model-card ${selected ? 'selected' : ''}`} onClick={onClick}>
-    <div className="thumb model-thumb">{model.thumbnail_path ? <img src={fileUrl(model.thumbnail_path)} alt="" onError={(e)=>{e.currentTarget.style.display="none";}}/> : null}<span className={model.thumbnail_path ? "thumb-fallback hidden-fallback" : "thumb-fallback"}>{initials(model.civitai_name || model.filename)}</span></div>
+    <div className="thumb model-thumb">{model.thumbnail_path ? <img src={fileUrl(model.thumbnail_path)} alt="" onError={(e)=>{e.currentTarget.style.display="none"; const fallback=e.currentTarget.nextElementSibling as HTMLElement|null; fallback?.classList.remove("hidden-fallback");}}/> : null}<span className={model.thumbnail_path ? "thumb-fallback hidden-fallback" : "thumb-fallback"}>{initials(model.civitai_name || model.filename)}</span></div>
     <div className="card-body">
       <div className="card-title">{model.civitai_name || model.filename.replace(/\.[^.]+$/, '')}</div>
       <div className="card-sub">{model.model_type} · {fmtBytes(model.size_bytes)}</div>
