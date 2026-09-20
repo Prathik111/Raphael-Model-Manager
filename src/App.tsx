@@ -471,8 +471,8 @@ function CoverEditorOverlay({
   const [closing, setClosing] = useState(false);
   const dragRef = useRef<{ pointerId: number; x: number; y: number; startX: number; startY: number } | null>(null);
 
-  const dismiss = () => {
-    if (busy || closing) return;
+  const dismiss = (force = false) => {
+    if ((!force && busy) || closing) return;
     setClosing(true);
     window.setTimeout(onClose, 180);
   };
@@ -565,7 +565,7 @@ function CoverEditorOverlay({
     try {
       const updated = await api.setModelCoverPosition(model.id, position.x, position.y);
       onUpdated(updated);
-      onClose();
+      dismiss(true);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -643,8 +643,8 @@ function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTag
   const [deleteClosing, setDeleteClosing] = useState(false);
   const promptText = model.activation_prompts.join(', ');
 
-  const dismissDelete = () => {
-    if (deleteBusy || deleteClosing) return;
+  const dismissDelete = (force = false) => {
+    if ((!force && deleteBusy) || deleteClosing) return;
     setDeleteClosing(true);
     window.setTimeout(() => {
       setDeleteOpen(false);
@@ -679,7 +679,7 @@ function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTag
     </div>}
     {tab==='examples' && <div className="inspector-scroll"><section><div className="section-head section-head-row"><span>CACHED CIVITAI GALLERY · {images.length}</span><span className="section-action">PICK A THUMBNAIL</span></div><Gallery model={model} images={images} onChooseThumbnail={onChooseThumbnail}/></section></div>}
     {tab==='files' && <div className="inspector-scroll"><section><div className="section-head">LOCAL FILE</div><div className="kv"><span>SIZE</span><b>{fmtBytes(model.size_bytes)}</b></div><div className="kv"><span>TYPE</span><b>{model.model_type}</b></div><div className="kv"><span>BASE</span><b>{model.base_model || '—'}</b></div><div className="kv"><span>VERSION</span><b>{model.version_name || '—'}</b></div><div className="kv"><span>CREATOR</span><b>{model.creator || '—'}</b></div><div className="kv"><span>SHA256</span><b className="wrap">{model.source_hash || 'Not computed'}</b></div></section><section className="danger-section"><div className="section-head">DANGER ZONE</div><p className="danger-copy">Permanently delete this model file from disk and remove its Raphael metadata and cached gallery entries.</p><button className="danger-btn" onClick={()=>{setDeleteError(null);setDeleteOpen(true);}} disabled={deleteBusy}>DELETE MODEL</button></section></div>}
-    {deleteOpen && <div className={"modal-backdrop inspector-delete-backdrop" + (deleteClosing ? " overlay-leaving" : "")} onClick={dismissDelete}><div className="delete-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">DESTRUCTIVE ACTION</div><h3>DELETE MODEL?</h3><p>This will permanently remove <b>{model.filename}</b> from your ComfyUI models folder. Raphael metadata and cached gallery files for this model will also be removed.</p>{deleteError ? <div className="error-box modal-error">{deleteError}</div> : null}<div className="modal-actions"><button className="text-btn" onClick={dismissDelete} disabled={deleteBusy}>CANCEL</button><button className="danger-btn confirm" disabled={deleteBusy} onClick={async()=>{setDeleteBusy(true);setDeleteError(null);try{await onDelete();setDeleteOpen(false);}catch(e){setDeleteError(String(e));}finally{setDeleteBusy(false);}}}>{deleteBusy?'DELETING…':'DELETE PERMANENTLY'}</button></div></div></div>}
+    {deleteOpen && <div className={"modal-backdrop inspector-delete-backdrop" + (deleteClosing ? " overlay-leaving" : "")} onClick={dismissDelete}><div className="delete-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">DESTRUCTIVE ACTION</div><h3>DELETE MODEL?</h3><p>This will permanently remove <b>{model.filename}</b> from your ComfyUI models folder. Raphael metadata and cached gallery files for this model will also be removed.</p>{deleteError ? <div className="error-box modal-error">{deleteError}</div> : null}<div className="modal-actions"><button className="text-btn" onClick={dismissDelete} disabled={deleteBusy}>CANCEL</button><button className="danger-btn confirm" disabled={deleteBusy} onClick={async()=>{setDeleteBusy(true);setDeleteError(null);try{await onDelete();dismissDelete(true);}catch(e){setDeleteError(String(e));}finally{setDeleteBusy(false);}}}>{deleteBusy?'DELETING…':'DELETE PERMANENTLY'}</button></div></div></div>}
   </aside>;
 }
 
