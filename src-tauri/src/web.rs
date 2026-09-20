@@ -136,6 +136,12 @@ struct TokenArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct DownloadProgressArgs {
+    #[serde(rename = "taskId")]
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct FileQuery {
     path: String,
 }
@@ -309,7 +315,10 @@ async fn command_handler(
             .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "get_download_progress" => serde_json::to_value(get_download_progress(handle.state())).map_err(|e| AppError::Invalid(e.to_string())),
-        "clear_download_progress" => clear_download_progress(handle.state()).and_then(|_| Ok(Value::Null)),
+        "clear_download_progress" => {
+            let args: DownloadProgressArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            clear_download_progress(handle.state(), args.task_id).and_then(|_| Ok(Value::Null))
+        },
         "link_model_civitai" => {
             let args: LinkArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             link_model_civitai(handle.state(), handle.clone(), args.id, args.url)
