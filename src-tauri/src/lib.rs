@@ -344,6 +344,8 @@ async fn fetch_model_and_version(app:&AppStateInner, source:&str) -> AppResult<(
 }
 
 fn civitai_type_to_folder(t:&str)->&'static str { match t.to_lowercase().as_str(){"checkpoint"=>"checkpoints","lora"|"locon"|"lycoris"=>"loras","vae"=>"vae","controlnet"=>"controlnet","textualinversion"=>"embeddings","upscaler"=>"upscale_models","ipadapter"=>"ipadapter","clip"=>"text_encoders",_=>"other"} }
+fn civitai_type_to_model_type(t:&str)->&'static str { match t.to_lowercase().as_str(){"checkpoint"=>"Checkpoint","lora"|"locon"|"lycoris"=>"LoRA","vae"=>"VAE","controlnet"=>"ControlNet","textualinversion"|"embedding"=>"Embedding","upscaler"=>"Upscaler","clip"=>"Text Encoder","clipvision"=>"CLIP Vision","ipadapter"|"ip-adapter"=>"IP-Adapter",_=>"Other"} }
+fn normalized_import_type(t:&str)->Option<&'static str> { match t.to_ascii_lowercase().as_str(){"checkpoint"=>Some("Checkpoint"),"lora"=>Some("LoRA"),"vae"=>Some("VAE"),"controlnet"=>Some("ControlNet"),"embedding"=>Some("Embedding"),"upscaler"=>Some("Upscaler"),"text encoder"=>Some("Text Encoder"),"clip vision"=>Some("CLIP Vision"),"ip-adapter"|"ipadapter"=>Some("IP-Adapter"),"other"=>Some("Other"),_=>None} }
 fn civitai_host(url:&str)->AppResult<String>{Ok(Url::parse(url)?.host_str().unwrap_or("civitai.com").to_ascii_lowercase().replace("www.",""))}
 fn canonical_civitai_url(source:&str,model_id:Option<i64>,version_id:Option<i64>)->AppResult<String>{let host=civitai_host(source)?;Ok(match (model_id,version_id){(Some(mid),Some(vid))=>format!("https://{host}/models/{mid}?modelVersionId={vid}"),(Some(mid),None)=>format!("https://{host}/models/{mid}"),_=>source.to_string()})}
 fn json_strings(v:Option<&Value>)->Vec<String>{v.and_then(Value::as_array).map(|a|a.iter().filter_map(|x|x.as_str().map(str::to_string)).collect()).unwrap_or_default()}
@@ -566,6 +568,7 @@ async fn install_civitai_model(
     handle: AppHandle,
     url: String,
     target_directory: Option<String>,
+    selected_type: Option<String>,
 ) -> AppResult<ModelRecord> {
     let (model, version) = fetch_model_and_version(&app, &url).await?;
     let version_id = version.get("id").and_then(Value::as_i64);
@@ -581,11 +584,17 @@ async fn install_civitai_model(
         }
     }
 
-    let typ = model
+    let civitai_typ = model
         .get("type")
         .and_then(Value::as_str)
-        .unwrap_or("Other")
-        .to_string();
+        .unwrap_or("Other");
+    let typ = if let Some(selected) = selected_type {
+        normalized_import_type(&selected)
+            .ok_or_else(|| AppError::Invalid("Unsupported Raphael library tag".into()))?
+            .to_string()
+    } else {
+        civitai_type_to_model_type(civitai_typ).to_string()
+    };
     let (dl, _, filename, sha256) = selected_file(&version)
         .ok_or_else(|| AppError::Api("No downloadable public file found for this version".into()))?;
 
@@ -1246,6 +1255,8 @@ mod tests {
         assert_eq!(civitai_type_to_folder("Checkpoint"), "checkpoints");
         assert_eq!(civitai_type_to_folder("LORA"), "loras");
         assert_eq!(civitai_type_to_folder("LoCon"), "loras");
+        assert_eq!(civitai_type_to_model_type("Upscaler"), "Upscaler");
+        assert_eq!(civitai_type_to_model_type("TextualInversion"), "Embedding");
         assert_eq!(civitai_type_to_folder("TextualInversion"), "embeddings");
         assert_eq!(civitai_type_to_folder("Upscaler"), "upscale_models");
         assert_eq!(civitai_type_to_folder("UnknownType"), "other");
