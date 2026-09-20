@@ -18,8 +18,34 @@ import type {
 
 export const isWebApp = typeof window !== 'undefined' && !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
 
+const WEB_REQUEST_TIMEOUT_MS = 10_000;
+const WEB_STATUS_TIMEOUT_MS = 4_000;
+
+async function webFetch(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = WEB_REQUEST_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...init,
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error(`Web API request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw new Error(`Web API connection failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 async function webCommand<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
-  const response = await fetch('/api/command/' + encodeURIComponent(command), {
+  const response = await webFetch('/api/command/' + encodeURIComponent(command), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(args),
@@ -150,7 +176,7 @@ export const api = {
     command<CacheOperationResult>('clean_cache_orphans'),
   getWebAppStatus: async () => {
     if (!isWebApp) return invoke<WebAppStatus>('get_web_app_status');
-    const response = await fetch('/api/status');
+    const response = await webFetch('/api/status', {}, WEB_STATUS_TIMEOUT_MS);
     const payload = await response.json().catch(() => null);
     if (!response.ok) throw new Error(payload?.error || `Web API status failed: ${response.status}`);
     return payload as WebAppStatus;
@@ -163,8 +189,26 @@ export const api = {
 
 export async function subscribeToModelChanges(cb: () => void) {
   if (isWebApp) {
-    const timer = window.setInterval(cb, 3000);
-    return () => window.clearInterval(timer);
+    let disposed = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (disposed || inFlight) return;
+      inFlight = true;
+      try {
+        await api.getWebAppStatus();
+        if (!disposed) cb();
+      } catch {
+        // The dedicated web-connection monitor reports the offline state.
+      } finally {
+        inFlight = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 3000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
   }
   return listen('models-changed', cb);
 }
@@ -172,9 +216,12 @@ export async function subscribeToModelChanges(cb: () => void) {
 export async function subscribeToExamplesRefresh(cb: (progress: ExamplesRefreshProgress) => void) {
   if (isWebApp) {
     let disposed = false;
+    let inFlight = false;
     const poll = async () => {
+      if (disposed || inFlight) return;
+      inFlight = true;
       try {
-        const response = await fetch('/api/command/get_examples_refresh_status', {
+        const response = await webFetch('/api/command/get_examples_refresh_status', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: '{}',
@@ -182,7 +229,11 @@ export async function subscribeToExamplesRefresh(cb: (progress: ExamplesRefreshP
         if (!response.ok) return;
         const payload = await response.json().catch(() => null);
         if (!disposed && payload) cb(payload as ExamplesRefreshProgress);
-      } catch {}
+      } catch {
+        // Connection state is handled by the dedicated heartbeat.
+      } finally {
+        inFlight = false;
+      }
     };
     await poll();
     const timer = window.setInterval(() => void poll(), 750);
