@@ -1,5 +1,5 @@
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use image::{imageops::FilterType, ImageFormat, ImageReader};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest::Client;
@@ -1127,6 +1127,110 @@ fn get_examples_refresh_state(
 
 type FeaturedImageRecord = (i64, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<f64>, Option<String>, Option<i64>, String);
 
+const FEATURED_MODEL_CONCURRENCY: usize = 3;
+const FEATURED_IMAGE_DOWNLOAD_CONCURRENCY: usize = 8;
+
+enum FeaturedDownloadResult {
+    Saved(FeaturedImageRecord),
+    DownloadFailed(String),
+    ReadFailed(String),
+    EmptyResponse,
+    InvalidImage(String),
+}
+
+async fn download_featured_image(
+    client: Client,
+    remote: String,
+    image_id: i64,
+    version_id: i64,
+    version_name: String,
+    image: Value,
+    version_dir: PathBuf,
+    active: PathBuf,
+) -> (i64, FeaturedDownloadResult) {
+    let response = match client.get(&remote).timeout(Duration::from_secs(60)).send().await {
+        Ok(value) => value,
+        Err(error) => return (image_id, FeaturedDownloadResult::DownloadFailed(error.to_string())),
+    };
+
+    if !response.status().is_success() {
+        return (
+            image_id,
+            FeaturedDownloadResult::DownloadFailed(format!("Civitai returned {}", response.status())),
+        );
+    }
+
+    let bytes = match response.bytes().await {
+        Ok(value) => value,
+        Err(error) => return (image_id, FeaturedDownloadResult::ReadFailed(error.to_string())),
+    };
+
+    if bytes.is_empty() {
+        return (image_id, FeaturedDownloadResult::EmptyResponse);
+    }
+
+    let detected_format = match detect_image_format_from_bytes(&bytes) {
+        Ok(value) => value,
+        Err(error) => return (image_id, FeaturedDownloadResult::InvalidImage(error.to_string())),
+    };
+
+    let guessed_ext = featured_extension(&remote);
+    let ext = image_format_extension(detected_format)
+        .unwrap_or(guessed_ext.as_str())
+        .to_string();
+    let local = version_dir.join(format!("{image_id}.{ext}"));
+
+    if let Err(error) = fs::write(&local, &bytes) {
+        return (image_id, FeaturedDownloadResult::ReadFailed(error.to_string()));
+    }
+
+    let mut meta = image.clone();
+    if let Some(map) = meta.as_object_mut() {
+        map.insert("featured".into(), json!(true));
+        map.insert("civitai_version_id".into(), json!(version_id));
+        map.insert("civitai_version_name".into(), json!(version_name));
+    }
+
+    let prompt = meta.get("meta").and_then(|m| parse_meta(m, "prompt"));
+    let negative_prompt = meta
+        .get("meta")
+        .and_then(|m| parse_meta(m, "negativePrompt").or_else(|| parse_meta(m, "Negative prompt")));
+    let sampler = meta
+        .get("meta")
+        .and_then(|m| parse_meta(m, "sampler").or_else(|| parse_meta(m, "Sampler")));
+    let steps = meta.get("meta").and_then(|m| m.get("steps")).and_then(Value::as_i64);
+    let cfg = meta
+        .get("meta")
+        .and_then(|m| m.get("cfgScale").or_else(|| m.get("cfg")))
+        .and_then(Value::as_f64);
+    let seed = meta.get("meta").and_then(|m| m.get("seed")).and_then(Value::as_i64);
+    let width = image.get("width").and_then(Value::as_i64);
+    let height = image.get("height").and_then(Value::as_i64);
+    let final_local = active
+        .join(version_id.to_string())
+        .join(format!("{image_id}.{ext}"))
+        .to_string_lossy()
+        .to_string();
+
+    (
+        image_id,
+        FeaturedDownloadResult::Saved((
+            image_id,
+            Some(final_local),
+            None,
+            width,
+            height,
+            prompt,
+            negative_prompt,
+            steps,
+            cfg,
+            sampler,
+            seed,
+            serde_json::to_string(&meta).unwrap_or_else(|_| "{}".into()),
+        )),
+    )
+}
+
 fn featured_extension(url: &str) -> String {
     Url::parse(url)
         .ok()
@@ -1160,8 +1264,8 @@ async fn sync_featured_examples_inner(
     model_id: i64,
     handle: AppHandle,
     progress_model: Option<(usize, usize)>,
+    maintain_cache: bool,
 ) -> AppResult<usize> {
-    let _guard=app.cache_lock.lock().await;
     let model_record = { let c = open_db(&app.app_data)?; model_by_id(&c, model_id)? };
     let civitai_id = model_record.civitai_model_id.ok_or_else(|| AppError::Invalid("This model is not linked to Civitai".into()))?;
     let model_name = model_record.civitai_name.clone().unwrap_or_else(|| model_record.filename.clone());
@@ -1188,9 +1292,9 @@ async fn sync_featured_examples_inner(
     let (model_index, model_total)=progress_model.unwrap_or((0,1));
     let cache=cache_root(&app.app_data).join(civitai_id.to_string());
     fs::create_dir_all(&cache)?;
-    let staging=cache.join("featured.__staging");
+    let run_id=DOWNLOAD_COUNTER.fetch_add(1,Ordering::Relaxed);
+    let staging=cache.join(format!("featured.__staging_{run_id}"));
     let active=cache.join("featured");
-    if staging.exists(){let _=fs::remove_dir_all(&staging);}
     fs::create_dir_all(&staging)?;
     let client=civitai_client(&app)?;
 
@@ -1204,109 +1308,77 @@ async fn sync_featured_examples_inner(
 
     for (version_index,version) in versions.iter().enumerate(){
         let version_id=version.get("id").and_then(Value::as_i64).ok_or_else(||AppError::Api("Civitai returned a model version without an ID".into()))?;
-        let version_name=version.get("name").and_then(Value::as_str).unwrap_or("version");
-        emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index,version_total:total_versions,images_saved:saved_count,status:format!("Fetching featured images from {version_name}"),done:false,error:None});
+        let version_name=version.get("name").and_then(Value::as_str).unwrap_or("version").to_string();
+        emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index,version_total:total_versions,images_saved:saved_count,status:format!("Downloading featured images from {version_name}"),done:false,error:None});
 
         let images=version.get("images").and_then(Value::as_array).cloned().unwrap_or_default();
         image_entries += images.len();
-        for (image_index, image) in images.into_iter().enumerate(){
-            let remote=match image.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty()).map(str::to_string) {
-                Some(v)=>{
-                    image_urls += 1;
-                    v
-                }
-                None=>continue
-            };
-            let image_id=match featured_image_key(&image, version_id, image_index) {
-                Some(v)=>v,
-                None=>continue
-            };
-            let guessed_ext=featured_extension(&remote);
-            let version_dir=staging.join(version_id.to_string());
-            fs::create_dir_all(&version_dir)?;
+        let version_dir=staging.join(version_id.to_string());
+        fs::create_dir_all(&version_dir)?;
 
-            // Match the reference prototype: always fetch the exact Civitai URL
-            // and replace the cached file on refresh. Detect the actual image
-            // format from the response bytes instead of trusting the URL suffix.
-            let request=client.get(&remote).timeout(Duration::from_secs(60));
-            let response=match request.send().await {
-                Ok(value)=>value,
-                Err(error)=>{
-                    download_failures += 1;
-                    emit_examples_progress(&handle,ExamplesRefreshProgress{
+        let jobs: Vec<(String,i64,Value)> = images
+            .into_iter()
+            .enumerate()
+            .filter_map(|(image_index,image)| {
+                let remote=image.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty()).map(str::to_string)?;
+                image_urls += 1;
+                let image_id=featured_image_key(&image,version_id,image_index)?;
+                Some((remote,image_id,image))
+            })
+            .collect();
+
+        let results = stream::iter(jobs.into_iter().map(|(remote,image_id,image)| {
+            let client=client.clone();
+            let version_dir=version_dir.clone();
+            let active=active.clone();
+            let version_name=version_name.clone();
+            async move {
+                download_featured_image(
+                    client,remote,image_id,version_id,version_name,image,version_dir,active
+                ).await
+            }
+        }))
+        .buffer_unordered(FEATURED_IMAGE_DOWNLOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        for (image_id,result) in results {
+            match result {
+                FeaturedDownloadResult::Saved(record) => {
+                    records.push(record);
+                    saved_count+=1;
+                }
+                FeaturedDownloadResult::DownloadFailed(error) => {
+                    download_failures+=1;
+                    let _=handle.emit("examples-refresh-progress",ExamplesRefreshProgress{
                         current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                         version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                        status:format!("Could not download featured image {image_id}"),done:false,error:Some(error.to_string())
+                        status:format!("Could not download featured image {image_id}"),done:false,error:Some(error)
                     });
-                    continue;
                 }
-            };
-            if !response.status().is_success(){
-                download_failures += 1;
-                emit_examples_progress(&handle,ExamplesRefreshProgress{
-                    current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                    version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                    status:format!("Civitai returned {} for image {image_id}", response.status()),done:false,error:None
-                });
-                continue;
-            }
-            let bytes=match response.bytes().await {
-                Ok(value)=>value,
-                Err(error)=>{
-                    read_failures += 1;
-                    emit_examples_progress(&handle,ExamplesRefreshProgress{
+                FeaturedDownloadResult::ReadFailed(error) => {
+                    read_failures+=1;
+                    let _=handle.emit("examples-refresh-progress",ExamplesRefreshProgress{
                         current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                         version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                        status:format!("Could not read featured image {image_id}"),done:false,error:Some(error.to_string())
+                        status:format!("Could not read featured image {image_id}"),done:false,error:Some(error)
                     });
-                    continue;
                 }
-            };
-            if bytes.is_empty(){
-                empty_responses += 1;
-                emit_examples_progress(&handle,ExamplesRefreshProgress{
-                    current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                    version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                    status:format!("Civitai returned an empty featured image {image_id}"),done:false,error:None
-                });
-                continue;
-            }
-            let detected_format=match detect_image_format_from_bytes(&bytes) {
-                Ok(value)=>value,
-                Err(error)=>{
-                    read_failures += 1;
-                    emit_examples_progress(&handle,ExamplesRefreshProgress{
+                FeaturedDownloadResult::EmptyResponse => {
+                    empty_responses+=1;
+                }
+                FeaturedDownloadResult::InvalidImage(error) => {
+                    read_failures+=1;
+                    let _=handle.emit("examples-refresh-progress",ExamplesRefreshProgress{
                         current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                         version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                        status:format!("Could not identify featured image {image_id}"),done:false,error:Some(error.to_string())
+                        status:format!("Could not identify featured image {image_id}"),done:false,error:Some(error)
                     });
-                    continue;
                 }
-            };
-            let ext=image_format_extension(detected_format)
-                .unwrap_or(guessed_ext.as_str())
-                .to_string();
-            let local=version_dir.join(format!("{image_id}.{ext}"));
-            fs::write(&local,&bytes)?;
-            let mut meta=image.clone();
-            if let Some(map)=meta.as_object_mut(){
-                map.insert("featured".into(),json!(true));
-                map.insert("civitai_version_id".into(),json!(version_id));
-                map.insert("civitai_version_name".into(),json!(version_name));
             }
-            let prompt=meta.get("meta").and_then(|m|parse_meta(m,"prompt"));
-            let negative_prompt=meta.get("meta").and_then(|m|parse_meta(m,"negativePrompt").or_else(||parse_meta(m,"Negative prompt")));
-            let sampler=meta.get("meta").and_then(|m|parse_meta(m,"sampler").or_else(||parse_meta(m,"Sampler")));
-            let steps=meta.get("meta").and_then(|m|m.get("steps")).and_then(Value::as_i64);
-            let cfg=meta.get("meta").and_then(|m|m.get("cfgScale").or_else(||m.get("cfg"))).and_then(Value::as_f64);
-            let seed=meta.get("meta").and_then(|m|m.get("seed")).and_then(Value::as_i64);
-            let width=image.get("width").and_then(Value::as_i64);
-            let height=image.get("height").and_then(Value::as_i64);
-            let final_local=active.join(version_id.to_string()).join(format!("{image_id}.{ext}")).to_string_lossy().to_string();
-            records.push((image_id,Some(final_local),None,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into())));
-            saved_count+=1;
         }
-        emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index+1,version_total:total_versions,images_saved:saved_count,status:format!("Saved featured examples from {version_name} ({} download failures, {} read failures, {} empty responses)",download_failures,read_failures,empty_responses),done:false,error:None});
+
+        emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index+1,version_total:total_versions,images_saved:saved_count,status:format!("Saved featured examples from {version_name} ({} failures)",download_failures+read_failures+empty_responses),done:false,error:None});
     }
 
     if records.is_empty(){
@@ -1320,6 +1392,7 @@ async fn sync_featured_examples_inner(
         return Ok(0);
     }
 
+    let _commit_guard=app.cache_lock.lock().await;
     let mut preserved_featured_cover_key: Option<i64> = None;
     let mut preserved_featured_cover_path: Option<PathBuf> = None;
     let mut clear_stale_featured_cover = false;
@@ -1347,7 +1420,7 @@ async fn sync_featured_examples_inner(
         }
     }
 
-    let backup=cache.join("featured.__backup");
+    let backup=cache.join(format!("featured.__backup_{run_id}"));
     if backup.exists(){let _=fs::remove_dir_all(&backup);}
     if active.exists(){fs::rename(&active,&backup)?;}
     fs::rename(&staging,&active)?;
@@ -1405,9 +1478,11 @@ async fn sync_featured_examples_inner(
     match db_result{
         Ok(())=>{
             if backup.exists(){let _=fs::remove_dir_all(&backup);}
-            let bytes=dir_size(&cache_root(&app.app_data));
-            if let Ok(c)=open_db(&app.app_data){let _=put_setting(&c,"cache_bytes",&bytes.to_string());}
-            let _=enforce_cache_limit_inner(&app.app_data);
+            if maintain_cache {
+                let bytes=dir_size(&cache_root(&app.app_data));
+                if let Ok(c)=open_db(&app.app_data){let _=put_setting(&c,"cache_bytes",&bytes.to_string());}
+                let _=enforce_cache_limit_inner(&app.app_data);
+            }
             let _=handle.emit("models-changed",());
             Ok(saved_count)
         }
@@ -2590,7 +2665,7 @@ async fn link_model_civitai(
     };
     let _=handle.emit("models-changed",());
     drop(_guard);
-    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
+    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None, true).await?;
     Ok(rec)
 }
 
@@ -2720,32 +2795,54 @@ fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResu
         if total == 0 { return; }
 
         let mut saved_total = 0usize;
+        let mut completed = 0usize;
         let mut first_error: Option<String> = None;
-        for (index, (local_id, name)) in models.iter().enumerate() {
-            store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
-                current: index, total, model_id: Some(*local_id), model_name: Some(name.clone()),
-                version_current: 0, version_total: 0, images_saved: saved_total,
-                status: format!("Refreshing {name}"), done: false, error: None,
-            });
-            match sync_featured_examples_inner(state.clone(), *local_id, handle.clone(), Some((index, total))).await {
+
+        let results = stream::iter(models.iter().cloned().enumerate().map(|(index,(local_id,name))| {
+            let state=state.clone();
+            let handle=handle.clone();
+            async move {
+                store_examples_refresh_state(&state.examples_refresh_state,&handle,ExamplesRefreshProgress{
+                    current:index,total,model_id:Some(local_id),model_name:Some(name.clone()),
+                    version_current:0,version_total:0,images_saved:0,
+                    status:format!("Refreshing {name}"),done:false,error:None,
+                });
+                let result=sync_featured_examples_inner(state,local_id,handle,Some((index,total)),false).await;
+                (local_id,name,result)
+            }
+        }))
+        .buffer_unordered(FEATURED_MODEL_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        for (local_id,name,result) in results {
+            completed+=1;
+            match result {
                 Ok(saved) => {
-                    saved_total += saved;
-                    store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
-                        current: index + 1, total, model_id: Some(*local_id), model_name: Some(name.clone()),
-                        version_current: 0, version_total: 0, images_saved: saved_total,
-                        status: format!("Finished {name} ({saved} examples)"), done: false, error: None,
+                    saved_total+=saved;
+                    store_examples_refresh_state(&refresh_state,&handle,ExamplesRefreshProgress{
+                        current:completed,total,model_id:Some(local_id),model_name:Some(name.clone()),
+                        version_current:0,version_total:0,images_saved:saved_total,
+                        status:format!("Finished {name} ({saved} examples)"),done:false,error:None,
                     });
                 }
                 Err(e) => {
-                    let msg = e.to_string();
-                    if first_error.is_none() { first_error = Some(msg.clone()); }
-                    store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
-                        current: index + 1, total, model_id: Some(*local_id), model_name: Some(name.clone()),
-                        version_current: 0, version_total: 0, images_saved: saved_total,
-                        status: format!("Failed {name}"), done: false, error: Some(msg),
+                    let msg=e.to_string();
+                    if first_error.is_none(){first_error=Some(msg.clone());}
+                    store_examples_refresh_state(&refresh_state,&handle,ExamplesRefreshProgress{
+                        current:completed,total,model_id:Some(local_id),model_name:Some(name.clone()),
+                        version_current:0,version_total:0,images_saved:saved_total,
+                        status:format!("Failed {name}"),done:false,error:Some(msg),
                     });
                 }
             }
+        }
+
+        {
+            let _guard=state.cache_lock.lock().await;
+            let bytes=dir_size(&cache_root(&state.app_data));
+            if let Ok(c)=open_db(&state.app_data){let _=put_setting(&c,"cache_bytes",&bytes.to_string());}
+            let _=enforce_cache_limit_inner(&state.app_data);
         }
         store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
             current: total, total, model_id: None, model_name: None,
