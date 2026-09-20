@@ -460,17 +460,23 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
         }
     }
 
-    if scan_complete {
-        let mut stmt = c.prepare("SELECT path FROM models")?;
-        let existing: Vec<String> = stmt.query_map([], |r| r.get(0))?.filter_map(Result::ok).collect();
-        drop(stmt);
-        for path in existing {
-            if !seen.contains(&path) {
-                c.execute("DELETE FROM models WHERE path=?1", [&path])?;
-            }
+    prune_unseen_models(&c, &seen, scan_complete)?;
+
+    Ok(())
+}
+
+fn prune_unseen_models(c: &Connection, seen: &[String], scan_complete: bool) -> AppResult<()> {
+    if !scan_complete {
+        return Ok(());
+    }
+    let mut stmt = c.prepare("SELECT path FROM models")?;
+    let existing: Vec<String> = stmt.query_map([], |r| r.get(0))?.filter_map(Result::ok).collect();
+    drop(stmt);
+    for path in existing {
+        if !seen.contains(&path) {
+            c.execute("DELETE FROM models WHERE path=?1", [&path])?;
         }
     }
-
     Ok(())
 }
 
@@ -2493,22 +2499,7 @@ mod tests {
         let count_before: i64 = db.query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0)).unwrap();
         assert_eq!(count_before, 1);
 
-        fn prune_unseen_models_if_complete(c: &Connection, seen: &[String], complete: bool) -> AppResult<()> {
-            if !complete {
-                return Ok(());
-            }
-            let mut stmt = c.prepare("SELECT path FROM models")?;
-            let existing: Vec<String> = stmt.query_map([], |r| r.get(0))?.filter_map(Result::ok).collect();
-            drop(stmt);
-            for path in existing {
-                if !seen.contains(&path) {
-                    c.execute("DELETE FROM models WHERE path=?1", [&path])?;
-                }
-            }
-            Ok(())
-        }
-
-        prune_unseen_models_if_complete(&db, &[], false).unwrap();
+        prune_unseen_models(&db, &[], false).unwrap();
 
         let count_after: i64 = db.query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0)).unwrap();
         assert_eq!(count_after, 1);
