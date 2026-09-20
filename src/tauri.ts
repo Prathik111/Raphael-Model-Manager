@@ -68,6 +68,10 @@ type WebTaskStatus = {
 
 const sleep = (ms: number) => new Promise<void>(resolve => window.setTimeout(resolve, ms));
 
+class WebTaskFailedError extends Error {
+  readonly webTaskFailure = true;
+}
+
 async function webTaskCommand<T>(commandName: string, args: Record<string, unknown> = {}): Promise<T> {
   if (!isWebApp) {
     return invoke<T>(commandName, args);
@@ -112,12 +116,13 @@ async function webTaskCommand<T>(commandName: string, args: Record<string, unkno
         return task.result as T;
       }
       if (task.state === 'failed') {
-        throw new Error(task.error || 'Web task failed');
+        throw new WebTaskFailedError(task.error || 'Web task failed');
       }
 
       await sleep(delayMs);
       delayMs = Math.min(1200, delayMs + 100);
     } catch (error) {
+      if (error instanceof WebTaskFailedError) throw error;
       connectionFailures += 1;
       if (connectionFailures >= 20) {
         throw error instanceof Error ? error : new Error(String(error));
