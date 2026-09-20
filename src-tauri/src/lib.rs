@@ -564,10 +564,13 @@ fn get_tags(app:State<AppStateInner>)->AppResult<Vec<TagRecord>>{
 fn set_model_tags(app:State<AppStateInner>, handle:AppHandle, id:i64, tags:Vec<String>)->AppResult<ModelRecord>{
     let normalized=normalize_tags(tags);
     let c=open_db(&app.app_data)?;
-    c.execute(
+    let changed = c.execute(
         "UPDATE models SET tags_json=?2,tags_user_modified=1,updated_at=?3 WHERE id=?1",
         params![id,serde_json::to_string(&normalized).unwrap_or_else(|_|"[]".into()),now()],
     )?;
+    if changed == 0 {
+        return Err(AppError::Invalid("Model no longer exists".into()));
+    }
     let rec=model_by_id(&c,id)?;
     let _=handle.emit("models-changed",());
     Ok(rec)
@@ -1768,7 +1771,42 @@ mod tests {
     }
 
     #[test]
-    fn tag_search_supports_positive_negative_and_hash_syntax() {
+    fn tag_search_supports_positive_negative_and_hash_syntax() {    #[test]
+    fn set_model_tags_are_persistent() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let root = temp.path().join("models");
+        fs::create_dir_all(&root).unwrap();
+        let model_path = root.join("checkpoints/test.safetensors");
+        fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        fs::write(&model_path, b"checkpoint").unwrap();
+
+        let state = test_state(app_data.clone(), root.clone());
+        scan_root(&state, &root).unwrap();
+
+        let id: i64 = {
+            let db = open_db(&app_data).unwrap();
+            db.query_row("SELECT id FROM models LIMIT 1", [], |r| r.get(0)).unwrap()
+        };
+
+        {
+            let db = open_db(&app_data).unwrap();
+            let changed = db.execute(
+                "UPDATE models SET tags_json=?2,tags_user_modified=1,updated_at=?3 WHERE id=?1",
+                params![id, serde_json::to_string(&vec!["Anime", "Megumin"]).unwrap(), now()],
+            ).unwrap();
+            assert_eq!(changed, 1);
+        }
+
+        let db = open_db(&app_data).unwrap();
+        let stored: String = db
+            .query_row("SELECT tags_json FROM models WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        let tags: Vec<String> = serde_json::from_str(&stored).unwrap();
+        assert_eq!(tags, vec!["Anime", "Megumin"]);
+    }
+
+
         let model = ModelRecord {
             id: 1, path: "C:/models/a.safetensors".into(), relative_path: "loras/a.safetensors".into(),
             filename: "a.safetensors".into(), model_type: "LoRA".into(), size_bytes: 1, modified_at: 0,
