@@ -807,7 +807,7 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
 
   useEffect(() => {
     setRenderCount(Math.min(48, images.length));
-  }, [model.id]);
+  }, [model.id, images.length]);
 
   useEffect(() => {
     if (renderCount >= images.length) return;
