@@ -116,7 +116,7 @@ function SettingsOverlay({
   const [folderBusy, setFolderBusy] = useState(false);
   const [tagBusy, setTagBusy] = useState(false);
   const [tagResult, setTagResult] = useState<string | null>(null);
-  const [tagError, setTagError] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [civitaiToken, setCivitaiToken] = useState('');
   const [tokenSet, setTokenSet] = useState(false);
   const [tokenBusy, setTokenBusy] = useState(false);
@@ -131,14 +131,14 @@ function SettingsOverlay({
     if (!value || tokenBusy) return;
     setTokenBusy(true);
     setTokenMessage(null);
-    setTagError(null);
+    setSettingsError(null);
     try {
       await api.setCivitaiToken(value);
       setCivitaiToken('');
       setTokenSet(true);
       setTokenMessage('CIVITAI TOKEN SAVED TO RAPHAEL');
     } catch (error) {
-      setTagError(String(error));
+      setSettingsError(String(error));
     } finally {
       setTokenBusy(false);
     }
@@ -148,14 +148,14 @@ function SettingsOverlay({
     if (tokenBusy) return;
     setTokenBusy(true);
     setTokenMessage(null);
-    setTagError(null);
+    setSettingsError(null);
     try {
       await api.setCivitaiToken('');
       setCivitaiToken('');
       setTokenSet(false);
       setTokenMessage('CIVITAI TOKEN CLEARED');
     } catch (error) {
-      setTagError(String(error));
+      setSettingsError(String(error));
     } finally {
       setTokenBusy(false);
     }
@@ -171,7 +171,7 @@ function SettingsOverlay({
         window.location.reload();
       }
     } catch (error) {
-      setTagError(String(error));
+      setSettingsError(String(error));
     } finally {
       setFolderBusy(false);
     }
@@ -181,12 +181,12 @@ function SettingsOverlay({
     if (tagBusy) return;
     setTagBusy(true);
     setTagResult(null);
-    setTagError(null);
+    setSettingsError(null);
     try {
       const count = await api.addSubfolderTags();
       setTagResult(count === 1 ? 'ADDED SUBFOLDER TAGS TO 1 MODEL' : `ADDED SUBFOLDER TAGS TO ${count} MODELS`);
     } catch (error) {
-      setTagError(String(error));
+      setSettingsError(String(error));
     } finally {
       setTagBusy(false);
     }
@@ -237,7 +237,7 @@ function SettingsOverlay({
             {tokenSet ? <button className="text-btn settings-clear-btn" onClick={clearCivitaiToken} disabled={tokenBusy}>CLEAR</button> : null}
           </div>
           {tokenMessage ? <div className="settings-success">{tokenMessage}</div> : null}
-          {tagError ? <div className="error-box settings-error">{tagError}</div> : null}
+          {settingsError ? <div className="error-box settings-error">{settingsError}</div> : null}
         </section>
 
         <section className="settings-section">
