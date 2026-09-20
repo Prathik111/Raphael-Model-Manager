@@ -1066,7 +1066,7 @@ function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, o
 
 function DownloadProgressWidget({ progress, onClear }: { progress: DownloadProgress; onClear: (taskId: string) => void }) {
   const percent = progress.percent !== null ? Math.max(0, Math.min(100, progress.percent)) : null;
-  const active = progress.phase !== 'COMPLETED' && progress.phase !== 'FAILED' && progress.phase !== 'ALREADY INSTALLED';
+  const active = progress.phase !== 'COMPLETED' && progress.phase !== 'FAILED' && progress.phase !== 'ALREADY INSTALLED' && progress.phase !== 'ALREADY QUEUED';
   const width = percent !== null ? percent : 8;
   const finished = !active;
   return <div className={'download-widget ' + (progress.phase === 'FAILED' ? 'failed' : finished ? 'done' : '')}>
@@ -1092,6 +1092,7 @@ function App() {
   const [coverEditorOpen,setCoverEditorOpen]=useState(false);
   const [thumbnailFit,setThumbnailFit]=useState<ThumbnailFit>(initialThumbnailFit);
   const [downloadProgress,setDownloadProgress]=useState<DownloadProgress[]>([]);
+  const [parallelDownloads,setParallelDownloads]=useState(3);
   const [examplesRefreshProgress,setExamplesRefreshProgress]=useState<ExamplesRefreshProgress|null>(null);
   const [examplesRefreshRunning,setExamplesRefreshRunning]=useState(false);
   const [importClosing,setImportClosing]=useState(false);
@@ -1101,12 +1102,18 @@ function App() {
     let disposed = false;
     const pull = async () => {
       try {
-        const progress = await api.getDownloadProgress();
-        if (!disposed) setDownloadProgress(progress.filter(item => item.visible));
+        const [progress, parallel] = await Promise.all([
+          api.getDownloadProgress(),
+          api.getParallelDownloads(),
+        ]);
+        if (!disposed) {
+          setDownloadProgress(progress.filter(item => item.visible));
+          setParallelDownloads(Math.max(1, Math.min(8, parallel)));
+        }
       } catch {}
     };
     void pull();
-    const timer = window.setInterval(() => void pull(), 450);
+    const timer = window.setInterval(() => void pull(), 600);
     return () => { disposed = true; window.clearInterval(timer); };
   }, []);
 
@@ -1376,12 +1383,29 @@ function App() {
   return <div className={`app-shell thumb-fit-${thumbnailFit}`}><Background/><div className="noise"/>
     <header className="topbar"><div className="brand"><PulseMark/><span>RAPHAEL MODEL MANAGER</span></div><div className="top-stats"><span>CACHED <b>{fmtBytes(state.storage.cached_bytes)}</b></span><span>TOTAL <b>{fmtBytes(state.storage.total_model_bytes)}</b></span></div><div className="top-actions"><button className={`web-app-btn ${webStatus.enabled ? 'active' : ''}`} disabled={api.isWebApp || webBusy} title={api.isWebApp ? 'LAN web app is controlled from the host desktop' : 'Expose Raphael to other devices on your private LAN'} onClick={toggleWebApp}>{webBusy ? 'STARTING…' : api.isWebApp ? 'WEB APP · CONNECTED' : webStatus.enabled ? 'WEB APP · ON' : 'ENABLE WEB APP'}</button>{webStatus.enabled && webStatus.url ? <a className="web-app-url" href={webStatus.url} target="_blank" rel="noreferrer">{webStatus.url}</a> : null}{webError ? <span className="web-app-error" title={webError}>WEB ERROR</span> : null}<div className="root-path" title={state.models_root}>{state.models_root}</div></div></header>
     <div className="workspace">
-      <aside className="sidebar hud-panel"><div className="side-title">LIBRARY</div><nav>{TYPES.map(t=><button key={t.key} className={type===t.key?'active':''} onClick={()=>setType(t.key)}><span>{t.label}</span><b>{t.key==='All' ? counts.all : (counts.by_type[t.key] ?? 0)}</b></button>)}</nav><div className="sidebar-foot">
-        {downloadProgress.length ? <div className="download-list">{downloadProgress.map(progress => <DownloadProgressWidget key={progress.task_id || progress.filename} progress={progress} onClear={clearDownload}/>)}</div> : null}
-        <button className="settings-trigger" aria-label="Open settings" title="SETTINGS" onClick={()=>setSettingsOpen(true)}>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Zm0-5.2 1 .3.7 2.1c.4.1.8.3 1.2.5l2-.9.9.7-.2 2.2c.3.3.6.6.9.9l2.2-.2.7.9-.9 2c.2.4.4.8.5 1.2l2.1.7.3 1-.3 1-2.1.7a7.4 7.4 0 0 1-.5 1.2l.9 2-.7.9-2.2-.2c-.3.3-.6.6-.9.9l.2 2.2-.9.7-2-.9c-.4.2-.8.4-1.2.5l-.7 2.1-1 .3-1-.3-.7-2.1a7.4 7.4 0 0 1-1.2-.5l-2 .9-.9-.7.2-2.2a7.2 7.2 0 0 1-.9-.9l-2.2.2-.7-.9.9-2c-.2-.4-.4-.8-.5-1.2l-2.1-.7-.3-1 .3-1 2.1-.7c.1-.4.3-.8.5-1.2l-.9-2 .7-.9 2.2.2c.3-.3.6-.6.9-.9l-.2-2.2.9-.7 2 .9c.4-.2.8-.4 1.2-.5l.7-2.1 1-.3Z"/></svg>
-        </button>
-      </div></aside>
+      <aside className="sidebar hud-panel">
+        <div className="side-title">LIBRARY</div>
+        <nav>{TYPES.map(t=><button key={t.key} className={type===t.key?'active':''} onClick={()=>setType(t.key)}><span>{t.label}</span><b>{t.key==='All' ? counts.all : (counts.by_type[t.key] ?? 0)}</b></button>)}</nav>
+        <div className="sidebar-downloads">
+          <div className="download-queue-header">
+            <div>
+              <div className="download-queue-title">DOWNLOADS</div>
+              <div className="download-queue-subtitle">{downloadProgress.length ? 'ACTIVE · QUEUED · FINISHED' : 'NO DOWNLOADS'}</div>
+            </div>
+            <span className="download-queue-count">{downloadProgress.length}</span>
+          </div>
+          {downloadProgress.length
+            ? <div className="download-list" data-parallel={parallelDownloads}>
+                {downloadProgress.map(progress => <DownloadProgressWidget key={progress.task_id || progress.filename} progress={progress} onClear={clearDownload}/>)}
+              </div>
+            : <div className="download-queue-empty">IMPORT A CIVITAI LINK FILE OR START A MODEL DOWNLOAD.</div>}
+        </div>
+        <div className="sidebar-foot">
+          <button className="settings-trigger" aria-label="Open settings" title="SETTINGS" onClick={()=>setSettingsOpen(true)}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0-0.9.9l-2.2-.2-.7.9.9 2c-.2.4-.4.8-.5 1.2l-2.1.7-.3 1 .3 1 2.1.7c.1.4.3.8.5 1.2l-.9 2 .7.9 2.2-.2c.3.3.6.6.9.9l-.2 2.2.9.7 2-.9c.4.2.8.4 1.2.5l.7 2.1 1 .3 1-.3.7-2.1c.4-.1.8-.3 1.2-.5l2 .9.9-.7-.2-2.2c.3-.3.6-.6.9-.9l2.2.2.7-.9-.9-2c.2-.4.4-.8.5-1.2l2.1-.7.3-1-.3-1-2.1-.7c-.1-.4-.3-.8-.5-1.2l.9-2-.7-.9-2.2.2c-.3-.3-.6-.6-.9-.9l.2-2.2-.9-.7-2 .9c-.4-.2-.8-.4-1.2-.5l-.7-2.1-1-.3-1 .3-.7 2.1c-.4.1-.8.3-1.2.5l-2-.9-.9.7.2 2.2c-.3.3-.6.6-.9.9Z"/></svg>
+          </button>
+        </div>
+      </aside>
       <main className="library"><div className="library-head"><div><div className="eyebrow">{type.toUpperCase()}</div><h1>{type==='All'?'MODEL LIBRARY':type.toUpperCase()}</h1></div><div className="library-tools"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search models, tags, tag:…"/><button className={`tag-filter-button ${activeTags.length?'active':''}`} onClick={()=>setTagPanelOpen(v=>!v)}>TAGS{activeTags.length ? ` · ${activeTags.length}` : ''}</button><button className="import-btn" onClick={()=>{setImportClosing(false);setImportError(null);setImportUrl('');setImportType('Other');setCustomDownloadPath(false);setDownloadPath('');setPreview({model:{},version:{id:0,name:'',base_model:null,download_url:'',filename:null,size_bytes:null,activation_prompts:[]},target_directory:'',thumbnail_path:null});}}>IMPORT CIVITAI</button><select value={sort} onChange={e=>setSort(e.target.value)}><option value="name">NAME</option><option value="size">SIZE</option><option value="path">PATH</option></select></div>{tagPanelOpen && <TagFilterPanel tags={allTags} activeTags={activeTags} onToggle={tag=>setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current.filter(x=>x.toLowerCase()!==tag.toLowerCase()):[...current,tag])} onClear={()=>setActiveTags([])}/>}</div>{activeTags.length ? <div className="active-tag-bar">{activeTags.map(tag=><button key={tag} onClick={()=>setActiveTags(current=>current.filter(x=>x.toLowerCase()!==tag.toLowerCase()))}>{tag}<span>×</span></button>)}<span className="active-tag-help">TAG FILTERS</span></div> : null}<div className="grid">{models.map(m=><ModelCard key={m.id} model={m} selected={m.id===selectedId} onClick={()=>setSelectedId(m.id)}/>)}{!models.length&&<div className="empty-state">No models match the current view.</div>}</div></main>
       {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} galleryHasMore={galleryHasMore} galleryFetchBusy={galleryFetchBusy} onFetchMore={onFetchMore} onOpenImage={openImageViewer} onRefresh={async()=>{await api.refreshModel(selected.id); await refresh(); const more=await api.syncModelGallery(selected.id,20); const result=await api.getImages(selected.id,1000); setImages(result.images); setGalleryHasMore(more);}} onLinkCivitai={async(url)=>{await api.linkModelCivitai(selected.id,url); await refresh(); const more=await api.syncModelGallery(selected.id,20); const result=await api.getImages(selected.id,1000); setImages(result.images); setGalleryHasMore(more);}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)} onChooseThumbnail={async imageId=>{const updated=await api.setModelCoverFromImage(selected.id,imageId); setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
       {selected && coverEditorOpen && <CoverEditorOverlay model={selected} onClose={()=>setCoverEditorOpen(false)} onUpdated={updated=>{setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
