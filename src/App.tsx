@@ -117,6 +117,49 @@ function SettingsOverlay({
   const [tagBusy, setTagBusy] = useState(false);
   const [tagResult, setTagResult] = useState<string | null>(null);
   const [tagError, setTagError] = useState<string | null>(null);
+  const [civitaiToken, setCivitaiToken] = useState('');
+  const [tokenSet, setTokenSet] = useState(false);
+  const [tokenBusy, setTokenBusy] = useState(false);
+  const [tokenMessage, setTokenMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.getCivitaiTokenSet().then(setTokenSet).catch(() => setTokenSet(false));
+  }, []);
+
+  const saveCivitaiToken = async () => {
+    const value = civitaiToken.trim();
+    if (!value || tokenBusy) return;
+    setTokenBusy(true);
+    setTokenMessage(null);
+    setTagError(null);
+    try {
+      await api.setCivitaiToken(value);
+      setCivitaiToken('');
+      setTokenSet(true);
+      setTokenMessage('CIVITAI TOKEN SAVED TO RAPHAEL');
+    } catch (error) {
+      setTagError(String(error));
+    } finally {
+      setTokenBusy(false);
+    }
+  };
+
+  const clearCivitaiToken = async () => {
+    if (tokenBusy) return;
+    setTokenBusy(true);
+    setTokenMessage(null);
+    setTagError(null);
+    try {
+      await api.setCivitaiToken('');
+      setCivitaiToken('');
+      setTokenSet(false);
+      setTokenMessage('CIVITAI TOKEN CLEARED');
+    } catch (error) {
+      setTagError(String(error));
+    } finally {
+      setTokenBusy(false);
+    }
+  };
 
   const changeFolder = async () => {
     if (api.isWebApp || folderBusy) return;
@@ -171,6 +214,33 @@ function SettingsOverlay({
         </section>
 
         <section className="settings-section">
+          <div className="section-head">CIVITAI ACCESS</div>
+          <p className="settings-copy">Paste an optional Civitai API token here. Raphael stores it in the host credential store and uses it for authenticated model downloads and API requests.</p>
+          <div className="settings-token-status">
+            <span className={tokenSet ? 'online' : ''}>{tokenSet ? 'TOKEN CONFIGURED' : 'NO TOKEN CONFIGURED'}</span>
+            <span>{api.isWebApp ? 'HOST TOKEN' : 'LOCAL TOKEN'}</span>
+          </div>
+          <div className="settings-token-row">
+            <input
+              className="settings-token-input"
+              type="password"
+              value={civitaiToken}
+              onChange={e => setCivitaiToken(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void saveCivitaiToken(); } }}
+              placeholder={tokenSet ? 'Paste a new token to replace the current one' : 'Paste Civitai API token'}
+              autoComplete="off"
+              disabled={tokenBusy}
+            />
+            <button className="primary-btn small" onClick={saveCivitaiToken} disabled={tokenBusy || !civitaiToken.trim()}>
+              {tokenBusy ? 'SAVING…' : 'SAVE TOKEN'}
+            </button>
+            {tokenSet ? <button className="text-btn settings-clear-btn" onClick={clearCivitaiToken} disabled={tokenBusy}>CLEAR</button> : null}
+          </div>
+          {tokenMessage ? <div className="settings-success">{tokenMessage}</div> : null}
+          {tagError ? <div className="error-box settings-error">{tagError}</div> : null}
+        </section>
+
+        <section className="settings-section">
           <div className="section-head">THUMBNAIL SCALING</div>
           <p className="settings-copy">Controls how model thumbnails are scaled inside the fixed Raphael card and import placeholder.</p>
           <div className="settings-options">
@@ -193,7 +263,6 @@ function SettingsOverlay({
           <div className="folder-tag-example"><span>loras/Illustrus/Character/model.safetensors</span><b>→</b><em>Illustrus · Character</em></div>
           <button className="primary-btn" onClick={addSubfolderTags} disabled={tagBusy}>{tagBusy ? 'SCANNING…' : 'ADD SUBFOLDERS AS TAGS'}</button>
           {tagResult ? <div className="settings-success">{tagResult}</div> : null}
-          {tagError ? <div className="error-box settings-error">{tagError}</div> : null}
         </section>
       </div>
     </section>
@@ -473,8 +542,6 @@ function CoverEditorOverlay({
 
 function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTags, onSaveType, onDelete, onFilterTag, onChangeCover }: { model: ModelRecord; images: ModelImage[]; allTags: TagRecord[]; onRefresh: ()=>void; onLinkCivitai: (url: string)=>Promise<void>; onSaveTags: (tags: string[])=>Promise<void>; onSaveType: (type: string)=>Promise<void>; onDelete: ()=>Promise<void>; onFilterTag: (tag: string)=>void; onChangeCover: ()=>void }) {
   const [tab, setTab] = useState<'overview'|'examples'|'files'>('overview');
-  const [showToken, setShowToken] = useState(false);
-  const [token, setToken] = useState('');
   const [civitaiUrl, setCivitaiUrl] = useState(model.civitai_url || '');
   const [linkBusy, setLinkBusy] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
@@ -494,7 +561,6 @@ function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTag
       <section><div className="section-head section-head-row"><span>TAGS</span><span className="section-action">EDITABLE</span></div><TagEditor model={model} allTags={allTags} onSave={onSaveTags} onFilter={onFilterTag}/></section>
       <section><div className="section-head">LOCATION</div><div className="mono-box">{model.path}</div><button className="text-btn" disabled={api.isWebApp} title={api.isWebApp ? 'Opening the Windows file manager is available only in the desktop app' : undefined} onClick={()=>api.openFolder(model.path)}>{api.isWebApp ? 'OPEN FOLDER · DESKTOP' : 'OPEN FOLDER'}</button></section>
       <section><div className="section-head">CIVITAI SOURCE</div>{model.civitai_url ? <div className="civitai-source-panel"><div className="source-line"><span className="source-dot"/><span className="source-label">LINKED SOURCE</span><span className="source-domain">{new URL(model.civitai_url).hostname.replace(/^www\./,'').toUpperCase()}</span></div><div className="mono-box source-url">{model.civitai_url}</div><button className="text-btn" onClick={onRefresh}>REFRESH SOURCE DATA</button></div> : <div className="civitai-link-panel"><div className="source-line"><span className="source-dot"/><span className="source-label">LINK LOCAL MODEL</span><span className="source-domain">CIVITAI</span></div><p className="empty-inline">Paste a Civitai model page to pull its metadata, gallery and thumbnail into Raphael.</p><div className="link-row"><input value={civitaiUrl} onChange={e=>{setCivitaiUrl(e.target.value);setLinkError(null);}} placeholder="civitai.com/models/... or civitai.red/models/..."/><button className="primary-btn small" disabled={linkBusy} onClick={async()=>{if(!civitaiUrl.trim()) return; setLinkBusy(true); setLinkError(null); try { await onLinkCivitai(civitaiUrl.trim()); } catch (e) { setLinkError(String(e)); } finally { setLinkBusy(false); }}}>{linkBusy?'FETCHING…':'FETCH DETAILS'}</button></div>{linkError ? <div className="error-box">{linkError}</div> : null}</div>}</section>
-      <section><div className="section-head">API TOKEN</div><button className="text-btn" onClick={()=>setShowToken(v=>!v)}>{showToken?'HIDE':'SET OPTIONAL CIVITAI TOKEN'}</button>{showToken && <div className="token-box"><input value={token} onChange={e=>setToken(e.target.value)} placeholder="Paste token" type="password"/><button className="primary-btn small" onClick={async()=>{await api.setCivitaiToken(token); setToken(''); setShowToken(false);}}>SAVE</button></div>}</section>
     </div>}
     {tab==='examples' && <div className="inspector-scroll"><section><div className="section-head">CACHED CIVITAI GALLERY · {images.length}</div><Gallery images={images}/></section></div>}
     {tab==='files' && <div className="inspector-scroll"><section><div className="section-head">LOCAL FILE</div><div className="kv"><span>SIZE</span><b>{fmtBytes(model.size_bytes)}</b></div><div className="kv"><span>TYPE</span><b>{model.model_type}</b></div><div className="kv"><span>BASE</span><b>{model.base_model || '—'}</b></div><div className="kv"><span>VERSION</span><b>{model.version_name || '—'}</b></div><div className="kv"><span>CREATOR</span><b>{model.creator || '—'}</b></div><div className="kv"><span>SHA256</span><b className="wrap">{model.source_hash || 'Not computed'}</b></div></section><section className="danger-section"><div className="section-head">DANGER ZONE</div><p className="danger-copy">Permanently delete this model file from disk and remove its Raphael metadata and cached gallery entries.</p><button className="danger-btn" onClick={()=>{setDeleteError(null);setDeleteOpen(true);}} disabled={deleteBusy}>DELETE MODEL</button></section></div>}
