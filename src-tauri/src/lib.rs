@@ -1,6 +1,6 @@
 use chrono::Utc;
 use futures_util::StreamExt;
-use image::imageops::FilterType;
+use image::{imageops::FilterType, ImageFormat, ImageReader};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -1221,14 +1221,13 @@ async fn sync_featured_examples_inner(
                 Some(v)=>v,
                 None=>continue
             };
-            let ext=featured_extension(&remote);
+            let guessed_ext=featured_extension(&remote);
             let version_dir=staging.join(version_id.to_string());
             fs::create_dir_all(&version_dir)?;
-            let local=version_dir.join(format!("{image_id}.{ext}"));
 
             // Match the reference prototype: always fetch the exact Civitai URL
-            // and replace the cached file on refresh. Do not inspect/decode the
-            // response as part of retrieval.
+            // and replace the cached file on refresh. Detect the actual image
+            // format from the response bytes instead of trusting the URL suffix.
             let request=client.get(&remote).timeout(Duration::from_secs(60));
             let response=match request.send().await {
                 Ok(value)=>value,
@@ -1272,6 +1271,22 @@ async fn sync_featured_examples_inner(
                 });
                 continue;
             }
+            let detected_format=match detect_image_format_from_bytes(&bytes) {
+                Ok(value)=>value,
+                Err(error)=>{
+                    read_failures += 1;
+                    emit_examples_progress(&handle,ExamplesRefreshProgress{
+                        current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                        version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                        status:format!("Could not identify featured image {image_id}"),done:false,error:Some(error.to_string())
+                    });
+                    continue;
+                }
+            };
+            let ext=image_format_extension(detected_format)
+                .unwrap_or(guessed_ext.as_str())
+                .to_string();
+            let local=version_dir.join(format!("{image_id}.{ext}"));
             fs::write(&local,&bytes)?;
             let mut meta=image.clone();
             if let Some(map)=meta.as_object_mut(){
@@ -1707,17 +1722,49 @@ fn custom_cover_extension(path: &Path) -> Option<&'static str> {
         Some("png") => Some("png"),
         Some("jpg") | Some("jpeg") => Some("jpg"),
         Some("webp") => Some("webp"),
+        Some("avif") => Some("avif"),
         _ => None,
     }
+}
+
+fn image_format_extension(format: ImageFormat) -> Option<&'static str> {
+    match format {
+        ImageFormat::Png => Some("png"),
+        ImageFormat::Jpeg => Some("jpg"),
+        ImageFormat::WebP => Some("webp"),
+        ImageFormat::Avif => Some("avif"),
+        _ => None,
+    }
+}
+
+fn detect_image_format_from_bytes(bytes: &[u8]) -> AppResult<ImageFormat> {
+    let reader = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| AppError::Invalid(format!("Could not determine image format: {e}")))?;
+    reader
+        .format()
+        .ok_or_else(|| AppError::Invalid("Could not determine image format from image data".into()))
+}
+
+fn decode_image_file(path: &Path) -> AppResult<image::DynamicImage> {
+    let file = File::open(path)?;
+    let reader = ImageReader::new(BufReader::new(file))
+        .with_guessed_format()
+        .map_err(|e| AppError::Invalid(format!("Could not inspect image: {e}")))?;
+    reader
+        .decode()
+        .map_err(|e| AppError::Invalid(format!("Could not decode image: {e}")))
 }
 
 fn copy_custom_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<PathBuf> {
     if !source.is_file() {
         return Err(AppError::Invalid("Selected cover image is not a file".into()));
     }
-    let ext = custom_cover_extension(source)
-        .ok_or_else(|| AppError::Invalid("Custom covers must be PNG, JPG, JPEG, or WebP images".into()))?;
-    image::open(source)
+    let format = detect_image_format_from_bytes(&fs::read(source)?)?;
+    let ext = image_format_extension(format)
+        .or_else(|| custom_cover_extension(source))
+        .ok_or_else(|| AppError::Invalid("Custom covers must be PNG, JPG, JPEG, WebP, or AVIF images".into()))?;
+    decode_image_file(source)
         .map_err(|e| AppError::Invalid(format!("Could not read the custom cover image: {e}")))?;
     let dir = cache_root(&app.app_data).join("covers");
     fs::create_dir_all(&dir)?;
@@ -1737,10 +1784,11 @@ fn copy_cached_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
     if !canonical_source.starts_with(&cache_root_path) || !canonical_source.is_file() {
         return Err(AppError::Invalid("That example image is outside Raphael's Civitai cache".into()));
     }
-    image::open(&canonical_source)
-        .map_err(|e| AppError::Invalid(format!("Could not read the example image: {e}")))?;
-    let ext = custom_cover_extension(&canonical_source)
+    let format = detect_image_format_from_bytes(&fs::read(&canonical_source)?)?;
+    let ext = image_format_extension(format)
         .ok_or_else(|| AppError::Invalid("The cached example image has an unsupported format".into()))?;
+    decode_image_file(&canonical_source)
+        .map_err(|e| AppError::Invalid(format!("Could not read the example image: {e}")))?;
     let dir = cache_root(&app.app_data).join("covers");
     fs::create_dir_all(&dir)?;
     let sequence = DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2330,28 +2378,40 @@ async fn sync_gallery_inner(
                 c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1 AND civitai_image_id=?2", params![model_id, iid], |r| r.get::<_, i64>(0))? > 0
             };
             let remote = img.get("url").and_then(Value::as_str).unwrap_or("");
-            let ext = remote.split('?').next().and_then(|x| Path::new(x).extension()).and_then(|x| x.to_str()).unwrap_or("jpg");
-            let local = cache.join(format!("{iid}.{ext}"));
+            let guessed_ext = remote.split('?').next().and_then(|x| Path::new(x).extension()).and_then(|x| x.to_str()).unwrap_or("jpg");
             let thumb = cache.join(format!("{iid}_thumb.webp"));
-            let local_path = if local.exists() {
-                Some(local.to_string_lossy().to_string())
-            } else if !remote.is_empty() {
-                match client.get(remote).send().await {
-                    Ok(resp) => match resp.error_for_status() {
-                        Ok(resp) => match resp.bytes().await {
-                            Ok(bytes) if fs::write(&local, &bytes).is_ok() => Some(local.to_string_lossy().to_string()),
-                            _ => None,
+            let local_path = if !remote.is_empty() {
+                if cache.join(format!("{iid}.{guessed_ext}")).exists() {
+                    Some(cache.join(format!("{iid}.{guessed_ext}")).to_string_lossy().to_string())
+                } else {
+                    match client.get(remote).send().await {
+                        Ok(resp) => match resp.error_for_status() {
+                            Ok(resp) => match resp.bytes().await {
+                                Ok(bytes) => {
+                                    let ext = detect_image_format_from_bytes(&bytes)
+                                        .ok()
+                                        .and_then(image_format_extension)
+                                        .unwrap_or(guessed_ext);
+                                    let local = cache.join(format!("{iid}.{ext}"));
+                                    if fs::write(&local, &bytes).is_ok() {
+                                        Some(local.to_string_lossy().to_string())
+                                    } else {
+                                        None
+                                    }
+                                },
+                                Err(_) => None,
+                            },
+                            Err(_) => None,
                         },
                         Err(_) => None,
-                    },
-                    Err(_) => None,
+                    }
                 }
             } else { None };
             if let Some(lp) = &local_path {
                 if !thumb.exists() {
-                    if let Ok(im) = image::open(lp) {
+                    if let Ok(im) = decode_image_file(Path::new(lp)) {
                         let t = im.resize(420, 420, FilterType::Triangle);
-                        let _ = t.save_with_format(&thumb, image::ImageFormat::WebP);
+                        let _ = t.save_with_format(&thumb, ImageFormat::WebP);
                     }
                 }
             }
@@ -3275,6 +3335,24 @@ mod tests {
         assert_ne!(copied, source);
 
         let copied_image = image::open(copied).unwrap();
+        assert_eq!(copied_image.width(), 2);
+        assert_eq!(copied_image.height(), 2);
+    }
+
+    #[test]
+    fn cached_featured_cover_uses_actual_image_format_not_filename_extension() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let model_cache = app_data.join("cache").join("civitai").join("123").join("featured").join("456");
+        fs::create_dir_all(&model_cache).unwrap();
+        let source = model_cache.join("789.jpg");
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0]));
+        image.save_with_format(&source, ImageFormat::Png).unwrap();
+
+        let state = test_state(app_data.clone(), temp.path().join("models"));
+        let copied = copy_cached_cover(&state, 43, &source).unwrap();
+        assert_eq!(copied.extension().and_then(|x| x.to_str()), Some("png"));
+        let copied_image = decode_image_file(&copied).unwrap();
         assert_eq!(copied_image.width(), 2);
         assert_eq!(copied_image.height(), 2);
     }
