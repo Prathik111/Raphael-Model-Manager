@@ -696,23 +696,14 @@ async fn sync_featured_examples_inner(
         bc.cmp(ac).then_with(|| bi.cmp(&ai))
     });
 
-    // Civitai may return recent versions with no creator/featured images
-    // (for example moderated or taken-down versions). Walk newest-to-oldest
-    // and keep the first five versions that contain at least one usable image.
-    versions.retain(|version| {
-        version
-            .get("images")
-            .and_then(Value::as_array)
-            .map(|images| images.iter().any(|image| {
-                image.get("url").and_then(Value::as_str).map(|url| !url.trim().is_empty()).unwrap_or(false)
-            }))
-            .unwrap_or(false)
-    });
-    versions.truncate(5);
     if versions.is_empty() {
-        return Err(AppError::Api("Civitai returned no featured images in any published model version".into()));
+        return Err(AppError::Api("Civitai returned no published model versions".into()));
     }
 
+    // Process every published model version returned by Civitai and every
+    // creator-uploaded image in version.images[]. There is intentionally no
+    // version limit here: the prototype and the Civitai model endpoint expose
+    // featured images on every returned model version.
     let total_versions=versions.len();
     let (model_index, model_total)=progress_model.unwrap_or((0,1));
     let cache=cache_root(&app.app_data).join(civitai_id.to_string());
@@ -838,7 +829,7 @@ async fn sync_featured_examples_inner(
 
     if records.is_empty(){
         let _=fs::remove_dir_all(&staging);
-        return Err(AppError::Api("Civitai returned no featured images in the newest five model versions".into()));
+        return Err(AppError::Api(format!("Civitai returned no featured images across {} published model versions", total_versions)));
     }
 
     let c = open_db(&app.app_data)?;
@@ -2003,7 +1994,7 @@ async fn refresh_model_civitai(
 fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResult<ExamplesRefreshProgress> {
     let initial = ExamplesRefreshProgress {
         current: 0, total: 0, model_id: None, model_name: None,
-        version_current: 0, version_total: 5, images_saved: 0,
+        version_current: 0, version_total: 0, images_saved: 0,
         status: "Starting featured example refresh".into(), done: false, error: None,
     };
     {
@@ -2040,7 +2031,7 @@ fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResu
         let total = models.len();
         store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
             current: 0, total, model_id: None, model_name: None,
-            version_current: 0, version_total: if total > 0 { 5 } else { 0 },
+            version_current: 0, version_total: 0,
             images_saved: 0,
             status: if total == 0 { "No Civitai-linked models found".into() } else { "Starting featured example refresh".into() },
             done: total == 0, error: None,
@@ -2052,7 +2043,7 @@ fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResu
         for (index, (local_id, name)) in models.iter().enumerate() {
             store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
                 current: index, total, model_id: Some(*local_id), model_name: Some(name.clone()),
-                version_current: 0, version_total: 5, images_saved: saved_total,
+                version_current: 0, version_total: 0, images_saved: saved_total,
                 status: format!("Refreshing {name}"), done: false, error: None,
             });
             match sync_featured_examples_inner(state.clone(), *local_id, handle.clone(), Some((index, total))).await {
@@ -2060,7 +2051,7 @@ fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResu
                     saved_total += saved;
                     store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
                         current: index + 1, total, model_id: Some(*local_id), model_name: Some(name.clone()),
-                        version_current: 5, version_total: 5, images_saved: saved_total,
+                        version_current: 0, version_total: 0, images_saved: saved_total,
                         status: format!("Finished {name} ({saved} examples)"), done: false, error: None,
                     });
                 }
