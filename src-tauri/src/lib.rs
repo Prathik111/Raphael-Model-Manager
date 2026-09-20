@@ -2472,6 +2472,46 @@ mod tests {
     }
 
     #[test]
+    fn featured_refresh_state_starts_idle() {
+        let state = ExamplesRefreshState::default();
+        assert!(!state.running);
+        assert!(state.progress.is_none());
+    }
+
+    #[test]
+    fn featured_remote_url_builds_civitai_cdn_urls() {
+        let image = json!({
+            "url": "123456789",
+            "name": "example.webp"
+        });
+        assert_eq!(
+            featured_remote_url(&image).as_deref(),
+            Some("https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/123456789/original=true/example.webp")
+        );
+    }
+
+    #[test]
+    fn cached_featured_cover_is_copied_to_stable_cover_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let model_cache = app_data.join("cache").join("civitai").join("123").join("featured").join("456");
+        fs::create_dir_all(&model_cache).unwrap();
+        let source = model_cache.join("789.jpg");
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0]));
+        image.save(&source).unwrap();
+
+        let state = test_state(app_data.clone(), temp.path().join("models"));
+        let copied = copy_cached_cover(&state, 42, &source).unwrap();
+        assert!(copied.starts_with(app_data.join("cache").join("covers")));
+        assert!(copied.is_file());
+        assert_ne!(copied, source);
+
+        let copied_image = image::open(copied).unwrap();
+        assert_eq!(copied_image.width(), 2);
+        assert_eq!(copied_image.height(), 2);
+    }
+
+    #[test]
     fn database_schema_is_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let first = open_db(temp.path()).unwrap();
