@@ -15,7 +15,7 @@ use std::{
     sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, OnceLock, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tauri::{AppHandle, Emitter, Manager, State};
 use thiserror::Error;
 use url::Url;
@@ -26,6 +26,22 @@ mod web;
 const API_BASE: &str = "https://civitai.com/api/v1";
 const USER_AGENT: &str = "RaphaelModelManager/0.1.0";
 static DOWNLOAD_COUNTER: AtomicU64 = AtomicU64::new(1);
+static MODEL_CHANGE_REVISION: AtomicU64 = AtomicU64::new(1);
+static MODEL_CHANGE_NOTIFY: OnceLock<Notify> = OnceLock::new();
+
+fn model_change_notify() -> &'static Notify {
+    MODEL_CHANGE_NOTIFY.get_or_init(Notify::new)
+}
+
+pub(crate) fn model_change_revision() -> u64 {
+    MODEL_CHANGE_REVISION.load(Ordering::Acquire)
+}
+
+fn emit_models_changed(handle: &AppHandle) {
+    MODEL_CHANGE_REVISION.fetch_add(1, Ordering::AcqRel);
+    model_change_notify().notify_waiters();
+    emit_models_changed(&handle);
+}
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -969,7 +985,7 @@ fn prune_unseen_models(c: &Connection, seen: &HashSet<String>, scan_complete: bo
 
 fn recursive_scan_and_emit(app: AppStateInner, handle: AppHandle) {
     if let Some(root) = app.models_root.read().unwrap().clone() {
-        if scan_root(&app, &root).is_ok() { let _ = handle.emit("models-changed", ()); }
+        if scan_root(&app, &root).is_ok() { emit_models_changed(&handle); }
     }
 }
 
@@ -1652,7 +1668,7 @@ async fn sync_featured_examples_inner(
                 let _=enforce_cache_limit_inner(&app.app_data);
             }
             if emit_model_change {
-                let _=handle.emit("models-changed",());
+                emit_models_changed(&handle);
             }
             Ok(saved_count)
         }
@@ -1672,7 +1688,7 @@ fn set_models_root(app: State<AppStateInner>, handle: AppHandle, path:String)->A
     let app_clone=app.inner().clone(); let handle_clone=handle.clone();
     let mut watcher=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{ if let Ok(e)=res { match e.kind { EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => { std::thread::sleep(Duration::from_millis(120)); recursive_scan_and_emit(app_clone.clone(),handle_clone.clone()); }, _=>{} } } }).map_err(|e|AppError::Io(io::Error::other(e.to_string())))?;
     watcher.watch(&root,RecursiveMode::Recursive).map_err(|e|AppError::Io(io::Error::other(e.to_string())))?; *app.watcher.lock().unwrap()=Some(watcher);
-    scan_root(&app,&root)?; let _=handle.emit("models-changed",()); spawn_hash_enrichment(app.inner().clone(),handle.clone()); Ok(AppStateResponse{models_root:Some(path),storage:storage_stats_inner(&app.app_data)?})
+    scan_root(&app,&root)?; emit_models_changed(&handle); spawn_hash_enrichment(app.inner().clone(),handle.clone()); Ok(AppStateResponse{models_root:Some(path),storage:storage_stats_inner(&app.app_data)?})
 }
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
@@ -1805,7 +1821,7 @@ fn set_model_tags(app:State<AppStateInner>, handle:AppHandle, id:i64, tags:Vec<S
         return Err(AppError::Invalid("Model no longer exists".into()));
     }
     let rec=model_by_id(&c,id)?;
-    let _=handle.emit("models-changed",());
+    emit_models_changed(&handle);
     Ok(rec)
 }
 
@@ -1867,7 +1883,7 @@ fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
 #[tauri::command]
 fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult<i64> {
     let updated = add_subfolder_tags_inner(&app)?;
-    let _ = handle.emit("models-changed", ());
+    emit_models_changed(&handle);
     Ok(updated)
 }
 
@@ -1930,7 +1946,7 @@ async fn delete_model(app:State<'_, AppStateInner>, handle:AppHandle, id:i64)->A
     if deleted == 0 {
         return Err(AppError::Invalid("Model no longer exists".into()));
     }
-    let _ = handle.emit("models-changed", ());
+    emit_models_changed(&handle);
     Ok(())
 }
 
@@ -1951,7 +1967,7 @@ fn set_model_type(app:State<AppStateInner>, handle:AppHandle, id:i64, model_type
     let locked=if requested.eq_ignore_ascii_case("auto"){0}else{1};
     c.execute("UPDATE models SET model_type=?2,model_type_user_modified=?3,updated_at=?4 WHERE id=?1",params![id,next_type,locked,now()])?;
     let rec=model_by_id(&c,id)?;
-    let _=handle.emit("models-changed",());
+    emit_models_changed(&handle);
     Ok(rec)
 }
 
@@ -2570,7 +2586,7 @@ async fn install_civitai_model(
                 model_by_id(&c, id)?
             };
 
-            let _ = task_handle.emit("models-changed", ());
+            emit_models_changed(&task_handle);
             set_download_progress(&task_progress, &task_id, |p| {
                 p.phase = "SYNCING GALLERY".into();
             });
@@ -2608,7 +2624,7 @@ async fn install_civitai_model(
             }
         }
         let _ = task_handle.emit("download-progress", final_progress);
-        let _ = task_handle.emit("models-changed", ());
+        emit_models_changed(&task_handle);
     });
 
     Ok(initial)
@@ -2917,7 +2933,7 @@ async fn sync_gallery_inner(
         }
         let _ = enforce_cache_limit_inner(&app.app_data);
     }
-    let _ = handle.emit("models-changed", ());
+    emit_models_changed(&handle);
     Ok(has_more)
 }
 #[tauri::command]
@@ -3034,7 +3050,7 @@ async fn link_model_civitai(
         )?;
         model_by_id(&c,id)?
     };
-    let _=handle.emit("models-changed",());
+    emit_models_changed(&handle);
     drop(_guard);
     Ok(rec)
 }
@@ -3111,7 +3127,7 @@ async fn refresh_model_civitai(
         model_by_id(&c, id)?
     };
 
-    let _ = handle.emit("models-changed", ());
+    emit_models_changed(&handle);
     drop(_guard);
     Ok(rec)
 }
@@ -3223,7 +3239,7 @@ fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResu
             },
             done: true, error: first_error,
         });
-        let _ = handle.emit("models-changed", ());
+        emit_models_changed(&handle);
     });
     Ok(initial)
 }
@@ -3433,7 +3449,7 @@ fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
                 );
             }
 
-            let _ = handle.emit("models-changed", ());
+            emit_models_changed(&handle);
         }
     });
 }
