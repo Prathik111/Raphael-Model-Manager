@@ -724,12 +724,11 @@ async fn sync_featured_examples_inner(
 
     let mut records:Vec<FeaturedImageRecord>=Vec::new();
     let mut saved_count=0usize;
-    let mut had_errors=false;
     let mut image_entries=0usize;
     let mut image_urls=0usize;
     let mut download_failures=0usize;
     let mut read_failures=0usize;
-    let mut decode_failures=0usize;
+    let mut empty_responses=0usize;
 
     for (version_index,version) in versions.iter().enumerate(){
         let version_id=version.get("id").and_then(Value::as_i64).ok_or_else(||AppError::Api("Civitai returned a model version without an ID".into()))?;
@@ -754,79 +753,54 @@ async fn sync_featured_examples_inner(
             let version_dir=staging.join(version_id.to_string());
             fs::create_dir_all(&version_dir)?;
             let local=version_dir.join(format!("{image_id}.{ext}"));
-            let thumb=version_dir.join(format!("{image_id}_thumb.webp"));
-            if !local.exists(){
-                let request=client.get(&remote).timeout(Duration::from_secs(60));
-                let response=match request.send().await {
-                    Ok(value)=>value,
-                    Err(error)=>{
-                        had_errors=true;
-                        download_failures += 1;
-                        emit_examples_progress(&handle,ExamplesRefreshProgress{
-                            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                            version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                            status:format!("Could not download featured image {image_id}"),done:false,error:Some(error.to_string())
-                        });
-                        continue;
-                    }
-                };
-                if !response.status().is_success(){
-                    had_errors=true;
+
+            // Match the reference prototype: always fetch the exact Civitai URL
+            // and replace the cached file on refresh. Do not inspect/decode the
+            // response as part of retrieval.
+            let request=client.get(&remote).timeout(Duration::from_secs(60));
+            let response=match request.send().await {
+                Ok(value)=>value,
+                Err(error)=>{
                     download_failures += 1;
                     emit_examples_progress(&handle,ExamplesRefreshProgress{
                         current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                         version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                        status:format!("Civitai returned {} for image {image_id}", response.status()),done:false,error:None
+                        status:format!("Could not download featured image {image_id}"),done:false,error:Some(error.to_string())
                     });
                     continue;
                 }
-                let bytes=match response.bytes().await {
-                    Ok(value)=>value,
-                    Err(error)=>{
-                        had_errors=true;
-                        read_failures += 1;
-                        emit_examples_progress(&handle,ExamplesRefreshProgress{
-                            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                            version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                            status:format!("Could not read featured image {image_id}"),done:false,error:Some(error.to_string())
-                        });
-                        continue;
-                    }
-                };
-                if bytes.is_empty(){
-                    had_errors=true;
-                    download_failures += 1;
+            };
+            if !response.status().is_success(){
+                download_failures += 1;
+                emit_examples_progress(&handle,ExamplesRefreshProgress{
+                    current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                    version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                    status:format!("Civitai returned {} for image {image_id}", response.status()),done:false,error:None
+                });
+                continue;
+            }
+            let bytes=match response.bytes().await {
+                Ok(value)=>value,
+                Err(error)=>{
+                    read_failures += 1;
                     emit_examples_progress(&handle,ExamplesRefreshProgress{
                         current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                         version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                        status:format!("Civitai returned an empty featured image {image_id}"),done:false,error:None
+                        status:format!("Could not read featured image {image_id}"),done:false,error:Some(error.to_string())
                     });
                     continue;
                 }
-                fs::write(&local,&bytes)?;
+            };
+            if bytes.is_empty(){
+                empty_responses += 1;
+                emit_examples_progress(&handle,ExamplesRefreshProgress{
+                    current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                    version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                    status:format!("Civitai returned an empty featured image {image_id}"),done:false,error:None
+                });
+                continue;
             }
-            if !thumb.exists() {
-                match image::open(&local) {
-                    Ok(img) => {
-                        let thumb_image = img.thumbnail(420, 420);
-                        if let Err(error) = thumb_image.save_with_format(&thumb, image::ImageFormat::WebP) {
-                            emit_examples_progress(&handle, ExamplesRefreshProgress{
-                                current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                                version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                                status:format!("Thumbnail generation skipped for featured image {image_id}"),done:false,error:Some(error.to_string())
-                            });
-                        }
-                    }
-                    Err(error) => {
-                        decode_failures += 1;
-                        emit_examples_progress(&handle, ExamplesRefreshProgress{
-                            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                            version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                            status:format!("Thumbnail decode skipped for featured image {image_id}; original saved"),done:false,error:Some(error.to_string())
-                        });
-                    }
-                }
-            }
+            fs::write(&local,&bytes)?;
             let mut meta=image.clone();
             if let Some(map)=meta.as_object_mut(){
                 map.insert("featured".into(),json!(true));
@@ -842,23 +816,10 @@ async fn sync_featured_examples_inner(
             let width=image.get("width").and_then(Value::as_i64);
             let height=image.get("height").and_then(Value::as_i64);
             let final_local=active.join(version_id.to_string()).join(format!("{image_id}.{ext}")).to_string_lossy().to_string();
-            let final_thumb=if thumb.exists() {
-                Some(active.join(version_id.to_string()).join(format!("{image_id}_thumb.webp")).to_string_lossy().to_string())
-            } else {
-                None
-            };
-            records.push((image_id,Some(final_local),final_thumb,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into())));
+            records.push((image_id,Some(final_local),None,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into())));
             saved_count+=1;
         }
-        emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index+1,version_total:total_versions,images_saved:saved_count,status:format!("Saved featured examples from {version_name}"),done:false,error:None});
-    }
-
-    if had_errors {
-        let _=fs::remove_dir_all(&staging);
-        return Err(AppError::Api(format!(
-            "Featured example refresh encountered image download/read errors; previous cache preserved ({} versions, {} image entries, {} usable URLs, {} download failures, {} read failures)",
-            total_versions, image_entries, image_urls, download_failures, read_failures
-        )));
+        emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index+1,version_total:total_versions,images_saved:saved_count,status:format!("Saved featured examples from {version_name} ({} download failures, {} read failures, {} empty responses)",download_failures,read_failures,empty_responses),done:false,error:None});
     }
 
     if records.is_empty(){
@@ -866,7 +827,7 @@ async fn sync_featured_examples_inner(
         emit_examples_progress(&handle,ExamplesRefreshProgress{
             current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
             version_current:total_versions,version_total:total_versions,images_saved:0,
-            status:format!("No featured images found across {total_versions} published model versions"),
+            status:format!("No featured images could be downloaded across {total_versions} published model versions ({} entries, {} usable URLs, {} download failures, {} read failures, {} empty responses)", image_entries, image_urls, download_failures, read_failures, empty_responses),
             done:false,error:None
         });
         return Ok(0);
