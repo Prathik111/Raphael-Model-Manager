@@ -738,7 +738,7 @@ function DownloadProgressWidget({ progress, onClear }: { progress: DownloadProgr
 function App() {
   const [state,setState]=useState<AppState|null>(null); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
   const refreshGeneration = useRef(0);
-  const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [galleryHasMore,setGalleryHasMore]=useState(true); const [galleryFetchBusy,setGalleryFetchBusy]=useState(false); const bulkFileInputRef=useRef<HTMLInputElement>(null); const [bulkBusy,setBulkBusy]=useState(false); const [bulkMessage,setBulkMessage]=useState<string|null>(null); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
+  const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [galleryHasMore,setGalleryHasMore]=useState(true); const [galleryFetchBusy,setGalleryFetchBusy]=useState(false); const galleryTargetRef=useRef(20); const bulkFileInputRef=useRef<HTMLInputElement>(null); const [bulkBusy,setBulkBusy]=useState(false); const [bulkMessage,setBulkMessage]=useState<string|null>(null); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
   const [settingsOpen,setSettingsOpen]=useState(false);
   const [coverEditorOpen,setCoverEditorOpen]=useState(false);
   const [thumbnailFit,setThumbnailFit]=useState<ThumbnailFit>(initialThumbnailFit);
@@ -776,6 +776,7 @@ function App() {
       setDownloadPath('');
       setCustomDownloadPath(false);
       setImportError(null);
+      setBulkMessage(null);
       setImportClosing(false);
     }, 180);
   };
@@ -845,9 +846,10 @@ function App() {
     const modelId=selected.id;
     setGalleryHasMore(true);
     setGalleryFetchBusy(false);
+    galleryTargetRef.current=20;
     api.getImages(modelId,20).then(setImages).catch(()=>setImages([]));
     void (async()=>{try{const more=await api.syncModelGallery(modelId,20);if(selectedId===modelId)setGalleryHasMore(more);}catch{}})();
-    const timer=window.setInterval(()=>api.getImages(modelId,20).then(setImages).catch(()=>{}),2000);
+    const timer=window.setInterval(()=>api.getImages(modelId,galleryTargetRef.current).then(setImages).catch(()=>{}),2000);
     return ()=>window.clearInterval(timer);
   },[selectedId, selected?.civitai_model_id]);
   useEffect(()=>{const t=setTimeout(()=>refresh(),180); return ()=>clearTimeout(t);},[query,type,sort,activeTags]);
@@ -855,7 +857,7 @@ function App() {
   if(!state.models_root) return <><Background/><Setup onReady={s=>{setState(s); refresh();}}/></>;
   const doImport = async()=>{ if(!importUrl.trim()) return; setBusy(true); setImportError(null); try { const result=await api.importCivitai(importUrl.trim()); const nextType=civitaiTypeToModelType(result.model.type); setImportType(nextType); setCustomDownloadPath(false); setPreview(result); setDownloadPath(defaultImportDirectory(state.models_root,nextType) || result.target_directory); } catch (e) { setImportError(String(e)); } finally {setBusy(false);} };
   const install = async()=>{ if(!importUrl.trim()) return; setBusy(true); setImportError(null); try { await api.installCivitai(importUrl.trim(),customDownloadPath ? downloadPath : undefined,importType); setBusy(false); closeImport(); await refresh(); } catch (e) { setImportError(String(e)); setBusy(false); } };
-  const onFetchMore = async()=>{ if(!selected || galleryFetchBusy || !galleryHasMore) return; const modelId=selected.id; const target=images.length+10; setGalleryFetchBusy(true); try { const more=await api.syncModelGallery(modelId,target); const next=await api.getImages(modelId,target); setImages(next); setGalleryHasMore(more); } catch { } finally { setGalleryFetchBusy(false); } };
+  const onFetchMore = async()=>{ if(!selected || galleryFetchBusy || !galleryHasMore) return; const modelId=selected.id; const target=images.length+10; galleryTargetRef.current=target; setGalleryFetchBusy(true); try { const more=await api.syncModelGallery(modelId,target); const next=await api.getImages(modelId,target); setImages(next); setGalleryHasMore(more); } catch { } finally { setGalleryFetchBusy(false); } };
   const handleBulkLinkFile = async(file: File)=>{
     setBulkBusy(true);
     setBulkMessage(null);
