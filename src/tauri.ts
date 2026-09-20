@@ -1,7 +1,7 @@
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
-import type { AppState, CivitaiImportPreview, ModelImage, ModelRecord, StorageStats, LibraryCounts } from './types';
+import type { AppState, CivitaiImportPreview, ModelImage, ModelRecord, StorageStats, LibraryCounts, TagRecord } from './types';
 
 export const fileUrl = (path: string) => convertFileSrc(path);
 
@@ -16,8 +16,10 @@ export const api = {
     return Array.isArray(result) ? result[0] ?? null : result;
   },
   setModelsRoot: (path: string) => invoke<AppState>('set_models_root', { path }),
-  listModels: (params?: { type?: string; query?: string }) => invoke<ModelRecord[]>('list_models', { ...params }),
+  listModels: (params?: { type?: string; query?: string; tags?: string[] }) => invoke<ModelRecord[]>('list_models', { ...params }),
   getLibraryCounts: () => invoke<LibraryCounts>('get_library_counts'),
+  getTags: () => invoke<TagRecord[]>('get_tags'),
+  setModelTags: (id: number, tags: string[]) => invoke<ModelRecord>('set_model_tags', { id, tags }),
   getImages: (id: number) => invoke<ModelImage[]>('get_model_images', { id }),
   syncModelGallery: (id: number) => invoke<void>('sync_model_gallery', { id }),
   importCivitai: (url: string) => invoke<CivitaiImportPreview>('preview_civitai_import', { url }),
