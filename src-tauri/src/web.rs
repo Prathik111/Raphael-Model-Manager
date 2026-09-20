@@ -9,7 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     net::{IpAddr, SocketAddr, UdpSocket},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
 };
 use tauri::{path::BaseDirectory, AppHandle, Manager, State};
