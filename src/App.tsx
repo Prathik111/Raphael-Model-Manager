@@ -1318,18 +1318,57 @@ function App() {
     setBulkMessage(null);
     setImportError(null);
     try {
-      const urls=Array.from(new Set((await file.text()).split(/\\r?\\n/).map(line=>line.trim()).filter(Boolean)));
+      const urls=Array.from(new Set(
+        (await file.text())
+          .split(/\r?\n/)
+          .map(line=>line.trim())
+          .filter(Boolean)
+      ));
       if(!urls.length) throw new Error('The selected file does not contain any links.');
-      const results=await Promise.allSettled(urls.map(url=>api.installCivitai(url)));
-      const started=results.filter(result=>result.status==='fulfilled').length;
-      const failed=results.length-started;
-      if(!started) throw new Error(`No models could be queued from the selected file. ${failed} link(s) failed validation.`);
-      setBulkMessage(failed ? `QUEUED ${started} MODELS · ${failed} LINK(S) FAILED TO START` : `QUEUED ${started} MODELS`);
+
+      let queued=0;
+      let skipped=0;
+      let failed=0;
+      const errors:string[]=[];
+
+      // Queue metadata requests sequentially so a link file cannot burst Civitai
+      // API requests. The backend returns as soon as each download worker has
+      // been queued, so model-file transfers still run concurrently.
+      for(const url of urls){
+        try {
+          const progress=await api.installCivitai(url);
+          if(progress.phase==='ALREADY INSTALLED' || progress.phase==='ALREADY QUEUED'){
+            skipped += 1;
+          }else{
+            queued += 1;
+          }
+        }catch(error){
+          failed += 1;
+          errors.push(String(error));
+        }
+      }
+
+      if(!queued && !skipped){
+        throw new Error(
+          failed
+            ? 'No models could be queued from the selected file. ' + failed + ' link(s) failed validation.\n\n' + errors.slice(0,3).join('\n')
+            : 'No valid Civitai model links were found in the selected file.'
+        );
+      }
+
+      const summary=[
+        queued ? 'QUEUED ' + queued : '',
+        skipped ? 'SKIPPED ' + skipped + ' ALREADY INSTALLED/QUEUED' : '',
+        failed ? 'FAILED ' + failed : '',
+      ].filter(Boolean).join(' · ');
+      setBulkMessage(summary);
       await refresh();
-      closeImport();
-    } catch(error) {
+      // Do not close the import window immediately. The user can see the
+      // queue summary while the live download list on the left updates.
+      if(errors.length) setImportError(errors.slice(0,3).join('\n'));
+    }catch(error){
       setImportError(String(error));
-    } finally {
+    }finally{
       setBulkBusy(false);
       if(bulkFileInputRef.current) bulkFileInputRef.current.value='';
     }
