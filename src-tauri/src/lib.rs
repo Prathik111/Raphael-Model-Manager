@@ -905,7 +905,7 @@ fn sha256_file(path: &Path) -> AppResult<String> {
 fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
     let _guard = app.scan_lock.lock().unwrap();
     let c = open_db(&app.app_data)?;
-    let mut seen = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
     let mut scan_complete = true;
 
     for entry in WalkDir::new(root).follow_links(false) {
@@ -928,7 +928,7 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
         };
         let size = meta.len() as i64;
         let modified = mtime(&path);
-        seen.push(path_s.clone());
+        seen.insert(path_s.clone());
         let old: Option<(i64,i64,i64,Option<String>,i64)> = c.query_row(
             "SELECT id,size_bytes,modified_at,source_hash,model_type_user_modified FROM models WHERE path=?1", [&path_s], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))
         ).optional()?;
@@ -952,7 +952,7 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn prune_unseen_models(c: &Connection, seen: &[String], scan_complete: bool) -> AppResult<()> {
+fn prune_unseen_models(c: &Connection, seen: &HashSet<String>, scan_complete: bool) -> AppResult<()> {
     if !scan_complete {
         return Ok(());
     }
