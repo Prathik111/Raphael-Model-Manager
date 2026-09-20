@@ -683,21 +683,8 @@ async fn sync_featured_examples_inner(
     let mut saved_count=0usize;
     let mut had_errors=false;
 
-    for (version_index,summary) in versions.iter().enumerate(){
-        let version_id=summary.get("id").and_then(Value::as_i64).ok_or_else(||AppError::Api("Civitai returned a model version without an ID".into()))?;
-        let version=match api_get(&app,&format!("{API_BASE}/model-versions/{version_id}")).await {
-            Ok(value)=>value,
-            Err(error)=>{
-                had_errors=true;
-                emit_examples_progress(&handle,ExamplesRefreshProgress{
-                    current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                    version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                    status:format!("Could not fetch version {version_id}"),
-                    done:false,error:Some(error.to_string())
-                });
-                continue;
-            }
-        };
+    for (version_index,version) in versions.iter().enumerate(){
+        let version_id=version.get("id").and_then(Value::as_i64).ok_or_else(||AppError::Api("Civitai returned a model version without an ID".into()))?;
         let version_name=version.get("name").and_then(Value::as_str).unwrap_or("version");
         emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index,version_total:total_versions,images_saved:saved_count,status:format!("Fetching featured images from {version_name}"),done:false,error:None});
 
@@ -802,7 +789,7 @@ async fn sync_featured_examples_inner(
 
     if records.is_empty(){
         let _=fs::remove_dir_all(&staging);
-        return Err(AppError::Api("Civitai returned no featured images for the newest five versions".into()));
+        return Err(AppError::Api("Civitai returned no featured images in the newest five model versions".into()));
     }
 
     let c = open_db(&app.app_data)?;
