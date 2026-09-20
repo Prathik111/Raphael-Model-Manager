@@ -182,7 +182,7 @@ function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTag
   const [linkError, setLinkError] = useState<string | null>(null);
   const promptText = model.activation_prompts.join(', ');
   return <aside className="inspector hud-panel">
-    <div className="inspector-header"><div><div className="eyebrow">MODEL</div><h2>{model.civitai_name || model.filename}</h2></div><select className="type-select" value={model.model_type} onChange={async e=>{try{await onSaveType(e.target.value);}catch{e.currentTarget.value=model.model_type;}}} aria-label="Model type">{MODEL_TYPES.filter(x=>x.value!=='Auto' || x.value===model.model_type).map(x=><option key={x.value} value={x.value}>{x.label}</option>)}</select></div>
+    <div className="inspector-header"><div><div className="eyebrow">MODEL</div><h2>{model.civitai_name || model.filename}</h2></div><select className="type-select" value={model.model_type} onChange={async e=>{try{await onSaveType(e.target.value);}catch{e.currentTarget.value=model.model_type;}}} aria-label="Model type">{MODEL_TYPES.map(x=><option key={x.value} value={x.value}>{x.label}</option>)}</select></div>
     <div className="inspector-tabs">{(['overview','examples','files'] as const).map(t=><button className={tab===t?'active':''} onClick={()=>setTab(t)} key={t}>{t.toUpperCase()}</button>)}</div>
     {tab==='overview' && <div className="inspector-scroll">
       <section><div className="section-head">DESCRIPTION</div><p className="description">{model.description || 'No description cached from Civitai.'}</p></section>
