@@ -2921,6 +2921,7 @@ pub fn run() {
             let app_data=app.path().app_data_dir()?;fs::create_dir_all(&app_data)?;let c=open_db(&app_data)?;let saved=setting(&c,"models_root")?;let parallel=read_parallel_downloads(&c)?;let state=AppStateInner{app_data:app_data.clone(),models_root:Arc::new(RwLock::new(saved.map(PathBuf::from))),watcher:Arc::new(Mutex::new(None)),scan_lock:Arc::new(Mutex::new(())),
                 downloads:Arc::new(Mutex::new(Vec::new())),
                 active_download_paths:Arc::new(Mutex::new(HashSet::new())),
+                active_download_versions:Arc::new(Mutex::new(HashSet::new())),
                 active_downloads:Arc::new(Mutex::new(0)),
                 parallel_downloads:Arc::new(Mutex::new(parallel)),
                 examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
