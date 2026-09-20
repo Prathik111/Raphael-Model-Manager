@@ -760,6 +760,7 @@ async fn sync_featured_examples_inner(
                 };
                 let thumb_image=img.thumbnail(420,420);
                 if let Err(error)=thumb_image.save_with_format(&thumb,image::ImageFormat::WebP){
+                    had_errors=true;
                     emit_examples_progress(&handle,ExamplesRefreshProgress{
                         current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                         version_current:version_index,version_total:total_versions,images_saved:saved_count,
@@ -861,8 +862,7 @@ async fn sync_featured_examples_inner(
             let _=handle.emit("models-changed",());
             Ok(saved_count)
         }
-        Err(error)=>{
-                had_errors=true;let _=fs::remove_dir_all(&active);if backup.exists(){let _=fs::rename(&backup,&active);}Err(error)}
+        Err(error)=>{let _=fs::remove_dir_all(&active);if backup.exists(){let _=fs::rename(&backup,&active);}Err(error)}
     }
 }
 
@@ -1330,7 +1330,7 @@ fn set_model_cover_from_image(
     if let Some(old) = old_cover {
         let old_path = PathBuf::from(old);
         let covers_root = app.app_data.join("cache").join("covers");
-        if old_path.starts_with(&covers_root) && old_path.is_file() {
+        if old_path != new_cover && old_path.starts_with(&covers_root) && old_path.is_file() {
             let _ = fs::remove_file(old_path);
         }
     }
@@ -1876,8 +1876,9 @@ async fn link_model_civitai(
         )?;
         model_by_id(&c,id)?
     };
-    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
     let _=handle.emit("models-changed",());
+    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
+    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
     Ok(rec)
 }
 
@@ -1945,8 +1946,9 @@ async fn refresh_model_civitai(
         model_by_id(&c, id)?
     };
 
-    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
     let _ = handle.emit("models-changed", ());
+    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
+    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
     Ok(rec)
 }
 #[tauri::command]
