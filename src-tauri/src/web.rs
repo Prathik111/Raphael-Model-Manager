@@ -213,11 +213,9 @@ fn web_url() -> String {
     }
 }
 
-fn validate_cached_file(path: &PathBuf, app_data: &PathBuf) -> AppResult<PathBuf> {
-    let app_data = app_data
-        .canonicalize()
-        .map_err(|e| AppError::Io(e))?;
-    let path = path.canonicalize().map_err(|e| AppError::Io(e))?;
+fn validate_cached_file(path: &Path, app_data: &Path) -> AppResult<PathBuf> {
+    let app_data = app_data.canonicalize().map_err(AppError::Io)?;
+    let path = path.canonicalize().map_err(AppError::Io)?;
     if !path.starts_with(&app_data) || !path.is_file() {
         return Err(AppError::Invalid("Requested file is outside Raphael's cache".into()));
     }
@@ -344,7 +342,7 @@ async fn command_handler(
         },
         "clear_download_progress" => {
             let args: DownloadProgressArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            clear_download_progress(handle.state(), args.task_id).and_then(|_| Ok(Value::Null))
+            clear_download_progress(handle.state(), args.task_id).map(|_| Value::Null)
         },
         "link_model_civitai" => {
             let args: LinkArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
@@ -426,7 +424,7 @@ pub async fn set_web_app_enabled(
 
     let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], WEB_PORT)))
         .await
-        .map_err(|error| AppError::Io(error))?;
+        .map_err(AppError::Io)?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let url = web_url();
