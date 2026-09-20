@@ -11,13 +11,17 @@ export const api = {
     const result = await open({ directory: true, multiple: false, title: 'Select your ComfyUI models folder' });
     return Array.isArray(result) ? result[0] ?? null : result;
   },
+  chooseDirectory: async (defaultPath?: string) => {
+    const result = await open({ directory: true, multiple: false, title: 'Choose model download folder', defaultPath });
+    return Array.isArray(result) ? result[0] ?? null : result;
+  },
   setModelsRoot: (path: string) => invoke<AppState>('set_models_root', { path }),
   listModels: (params?: { type?: string; query?: string }) => invoke<ModelRecord[]>('list_models', { ...params }),
   getLibraryCounts: () => invoke<LibraryCounts>('get_library_counts'),
   getImages: (id: number) => invoke<ModelImage[]>('get_model_images', { id }),
   syncModelGallery: (id: number) => invoke<void>('sync_model_gallery', { id }),
   importCivitai: (url: string) => invoke<CivitaiImportPreview>('preview_civitai_import', { url }),
-  installCivitai: (url: string) => invoke<ModelRecord>('install_civitai_model', { url }),
+  installCivitai: (url: string, targetDirectory?: string) => invoke<ModelRecord>('install_civitai_model', { url, targetDirectory }),
   refreshModel: (id: number) => invoke<ModelRecord>('refresh_model_civitai', { id }),
   linkModelCivitai: (id: number, url: string) => invoke<ModelRecord>('link_model_civitai', { id, url }),
   openFolder: (path: string) => invoke<void>('open_in_file_manager', { path }),
