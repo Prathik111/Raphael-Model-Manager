@@ -598,6 +598,8 @@ fn featured_remote_url(image: &Value) -> Option<String> {
     Some(format!("{IMAGE_CDN_BASE}/{image_id}/original=true/{filename}"))
 }
 
+type FeaturedImageRecord = (i64, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<f64>, Option<String>, Option<i64>, String);
+
 fn featured_extension(url: &str) -> String {
     Url::parse(url)
         .ok()
@@ -636,7 +638,7 @@ async fn sync_featured_examples_inner(
     fs::create_dir_all(&staging)?;
     let client=civitai_client(&app)?;
 
-    let mut records:Vec<(i64,Option<String>,Option<String>,Option<i64>,Option<i64>,Option<String>,Option<String>,Option<i64>,Option<f64>,Option<String>,Option<i64>,String)>=Vec::new();
+    let mut records:Vec<FeaturedImageRecord>=Vec::new();
     let mut saved_count=0usize;
 
     for (version_index,summary) in versions.iter().enumerate(){
@@ -663,8 +665,7 @@ async fn sync_featured_examples_inner(
             }
             if !thumb.exists(){
                 let img=image::open(&local).map_err(|e|AppError::Api(format!("Could not decode featured image {image_id}: {e}")))?;
-                let mut thumb_image=img;
-                thumb_image.thumbnail(420,420);
+                let thumb_image=img.thumbnail(420,420);
                 thumb_image.save_with_format(&thumb,image::ImageFormat::WebP).map_err(|e|AppError::Api(format!("Could not create featured thumbnail {image_id}: {e}")))?;
             }
             let mut meta=image.clone();
@@ -959,12 +960,10 @@ fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<(
     }
 
     for (local_path, thumb_path) in image_paths {
-        for cached in [local_path, thumb_path] {
-            if let Some(cached) = cached {
-                let cached_path = PathBuf::from(cached);
-                if cached_path.starts_with(&app.app_data) && cached_path.is_file() {
-                    let _ = fs::remove_file(cached_path);
-                }
+        for cached in [local_path, thumb_path].into_iter().flatten() {
+            let cached_path = PathBuf::from(cached);
+            if cached_path.starts_with(&app.app_data) && cached_path.is_file() {
+                let _ = fs::remove_file(cached_path);
             }
         }
     }
@@ -1199,6 +1198,7 @@ async fn preview_civitai_import(app:State<'_,AppStateInner>,url:String)->AppResu
     Ok(CivitaiImportPreview{model:json!({"id":model.get("id"),"name":model.get("name"),"type":typ,"description":model.get("description"),"tags":model.get("tags"),"creator":model.get("creator").and_then(|v|v.get("username")),"thumbnail_path":thumb}),version:json!({"id":version.get("id"),"name":version.get("name"),"base_model":version.get("baseModel"),"download_url":dl,"filename":filename,"size_bytes":size,"sha256":sha256,"activation_prompts":activation}),target_directory:target.to_string_lossy().to_string(),thumbnail_path:thumb,images_count_hint:version.get("images").and_then(Value::as_array).map(|x|x.len() as i64)})
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_file(
     app: &AppStateInner,
     url: &str,
@@ -1228,7 +1228,6 @@ async fn download_file(
         p.error = None;
     });
 
-    let path = path;
     let partial = path.with_extension(format!(
         "{}.part",
         path.extension().and_then(|x| x.to_str()).unwrap_or("bin")
