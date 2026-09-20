@@ -1099,14 +1099,7 @@ async fn download_file(
             })
     };
 
-    let safe_name = Path::new(&raw_name)
-        .file_name()
-        .and_then(|x| x.to_str())
-        .filter(|x| !x.is_empty())
-        .unwrap_or("model.safetensors")
-        .to_string();
-
-    let mut path = path;
+    let path = path;
     let partial = path.with_extension(format!(
         "{}.part",
         path.extension().and_then(|x| x.to_str()).unwrap_or("bin")
@@ -1410,7 +1403,7 @@ async fn sync_gallery_inner(
         let c = open_db(&app.app_data)?;
         c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1", [model_id], |r| r.get(0))?
     };
-    let mut has_more = false;
+    let has_more;
     loop {
         let mut url = format!("{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true");
         if let Some(c) = &cursor { url.push_str("&cursor="); url.push_str(&urlencoding::encode(c)); }
@@ -1956,7 +1949,24 @@ mod tests {
     }
 
     #[test]
-    fn tag_search_supports_positive_negative_and_hash_syntax() {    #[test]
+    fn tag_search_supports_positive_negative_and_hash_syntax() {
+        let model = ModelRecord {
+            id: 1, path: "C:/models/a.safetensors".into(), relative_path: "loras/a.safetensors".into(),
+            filename: "a.safetensors".into(), model_type: "LoRA".into(), size_bytes: 1, modified_at: 0,
+            civitai_model_id: None, civitai_version_id: None, civitai_url: None, civitai_name: Some("Hero".into()),
+            version_name: None, base_model: None, creator: None, description: None,
+            tags: vec!["Anime".into(), "Megumin".into()], activation_prompts: vec!["magic".into()],
+            source_hash: None, thumbnail_path: None, cover_path: None, cover_position_x: 50.0, cover_position_y: 50.0,
+            downloaded_at: 0, updated_at: 0,
+        };
+        assert!(model_search_match(&model, "tag:anime", &[]));
+        assert!(model_search_match(&model, "#megumin", &[]));
+        assert!(model_search_match(&model, "-tag:realistic", &[]));
+        assert!(!model_search_match(&model, "-tag:anime", &[]));
+        assert!(model_search_match(&model, "magic", &[]));
+    }
+
+    #[test]
     fn set_model_tags_are_persistent() {
         let temp = tempfile::tempdir().unwrap();
         let app_data = temp.path().join("app");
@@ -1989,22 +1999,6 @@ mod tests {
             .unwrap();
         let tags: Vec<String> = serde_json::from_str(&stored).unwrap();
         assert_eq!(tags, vec!["Anime", "Megumin"]);
-    }
-
-
-        let model = ModelRecord {
-            id: 1, path: "C:/models/a.safetensors".into(), relative_path: "loras/a.safetensors".into(),
-            filename: "a.safetensors".into(), model_type: "LoRA".into(), size_bytes: 1, modified_at: 0,
-            civitai_model_id: None, civitai_version_id: None, civitai_url: None, civitai_name: Some("Hero".into()),
-            version_name: None, base_model: None, creator: None, description: None,
-            tags: vec!["Anime".into(), "Megumin".into()], activation_prompts: vec!["magic".into()],
-            source_hash: None, thumbnail_path: None, cover_path: None, cover_position_x: 50.0, cover_position_y: 50.0, updated_at: 0,
-        };
-        assert!(model_search_match(&model, "tag:anime", &[]));
-        assert!(model_search_match(&model, "#megumin", &[]));
-        assert!(model_search_match(&model, "-tag:realistic", &[]));
-        assert!(!model_search_match(&model, "-tag:anime", &[]));
-        assert!(model_search_match(&model, "magic", &[]));
     }
 
     #[test]
