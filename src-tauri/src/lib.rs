@@ -836,6 +836,55 @@ fn get_library_counts(app:State<AppStateInner>)->AppResult<LibraryCounts>{
 }
 
 #[tauri::command]
+fn set_model_cover_from_image(
+    app: State<AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    image_id: i64,
+) -> AppResult<ModelRecord> {
+    let (old_cover, source) = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT m.cover_path,COALESCE(i.thumbnail_path,i.local_path)
+             FROM models m
+             JOIN images i ON i.model_id=m.id
+             WHERE m.id=?1 AND i.id=?2",
+            params![id, image_id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .map_err(|_| AppError::Invalid("That example image is not cached for this model".into()))?
+    };
+
+    let source = source
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::Invalid("That example image has not finished caching yet".into()))?;
+    let cache_root = cache_root(&app.app_data);
+    let source = source
+        .canonicalize()
+        .map_err(|_| AppError::Invalid("That example image is no longer available in Raphael's cache".into()))?;
+    if !source.starts_with(&cache_root) || !source.is_file() {
+        return Err(AppError::Invalid("That example image is outside Raphael's Civitai cache".into()));
+    }
+
+    if let Some(old) = old_cover {
+        let old_path = PathBuf::from(old);
+        let covers_root = app.app_data.join("cache").join("covers");
+        if old_path.starts_with(&covers_root) && old_path.is_file() {
+            let _ = fs::remove_file(old_path);
+        }
+    }
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET cover_path=?2,cover_position_x=50,cover_position_y=50,updated_at=?3 WHERE id=?1",
+        params![id, source.to_string_lossy().to_string(), now()],
+    )?;
+    let rec = model_by_id(&c, id)?;
+    let _ = handle.emit("models-changed", ());
+    Ok(rec)
+}
+
+#[tauri::command]
 fn get_model_images(app:State<AppStateInner>, id:i64)->AppResult<Vec<ModelImage>>{
     let c=open_db(&app.app_data)?; let mut stmt=c.prepare("SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json FROM images WHERE model_id=?1 ORDER BY id")?; let rows=stmt.query_map([id],|r|Ok(ModelImage{id:r.get(0)?,civitai_image_id:r.get(1)?,local_path:r.get(2)?,thumbnail_path:r.get(3)?,width:r.get(4)?,height:r.get(5)?,prompt:r.get(6)?,negative_prompt:r.get(7)?,steps:r.get(8)?,cfg:r.get(9)?,sampler:r.get(10)?,seed:r.get(11)?,meta_json:r.get(12)?}))?; Ok(rows.filter_map(Result::ok).collect())
 }
