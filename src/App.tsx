@@ -605,7 +605,7 @@ function CoverEditorOverlay({
     }
   };
 
-  return <div className={"modal-backdrop cover-editor-backdrop" + (closing ? " overlay-leaving" : "")} onClick={dismiss}>
+  return <div className={"modal-backdrop cover-editor-backdrop" + (closing ? " overlay-leaving" : "")} onClick={()=>dismiss()}>
     <div className="cover-editor hud-panel" onClick={e => e.stopPropagation()}>
       <header className="cover-editor-header">
         <div>
@@ -657,7 +657,7 @@ function CoverEditorOverlay({
       </div>
 
       <div className="modal-actions cover-editor-actions">
-        <button className="text-btn" onClick={dismiss} disabled={busy}>CANCEL</button>
+        <button className="text-btn" onClick={()=>dismiss()} disabled={busy}>CANCEL</button>
         <button className="primary-btn" onClick={apply} disabled={busy}>{busy ? 'SAVING…' : 'APPLY COVER'}</button>
       </div>
     </div>
