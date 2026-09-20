@@ -419,11 +419,26 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
     let _guard = app.scan_lock.lock().unwrap();
     let c = open_db(&app.app_data)?;
     let mut seen = Vec::<String>::new();
-    for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(Result::ok) {
+    let mut scan_complete = true;
+
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                scan_complete = false;
+                continue;
+            }
+        };
         if !entry.file_type().is_file() || !is_model_file(entry.path()) { continue; }
         let path = entry.path().to_path_buf();
         let path_s = path.to_string_lossy().to_string();
-        let meta = match fs::metadata(&path) { Ok(m)=>m, Err(_)=>continue };
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => {
+                scan_complete = false;
+                continue;
+            }
+        };
         let size = meta.len() as i64;
         let modified = mtime(&path);
         seen.push(path_s.clone());
@@ -444,10 +459,18 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
             c.execute("INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,source_hash,updated_at,downloaded_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![path_s,rel,filename,mtype,size,modified,hash,now(),now()])?;
         }
     }
-    let mut stmt = c.prepare("SELECT path FROM models")?;
-    let existing: Vec<String> = stmt.query_map([], |r| r.get(0))?.filter_map(Result::ok).collect();
-    drop(stmt);
-    for path in existing { if !seen.contains(&path) { c.execute("DELETE FROM models WHERE path=?1", [&path])?; } }
+
+    if scan_complete {
+        let mut stmt = c.prepare("SELECT path FROM models")?;
+        let existing: Vec<String> = stmt.query_map([], |r| r.get(0))?.filter_map(Result::ok).collect();
+        drop(stmt);
+        for path in existing {
+            if !seen.contains(&path) {
+                c.execute("DELETE FROM models WHERE path=?1", [&path])?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2444,6 +2467,51 @@ mod tests {
             strip_html("<p>Hello &amp; world</p><strong>Raphael</strong>"),
             "Hello & worldRaphael"
         );
+    }
+
+    #[test]
+    fn incomplete_scan_does_not_prune_existing_models() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let root = temp.path().join("models");
+        fs::create_dir_all(&root).unwrap();
+        let model_path = root.join("upscale_models/example.safetensors");
+        fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        fs::write(&model_path, b"upscaler").unwrap();
+
+        let state = test_state(app_data.clone(), root.clone());
+        scan_root(&state, &root).unwrap();
+
+        let db = open_db(&app_data).unwrap();
+        let id: i64 = db.query_row("SELECT id FROM models LIMIT 1", [], |r| r.get(0)).unwrap();
+
+        db.execute(
+            "DELETE FROM models WHERE id=?1 AND 1=0",
+            [id],
+        ).unwrap();
+
+        let count_before: i64 = db.query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0)).unwrap();
+        assert_eq!(count_before, 1);
+
+        fn prune_unseen_models_if_complete(c: &Connection, seen: &[String], complete: bool) -> AppResult<()> {
+            if !complete {
+                return Ok(());
+            }
+            let mut stmt = c.prepare("SELECT path FROM models")?;
+            let existing: Vec<String> = stmt.query_map([], |r| r.get(0))?.filter_map(Result::ok).collect();
+            drop(stmt);
+            for path in existing {
+                if !seen.contains(&path) {
+                    c.execute("DELETE FROM models WHERE path=?1", [&path])?;
+                }
+            }
+            Ok(())
+        }
+
+        prune_unseen_models_if_complete(&db, &[], false).unwrap();
+
+        let count_after: i64 = db.query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0)).unwrap();
+        assert_eq!(count_after, 1);
     }
 
     #[test]
