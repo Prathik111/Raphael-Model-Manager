@@ -549,7 +549,7 @@ fn set_model_tags(app:State<AppStateInner>, handle:AppHandle, id:i64, tags:Vec<S
 }
 
 #[tauri::command]
-fn get_library_countsget_library_counts(app:State<AppStateInner>)->AppResult<LibraryCounts>{
+fn get_library_counts(app:State<AppStateInner>)->AppResult<LibraryCounts>{
     let c=open_db(&app.app_data)?;
     let all:i64=c.query_row("SELECT COUNT(*) FROM models",[],|r|r.get(0))?;
     let mut stmt=c.prepare("SELECT model_type,COUNT(*) FROM models GROUP BY model_type")?;
@@ -795,7 +795,6 @@ async fn install_civitai_model(
                 base_model=excluded.base_model,
                 creator=excluded.creator,
                 description=excluded.description,
-                tags_json=excluded.tags_json,
                 activation_json=excluded.activation_json,
                 source_hash=excluded.source_hash,
                 tags_json=CASE WHEN models.tags_user_modified=0 THEN excluded.tags_json ELSE models.tags_json END,
