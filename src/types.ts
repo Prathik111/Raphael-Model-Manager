@@ -8,4 +8,15 @@ export interface TagRecord { name:string; count:number; }
 export interface AppState { models_root:string|null; storage:StorageStats; }
 export interface CivitaiImportPreview { model:{id?:number;name?:string;type?:string;description?:string|null;tags?:string[];creator?:string|null;thumbnail_path?:string|null}; version:{id:number;name:string;base_model:string|null;download_url:string;filename:string|null;size_bytes:number|null;activation_prompts:string[]}; target_directory:string; thumbnail_path?:string|null; images_count_hint?:number; }
 
+export interface DownloadProgress {
+  visible: boolean;
+  task_id: string | null;
+  filename: string;
+  phase: string;
+  downloaded_bytes: number;
+  total_bytes: number | null;
+  percent: number | null;
+  error: string | null;
+}
+
 export interface WebAppStatus { enabled: boolean; url: string | null; port: number; }
