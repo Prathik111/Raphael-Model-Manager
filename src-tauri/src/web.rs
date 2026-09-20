@@ -911,6 +911,7 @@ pub async fn set_web_app_enabled(
     let controller = controller.inner().clone();
 
     if !enabled {
+        controller.inner.generation.fetch_add(1, Ordering::AcqRel);
         if let Some(sender) = controller.inner.shutdown.lock().unwrap().take() {
             let _ = sender.send(());
         }
