@@ -187,16 +187,10 @@ struct ExamplesRefreshProgress {
     error: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct ExamplesRefreshState {
     progress: Option<ExamplesRefreshProgress>,
     running: bool,
-}
-
-impl Default for ExamplesRefreshState {
-    fn default() -> Self {
-        Self { progress: None, running: false }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -657,14 +651,12 @@ fn referenced_cache_paths(c: &Connection) -> AppResult<HashSet<PathBuf>> {
     ] {
         let mut stmt = c.prepare(sql)?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        for row in rows {
-            if let Ok(value) = row {
-                let path = PathBuf::from(value);
-                if let Ok(canonical) = path.canonicalize() {
-                    paths.insert(canonical);
-                }
-                paths.insert(path);
+        for value in rows.flatten() {
+            let path = PathBuf::from(value);
+            if let Ok(canonical) = path.canonicalize() {
+                paths.insert(canonical);
             }
+            paths.insert(path);
         }
     }
     Ok(paths)
