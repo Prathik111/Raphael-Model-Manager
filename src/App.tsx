@@ -1149,7 +1149,7 @@ function App() {
       } catch {}
     };
     void pull();
-    const timer = window.setInterval(() => void pull(), 600);
+    const timer = window.setInterval(() => void pull(), 1000);
     return () => { disposed = true; window.clearInterval(timer); };
   }, []);
 
@@ -1252,7 +1252,6 @@ function App() {
     }
   }
   useEffect(()=>{
-    void refresh();
     if (!api.isWebApp) {
       api.getWebAppStatus().then(setWebStatus).catch(() => {});
       return;
