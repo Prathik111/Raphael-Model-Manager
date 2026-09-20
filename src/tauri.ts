@@ -54,6 +54,7 @@ export const api = {
     command<ModelRecord[]>('list_models', { ...params }),
   getLibraryCounts: () => command<LibraryCounts>('get_library_counts'),
   getTags: () => command<TagRecord[]>('get_tags'),
+  addSubfolderTags: () => command<number>('add_subfolder_tags'),
   setModelTags: (id: number, tags: string[]) =>
     command<ModelRecord>('set_model_tags', { id, tags }),
   setModelType: (id: number, modelType: string) =>
