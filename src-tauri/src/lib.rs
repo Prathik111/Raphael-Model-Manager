@@ -1609,7 +1609,7 @@ fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult
 }
 
 #[tauri::command]
-async fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<()> {
+async fn delete_model(app:State<'_, AppStateInner>, handle:AppHandle, id:i64)->AppResult<()> {
     let _guard=app.cache_lock.lock().await;
     let root = app.models_root.read().unwrap().clone()
         .ok_or_else(|| AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
@@ -1725,13 +1725,13 @@ fn copy_custom_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
 }
 
 fn copy_cached_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<PathBuf> {
-    let cache_root = cache_root(&app.app_data)
+    let cache_root_path = cache_root(&app.app_data)
         .canonicalize()
         .map_err(|_| AppError::Invalid("Raphael's Civitai cache is unavailable".into()))?;
     let canonical_source = source
         .canonicalize()
         .map_err(|_| AppError::Invalid("That example image is no longer available in Raphael's cache".into()))?;
-    if !canonical_source.starts_with(&cache_root) || !canonical_source.is_file() {
+    if !canonical_source.starts_with(&cache_root_path) || !canonical_source.is_file() {
         return Err(AppError::Invalid("That example image is outside Raphael's Civitai cache".into()));
     }
     image::open(&canonical_source)
@@ -2020,11 +2020,12 @@ async fn install_civitai_model(
 
     if let Some(vid) = version_id {
         let c0 = open_db(&app.app_data)?;
-        if let Ok(existing_id) = c0.query_row(
+        let existing_id: Result<i64, rusqlite::Error> = c0.query_row(
             "SELECT id FROM models WHERE civitai_version_id=?1 AND path IS NOT NULL",
             [vid],
             |r| r.get::<_, i64>(0),
-        ) {
+        );
+        if let Ok(existing_id) = existing_id {
             let existing = model_by_id(&c0, existing_id)?;
             let progress = DownloadProgress {
                 visible: true,
@@ -2686,32 +2687,32 @@ fn get_storage_stats(app:State<AppStateInner>)->AppResult<StorageStats>{storage_
 #[tauri::command]
 fn get_cache_stats(app:State<AppStateInner>)->AppResult<CacheStats>{cache_stats_inner(&app.app_data)}
 #[tauri::command]
-async fn set_cache_max_bytes(app:State<AppStateInner>, max_bytes:i64)->AppResult<CacheStats>{
+async fn set_cache_max_bytes(app:State<'_, AppStateInner>, max_bytes:i64)->AppResult<CacheStats>{
     let _guard=app.cache_lock.lock().await;
     set_cache_max_bytes_inner(&app.app_data,max_bytes)
 }
 #[tauri::command]
-async fn set_cache_location(app:State<AppStateInner>, path:String)->AppResult<CacheStats>{
+async fn set_cache_location(app:State<'_, AppStateInner>, path:String)->AppResult<CacheStats>{
     let _guard=app.cache_lock.lock().await;
     set_cache_location_inner(&app.app_data,&path)
 }
 #[tauri::command]
-async fn clear_cache_images(app:State<AppStateInner>)->AppResult<CacheOperationResult>{
+async fn clear_cache_images(app:State<'_, AppStateInner>)->AppResult<CacheOperationResult>{
     let _guard=app.cache_lock.lock().await;
     clear_cache_images_inner(&app.app_data)
 }
 #[tauri::command]
-async fn clear_complete_cache(app:State<AppStateInner>)->AppResult<CacheOperationResult>{
+async fn clear_complete_cache(app:State<'_, AppStateInner>)->AppResult<CacheOperationResult>{
     let _guard=app.cache_lock.lock().await;
     clear_complete_cache_inner(&app.app_data)
 }
 #[tauri::command]
-async fn prune_cache_images(app:State<AppStateInner>, keep_per_model:i64)->AppResult<CacheOperationResult>{
+async fn prune_cache_images(app:State<'_, AppStateInner>, keep_per_model:i64)->AppResult<CacheOperationResult>{
     let _guard=app.cache_lock.lock().await;
     prune_cache_images_inner(&app.app_data,keep_per_model)
 }
 #[tauri::command]
-async fn clean_cache_orphans(app:State<AppStateInner>)->AppResult<CacheOperationResult>{
+async fn clean_cache_orphans(app:State<'_, AppStateInner>)->AppResult<CacheOperationResult>{
     let _guard=app.cache_lock.lock().await;
     clean_cache_orphans_inner(&app.app_data)
 }
@@ -2881,7 +2882,7 @@ pub fn run() {
                 active_downloads:Arc::new(Mutex::new(0)),
                 parallel_downloads:Arc::new(Mutex::new(parallel)),
                 examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
-                cache_lock: Arc::new(Mutex::new(())),
+                cache_lock: Arc::new(AsyncMutex::new(())),
             };app.manage(state.clone());
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
@@ -2907,7 +2908,7 @@ mod tests {
             active_downloads: Arc::new(Mutex::new(0)),
             parallel_downloads: Arc::new(Mutex::new(3)),
             examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
-            cache_lock: Arc::new(Mutex::new(())),
+            cache_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
