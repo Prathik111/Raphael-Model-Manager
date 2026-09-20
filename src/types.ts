@@ -3,5 +3,6 @@ export interface ModelRecord { id:number; path:string; relative_path:string; fil
 export interface ModelImage { id:number; civitai_image_id:number; local_path:string|null; thumbnail_path:string|null; width:number|null; height:number|null; prompt:string|null; negative_prompt:string|null; steps:number|null; cfg:number|null; sampler:string|null; seed:number|null; meta_json:string|null; }
 export interface CategoryStats { type:ModelType; count:number; bytes:number; }
 export interface StorageStats { total_model_bytes:number; cached_bytes:number; categories:CategoryStats[]; }
+export interface LibraryCounts { all:number; by_type:Record<string,number>; }
 export interface AppState { models_root:string|null; storage:StorageStats; }
 export interface CivitaiImportPreview { model:{id?:number;name?:string;type?:string;description?:string|null;tags?:string[];creator?:string|null}; version:{id:number;name:string;base_model:string|null;download_url:string;filename:string|null;size_bytes:number|null;activation_prompts:string[]}; target_directory:string; images_count_hint?:number; }
