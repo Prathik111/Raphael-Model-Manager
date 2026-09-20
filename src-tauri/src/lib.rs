@@ -1320,7 +1320,7 @@ async fn sync_featured_examples_inner(
                     .query_row(
                         "SELECT civitai_image_id FROM images WHERE model_id=?1 AND (local_path=?2 OR thumbnail_path=?2) AND meta_json LIKE '%\"featured\":true%' LIMIT 1",
                         params![model_id, old_path.to_string_lossy().to_string()],
-                        |r| r.get(0),
+                        |r| r.get::<_, i64>(0),
                     )
                     .optional()?;
             } else {
@@ -1768,7 +1768,7 @@ fn set_model_cover_position(
 
 #[tauri::command]
 async fn set_model_custom_cover(
-    app: State<AppStateInner>,
+    app: State<'_, AppStateInner>,
     handle: AppHandle,
     id: i64,
     source_path: String,
@@ -1800,7 +1800,7 @@ async fn set_model_custom_cover(
 
 #[tauri::command]
 async fn reset_model_cover(
-    app: State<AppStateInner>,
+    app: State<'_, AppStateInner>,
     handle: AppHandle,
     id: i64,
 ) -> AppResult<ModelRecord> {
@@ -1840,7 +1840,7 @@ fn get_library_counts(app:State<AppStateInner>)->AppResult<LibraryCounts>{
 
 #[tauri::command]
 async fn set_model_cover_from_image(
-    app: State<AppStateInner>,
+    app: State<'_, AppStateInner>,
     handle: AppHandle,
     id: i64,
     image_id: i64,
