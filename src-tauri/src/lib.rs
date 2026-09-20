@@ -64,7 +64,7 @@ struct AppStateInner {
     active_download_paths: Arc<Mutex<HashSet<PathBuf>>>,
     active_downloads: Arc<Mutex<usize>>,
     parallel_downloads: Arc<Mutex<usize>>,
-    examples_refresh_state: Arc<Mutex<bool>>,
+    examples_refresh_state: Arc<Mutex<ExamplesRefreshState>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
