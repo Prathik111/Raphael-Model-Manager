@@ -545,6 +545,7 @@ pub async fn set_web_app_enabled(
                 match TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], WEB_PORT))).await {
                     Ok(next_listener) => {
                         listener = next_listener;
+                        *task_controller.inner.url.write().unwrap() = Some(web_url());
                         let (next_shutdown_tx, next_shutdown_rx) = oneshot::channel();
                         *task_controller.inner.shutdown.lock().unwrap() = Some(next_shutdown_tx);
                         shutdown_rx = Some(next_shutdown_rx);
