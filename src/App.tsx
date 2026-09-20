@@ -9,8 +9,7 @@ const TYPES: Array<{ key: ModelType | 'All'; label: string }> = [
 ];
 
 const IMPORT_TYPES: ModelType[] = [
-  'Checkpoint', 'LoRA', 'VAE', 'ControlNet', 'Embedding',
-  'Upscaler', 'Text Encoder', 'CLIP Vision', 'IP-Adapter', 'Other'
+  'Checkpoint', 'LoRA', 'VAE', 'ControlNet', 'Embedding', 'Upscaler', 'Other'
 ];
 
 function civitaiTypeToModelType(type?: string | null): ModelType {
@@ -24,9 +23,9 @@ function civitaiTypeToModelType(type?: string | null): ModelType {
     case 'textualinversion':
     case 'embedding': return 'Embedding';
     case 'upscaler': return 'Upscaler';
-    case 'clip': return 'Text Encoder';
-    case 'clipvision': return 'CLIP Vision';
-    case 'ipadapter': return 'IP-Adapter';
+    case 'clip':
+    case 'clipvision':
+    case 'ipadapter': return 'Other';
     default: return 'Other';
   }
 }
