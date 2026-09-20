@@ -932,7 +932,7 @@ function App() {
       try {
         const result = await api.getImages(modelId,200);
         setImages(result.images);
-        setGalleryHasMore(result.has_more);
+        if (result.images.length < 200) setGalleryHasMore(false);
       } catch {
         setImages([]);
         setGalleryHasMore(false);
@@ -943,7 +943,7 @@ function App() {
         const remoteHasMore = await api.syncModelGallery(modelId,20);
         const result = await api.getImages(modelId,200);
         setImages(result.images);
-        setGalleryHasMore(remoteHasMore || result.has_more);
+        setGalleryHasMore(remoteHasMore);
       } catch {
         await loadImages();
       }
