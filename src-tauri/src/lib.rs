@@ -1810,13 +1810,6 @@ async fn reset_model_cover(
         c.query_row("SELECT cover_path FROM models WHERE id=?1", [id], |r| r.get::<_, Option<String>>(0))?
     };
 
-    if let Some(path) = old_cover {
-        let cover = PathBuf::from(path);
-        if path_is_in_cache(&app.app_data,&cover) && cover.is_file() {
-            let _ = fs::remove_file(cover);
-        }
-    }
-
     let c = open_db(&app.app_data)?;
     c.execute(
         "UPDATE models SET cover_path=NULL,cover_source_image_id=NULL,cover_position_x=50,cover_position_y=50,updated_at=?2 WHERE id=?1",
