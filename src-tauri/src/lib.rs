@@ -725,6 +725,10 @@ async fn sync_featured_examples_inner(
     let mut records:Vec<FeaturedImageRecord>=Vec::new();
     let mut saved_count=0usize;
     let mut had_errors=false;
+    let mut image_entries=0usize;
+    let mut image_urls=0usize;
+    let mut download_failures=0usize;
+    let mut decode_failures=0usize;
 
     for (version_index,version) in versions.iter().enumerate(){
         let version_id=version.get("id").and_then(Value::as_i64).ok_or_else(||AppError::Api("Civitai returned a model version without an ID".into()))?;
@@ -732,6 +736,7 @@ async fn sync_featured_examples_inner(
         emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index,version_total:total_versions,images_saved:saved_count,status:format!("Fetching featured images from {version_name}"),done:false,error:None});
 
         let images=version.get("images").and_then(Value::as_array).cloned().unwrap_or_default();
+        image_entries += images.len();
         for (image_index, image) in images.into_iter().enumerate(){
             let remote=match image.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty()).map(str::to_string) {
                 Some(v)=>v,
@@ -751,7 +756,8 @@ async fn sync_featured_examples_inner(
                 let response=match request.send().await {
                     Ok(value)=>value,
                     Err(error)=>{
-                had_errors=true;
+                        had_errors=true;
+                        download_failures += 1;
                         emit_examples_progress(&handle,ExamplesRefreshProgress{
                             current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                             version_current:version_index,version_total:total_versions,images_saved:saved_count,
@@ -762,6 +768,7 @@ async fn sync_featured_examples_inner(
                 };
                 if !response.status().is_success(){
                     had_errors=true;
+                    download_failures += 1;
                     emit_examples_progress(&handle,ExamplesRefreshProgress{
                         current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                         version_current:version_index,version_total:total_versions,images_saved:saved_count,
@@ -772,7 +779,8 @@ async fn sync_featured_examples_inner(
                 let bytes=match response.bytes().await {
                     Ok(value)=>value,
                     Err(error)=>{
-                had_errors=true;
+                        had_errors=true;
+                        decode_failures += 1;
                         emit_examples_progress(&handle,ExamplesRefreshProgress{
                             current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                             version_current:version_index,version_total:total_versions,images_saved:saved_count,
@@ -832,7 +840,10 @@ async fn sync_featured_examples_inner(
 
     if had_errors {
         let _=fs::remove_dir_all(&staging);
-        return Err(AppError::Api("Featured example refresh encountered fetch or image errors; the previous cache was preserved".into()));
+        return Err(AppError::Api(format!(
+            "Featured example refresh encountered image errors; previous cache preserved ({} versions, {} image entries, {} usable URLs, {} download failures, {} decode failures)",
+            total_versions, image_entries, image_urls, download_failures, decode_failures
+        )));
     }
 
     if records.is_empty(){
