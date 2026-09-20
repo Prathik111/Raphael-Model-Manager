@@ -793,6 +793,11 @@ function App() {
     return () => { disposed = true; window.clearInterval(timer); };
   }, []);
 
+  const selectedIdRef = useRef<number | null>(null);
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+
   useEffect(() => {
     let disposed = false;
     let stop: undefined | (() => void);
@@ -800,8 +805,15 @@ function App() {
       if (disposed) return;
       setExamplesRefreshProgress(progress);
       setExamplesRefreshRunning(!progress.done);
-      if (progress.done && selectedId != null) {
-        void api.getImages(selectedId, 200).then(setImages).catch(() => {});
+      if (progress.done) {
+        void refresh();
+        const currentId = selectedIdRef.current;
+        if (currentId != null) {
+          void api.getImages(currentId, 200).then(result => {
+            setImages(result.images);
+            setGalleryHasMore(result.has_more);
+          }).catch(() => {});
+        }
       }
     }).then(unlisten => {
       if (disposed) unlisten();
@@ -811,7 +823,7 @@ function App() {
       disposed = true;
       stop?.();
     };
-  }, [selectedId]);
+  }, []);
 
   const selected = models.find(m=>m.id===selectedId) || null;
   const clearDownload = async (taskId: string) => {
@@ -901,8 +913,18 @@ function App() {
     setGalleryHasMore(false);
     setGalleryFetchBusy(false);
     galleryTargetRef.current=200;
-    api.getImages(modelId,200).then(setImages).catch(()=>setImages([]));
-    const timer=window.setInterval(()=>api.getImages(modelId,200).then(setImages).catch(()=>{}),2000);
+    const loadImages = async () => {
+      try {
+        const result = await api.getImages(modelId,200);
+        setImages(result.images);
+        setGalleryHasMore(result.has_more);
+      } catch {
+        setImages([]);
+        setGalleryHasMore(false);
+      }
+    };
+    void loadImages();
+    const timer=window.setInterval(()=>void loadImages(),2000);
     return ()=>window.clearInterval(timer);
   },[selectedId, selected?.civitai_model_id]);
   useEffect(()=>{const t=setTimeout(()=>refresh(),180); return ()=>clearTimeout(t);},[query,type,sort,activeTags]);
@@ -913,9 +935,10 @@ function App() {
   const refreshAllExamples = async()=>{
     if (examplesRefreshRunning) return;
     setExamplesRefreshRunning(true);
-    setExamplesRefreshProgress({current:0,total:0,model_id:null,model_name:null,version_current:0,version_total:5,images_saved:0,status:'Starting featured example refresh',done:false,error:null});
     try {
-      await api.refreshAllExamples();
+      const initial = await api.refreshAllExamples();
+      setExamplesRefreshProgress(initial);
+      setExamplesRefreshRunning(!initial.done);
     } catch (e) {
       setExamplesRefreshRunning(false);
       setExamplesRefreshProgress(p=>({
@@ -926,7 +949,7 @@ function App() {
       }));
     }
   };
-  const onFetchMore = async()=>{ if(!selected || galleryFetchBusy || !galleryHasMore) return; const modelId=selected.id; const target=images.length+10; galleryTargetRef.current=target; setGalleryFetchBusy(true); try { const more=await api.syncModelGallery(modelId,target); const next=await api.getImages(modelId,target); setImages(next); setGalleryHasMore(more); } catch { } finally { setGalleryFetchBusy(false); } };
+  const onFetchMore = async()=>{ if(!selected || galleryFetchBusy || !galleryHasMore) return; const modelId=selected.id; const target=images.length+10; galleryTargetRef.current=target; setGalleryFetchBusy(true); try { const more=await api.syncModelGallery(modelId,target); const next=await api.getImages(modelId,target); setImages(next.images); setGalleryHasMore(more); } catch { } finally { setGalleryFetchBusy(false); } };
   const handleBulkLinkFile = async(file: File)=>{
     setBulkBusy(true);
     setBulkMessage(null);
@@ -958,7 +981,7 @@ function App() {
         </button>
       </div></aside>
       <main className="library"><div className="library-head"><div><div className="eyebrow">{type.toUpperCase()}</div><h1>{type==='All'?'MODEL LIBRARY':type.toUpperCase()}</h1></div><div className="library-tools"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search models, tags, tag:…"/><button className={`tag-filter-button ${activeTags.length?'active':''}`} onClick={()=>setTagPanelOpen(v=>!v)}>TAGS{activeTags.length ? ` · ${activeTags.length}` : ''}</button><button className="import-btn" onClick={()=>{setImportClosing(false);setImportError(null);setImportUrl('');setImportType('Other');setCustomDownloadPath(false);setDownloadPath('');setPreview({model:{},version:{id:0,name:'',base_model:null,download_url:'',filename:null,size_bytes:null,activation_prompts:[]},target_directory:'',thumbnail_path:null});}}>IMPORT CIVITAI</button><select value={sort} onChange={e=>setSort(e.target.value)}><option value="name">NAME</option><option value="size">SIZE</option><option value="path">PATH</option></select></div>{tagPanelOpen && <TagFilterPanel tags={allTags} activeTags={activeTags} onToggle={tag=>setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current.filter(x=>x.toLowerCase()!==tag.toLowerCase()):[...current,tag])} onClear={()=>setActiveTags([])}/>}</div>{activeTags.length ? <div className="active-tag-bar">{activeTags.map(tag=><button key={tag} onClick={()=>setActiveTags(current=>current.filter(x=>x.toLowerCase()!==tag.toLowerCase()))}>{tag}<span>×</span></button>)}<span className="active-tag-help">TAG FILTERS</span></div> : null}<div className="grid">{models.map(m=><ModelCard key={m.id} model={m} selected={m.id===selectedId} onClick={()=>setSelectedId(m.id)}/>)}{!models.length&&<div className="empty-state">No models match the current view.</div>}</div></main>
-      {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} galleryHasMore={galleryHasMore} galleryFetchBusy={galleryFetchBusy} onFetchMore={onFetchMore} onRefresh={async()=>{await api.refreshModel(selected.id); await refresh();}} onLinkCivitai={async(url)=>{await api.linkModelCivitai(selected.id,url); await refresh();}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)} onChooseThumbnail={async imageId=>{const updated=await api.setModelCoverFromImage(selected.id,imageId); setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
+      {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} galleryHasMore={galleryHasMore} galleryFetchBusy={galleryFetchBusy} onFetchMore={onFetchMore} onRefresh={async()=>{await api.refreshModel(selected.id); await refresh(); const result=await api.getImages(selected.id,200); setImages(result.images); setGalleryHasMore(result.has_more);}} onLinkCivitai={async(url)=>{await api.linkModelCivitai(selected.id,url); await refresh(); const result=await api.getImages(selected.id,200); setImages(result.images); setGalleryHasMore(result.has_more);}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)} onChooseThumbnail={async imageId=>{const updated=await api.setModelCoverFromImage(selected.id,imageId); setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
       {selected && coverEditorOpen && <CoverEditorOverlay model={selected} onClose={()=>setCoverEditorOpen(false)} onUpdated={updated=>{setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
     </div>
     {settingsOpen && <SettingsOverlay thumbnailFit={thumbnailFit} onThumbnailFitChange={setThumbnailFit} progress={examplesRefreshProgress} running={examplesRefreshRunning} onRefreshExamples={refreshAllExamples} onClose={()=>setSettingsOpen(false)}/>} 
