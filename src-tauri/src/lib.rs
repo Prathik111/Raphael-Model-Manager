@@ -89,6 +89,7 @@ struct ModelRecord {
     cover_path: Option<String>,
     cover_position_x: f64,
     cover_position_y: f64,
+    downloaded_at: i64,
     updated_at: i64,
 }
 
