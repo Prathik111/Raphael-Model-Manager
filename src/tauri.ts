@@ -12,6 +12,7 @@ import type {
   TagRecord,
   WebAppStatus,
   ExamplesRefreshProgress,
+  ModelImagesResponse,
 } from './types';
 
 export const isWebApp = typeof window !== 'undefined' && !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
@@ -82,11 +83,13 @@ export const api = {
   deleteModel: (id: number) =>
     command<void>('delete_model', { id }),
   getImages: (id: number, limit = 20) =>
-    command<ModelImage[]>('get_model_images', { id, limit }),
+    command<ModelImagesResponse>('get_model_images', { id, limit }),
   syncModelGallery: (id: number, targetCount = 20) =>
     command<boolean>('sync_model_gallery', { id, targetCount }),
   refreshAllExamples: () =>
-    command<void>('refresh_all_examples'),
+    command<ExamplesRefreshProgress>('refresh_all_examples'),
+  getExamplesRefreshStatus: () =>
+    command<ExamplesRefreshProgress | null>('get_examples_refresh_status'),
   importCivitai: (url: string) =>
     command<CivitaiImportPreview>('preview_civitai_import', { url }),
   installCivitai: (
@@ -142,7 +145,25 @@ export async function subscribeToModelChanges(cb: () => void) {
 
 export async function subscribeToExamplesRefresh(cb: (progress: ExamplesRefreshProgress) => void) {
   if (isWebApp) {
-    return () => {};
+    let disposed = false;
+    const poll = async () => {
+      try {
+        const response = await fetch('/api/command/get_examples_refresh_status', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        });
+        if (!response.ok) return;
+        const payload = await response.json().catch(() => null);
+        if (!disposed && payload) cb(payload as ExamplesRefreshProgress);
+      } catch {}
+    };
+    await poll();
+    const timer = window.setInterval(() => void poll(), 750);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
   }
   return listen<ExamplesRefreshProgress>('examples-refresh-progress', event => cb(event.payload));
 }
