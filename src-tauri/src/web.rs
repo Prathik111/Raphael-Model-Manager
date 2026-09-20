@@ -243,11 +243,12 @@ fn web_url() -> String {
     }
 }
 
-fn validate_cached_file(path: &Path, app_data: &Path) -> AppResult<PathBuf> {
-    let cache = crate::cache_root(app_data);
-    let cache = cache.canonicalize().unwrap_or(cache);
-    let path = path.canonicalize().map_err(AppError::Io)?;
-    if !path.starts_with(&cache) || !path.is_file() {
+async fn validate_cached_file(path: &Path, app_data: &Path) -> AppResult<PathBuf> {
+    let cache_root = crate::cache_root(app_data);
+    let cache = tokio::fs::canonicalize(&cache_root).await.unwrap_or(cache_root);
+    let path = tokio::fs::canonicalize(path).await.map_err(AppError::Io)?;
+    let metadata = tokio::fs::metadata(&path).await.map_err(AppError::Io)?;
+    if !path.starts_with(&cache) || !metadata.is_file() {
         return Err(AppError::Invalid("Requested file is outside Raphael's configured cache".into()));
     }
     Ok(path)
@@ -307,7 +308,7 @@ async fn file_handler(
     };
 
     let requested = PathBuf::from(query.path);
-    let path = match validate_cached_file(&requested, &app_data) {
+    let path = match validate_cached_file(&requested, &app_data).await {
         Ok(path) => path,
         Err(error) => return response_err(error),
     };
@@ -368,13 +369,12 @@ async fn file_handler(
             let remaining = stream_length - sent;
             let chunk_size = remaining.min(64 * 1024) as usize;
             let mut buffer = vec![0u8; chunk_size];
-            match file.read_exact(&mut buffer).await {
-                Ok(_) => {
-                    sent += buffer.len() as u64;
+            match file.read(&mut buffer).await {
+                Ok(0) => None,
+                Ok(bytes_read) => {
+                    buffer.truncate(bytes_read);
+                    sent += bytes_read as u64;
                     Some((Ok::<Vec<u8>, std::io::Error>(buffer), (file, sent)))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    None
                 }
                 Err(error) => Some((Err(error), (file, stream_length))),
             }
