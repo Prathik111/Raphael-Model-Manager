@@ -805,10 +805,12 @@ async fn sync_featured_examples_inner(
         return Err(AppError::Api("Civitai returned no featured images for the newest five versions".into()));
     }
 
-    let old_cover = {
-        let c = open_db(&app.app_data)?;
-        c.query_row("SELECT cover_path FROM models WHERE id=?1", [model_id], |r| r.get::<_, Option<String>>(0))?
-    };
+    let c = open_db(&app.app_data)?;
+    let old_cover: Option<String> = c.query_row(
+        "SELECT cover_path FROM models WHERE id=?1",
+        [model_id],
+        |r| r.get(0),
+    )?;
     if let Some(old_cover) = old_cover {
         let old_path = PathBuf::from(old_cover);
         if old_path.starts_with(&active) {
@@ -826,7 +828,6 @@ async fn sync_featured_examples_inner(
                     params![model_id, new_cover.to_string_lossy().to_string(), cover_source_image_id, now()],
                 )?;
             } else {
-                let c = open_db(&app.app_data)?;
                 c.execute("UPDATE models SET cover_path=NULL,cover_source_image_id=NULL,updated_at=?2 WHERE id=?1", params![model_id, now()])?;
             }
         }
