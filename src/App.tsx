@@ -224,7 +224,7 @@ function ModelCard({ model, selected, onClick }: { model: ModelRecord; selected:
   return <button className={`model-card ${selected ? 'selected' : ''}`} onClick={onClick}>
     <div className="thumb model-thumb">
       <TypePlaceholder type={model.model_type as ModelType}/>
-      {model.thumbnail_path ? <img src={fileUrl(model.thumbnail_path)} alt="" onError={(e)=>{e.currentTarget.style.display="none";}}/> : null}
+      {(model.cover_path || model.thumbnail_path) ? <img src={fileUrl(model.cover_path || model.thumbnail_path || '')} alt="" style={{objectPosition: `${model.cover_position_x}% ${model.cover_position_y}%`}} onError={(e)=>{e.currentTarget.style.display="none";}}/> : null}
     </div>
     <div className="card-body">
       <div className="card-title">{model.civitai_name || model.filename.replace(/\.[^.]+$/, '')}</div>
@@ -308,7 +308,170 @@ function TagFilterPanel({ tags, activeTags, onToggle, onClear }: { tags: TagReco
   </div>;
 }
 
-function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTags, onSaveType, onDelete, onFilterTag }: { model: ModelRecord; images: ModelImage[]; allTags: TagRecord[]; onRefresh: ()=>void; onLinkCivitai: (url: string)=>Promise<void>; onSaveTags: (tags: string[])=>Promise<void>; onSaveType: (type: string)=>Promise<void>; onDelete: ()=>Promise<void>; onFilterTag: (tag: string)=>void }) {
+function CoverEditorOverlay({
+  model,
+  onClose,
+  onUpdated,
+}: {
+  model: ModelRecord;
+  onClose: () => void;
+  onUpdated: (model: ModelRecord) => void;
+}) {
+  const sourcePath = model.cover_path || model.thumbnail_path;
+  const [coverPath, setCoverPath] = useState(sourcePath);
+  const [position, setPosition] = useState({
+    x: Number.isFinite(model.cover_position_x) ? model.cover_position_x : 50,
+    y: Number.isFinite(model.cover_position_y) ? model.cover_position_y : 50,
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const dragRef = useRef<{ pointerId: number; x: number; y: number; startX: number; startY: number } | null>(null);
+
+  const clamp = (value: number) => Math.max(0, Math.min(100, value));
+
+  const startDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!coverPath || busy) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = {
+      pointerId: event.pointerId,
+      x: position.x,
+      y: position.y,
+      startX: event.clientX,
+      startY: event.clientY,
+    };
+    void rect;
+  };
+
+  const moveDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    setPosition({
+      x: clamp(drag.x - ((event.clientX - drag.startX) / rect.width) * 100),
+      y: clamp(drag.y - ((event.clientY - drag.startY) / rect.height) * 100),
+    });
+  };
+
+  const stopDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (dragRef.current?.pointerId === event.pointerId) {
+      dragRef.current = null;
+      try { event.currentTarget.releasePointerCapture(event.pointerId); } catch {}
+    }
+  };
+
+  const chooseCustom = async () => {
+    if (api.isWebApp || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const source = await api.chooseImageFile();
+      if (!source) return;
+      const updated = await api.setModelCustomCover(model.id, source);
+      setCoverPath(updated.cover_path || updated.thumbnail_path);
+      setPosition({
+        x: Number.isFinite(updated.cover_position_x) ? updated.cover_position_x : 50,
+        y: Number.isFinite(updated.cover_position_y) ? updated.cover_position_y : 50,
+      });
+      onUpdated(updated);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resetCover = async () => {
+    if (busy || !model.cover_path) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await api.resetModelCover(model.id);
+      setCoverPath(updated.thumbnail_path);
+      setPosition({ x: 50, y: 50 });
+      onUpdated(updated);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const apply = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await api.setModelCoverPosition(model.id, position.x, position.y);
+      onUpdated(updated);
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <div className="modal-backdrop cover-editor-backdrop" onClick={() => { if (!busy) onClose(); }}>
+    <div className="cover-editor hud-panel" onClick={e => e.stopPropagation()}>
+      <header className="cover-editor-header">
+        <div>
+          <div className="eyebrow">COVER EDITOR</div>
+          <h2>{model.civitai_name || model.filename}</h2>
+        </div>
+        <button className="settings-close" aria-label="Close cover editor" onClick={onClose} disabled={busy}>×</button>
+      </header>
+
+      <div className="cover-editor-body">
+        <div
+          className={`cover-editor-frame ${coverPath ? 'draggable' : 'empty'}`}
+          onPointerDown={startDrag}
+          onPointerMove={moveDrag}
+          onPointerUp={stopDrag}
+          onPointerCancel={stopDrag}
+        >
+          {coverPath
+            ? <img
+                src={fileUrl(coverPath)}
+                alt=""
+                draggable={false}
+                style={{ objectPosition: `${position.x}% ${position.y}%` }}
+                onError={() => setError('The selected cover image could not be displayed.')}
+              />
+            : <TypePlaceholder type={model.model_type as ModelType}/>}
+          <div className="cover-editor-grid"/>
+          <div className="cover-editor-corners"/>
+          {coverPath ? <div className="cover-editor-hint">DRAG TO REPOSITION</div> : null}
+        </div>
+
+        <div className="cover-editor-tools">
+          <div className="cover-editor-tool-row">
+            <button className="cover-upload-btn" onClick={chooseCustom} disabled={api.isWebApp || busy} title={api.isWebApp ? 'Custom cover selection is available in the desktop app' : 'Choose a custom cover image'}>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l1.7 2H20.5v9.8a1.7 1.7 0 0 1-1.7 1.7H5.2a1.7 1.7 0 0 1-1.7-1.7Z"/><path d="M3.5 7.5V5.4a1.4 1.4 0 0 1 1.4-1.4h4.1l1.6 2H19a1.5 1.5 0 0 1 1.5 1.5"/></svg>
+              <span>{busy ? 'WORKING…' : 'CUSTOM COVER'}</span>
+            </button>
+            <button className="text-btn" onClick={resetCover} disabled={busy || !model.cover_path}>USE THUMBNAIL</button>
+          </div>
+
+          <div className="cover-position-readout">
+            <span>X {position.x.toFixed(0)}%</span>
+            <span>Y {position.y.toFixed(0)}%</span>
+          </div>
+          <p className="settings-copy">The selected image is cropped to Raphael’s cover frame. Drag it inside the frame to choose which part is visible.</p>
+          {api.isWebApp ? <div className="cover-web-note">POSITION EDITING WORKS IN WEB MODE. CUSTOM FILE PICKING IS DESKTOP ONLY.</div> : null}
+          {error ? <div className="error-box settings-error">{error}</div> : null}
+        </div>
+      </div>
+
+      <div className="modal-actions cover-editor-actions">
+        <button className="text-btn" onClick={onClose} disabled={busy}>CANCEL</button>
+        <button className="primary-btn" onClick={apply} disabled={busy}>{busy ? 'SAVING…' : 'APPLY COVER'}</button>
+      </div>
+    </div>
+  </div>;
+}
+
+function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTags, onSaveType, onDelete, onFilterTag, onChangeCover }: { model: ModelRecord; images: ModelImage[]; allTags: TagRecord[]; onRefresh: ()=>void; onLinkCivitai: (url: string)=>Promise<void>; onSaveTags: (tags: string[])=>Promise<void>; onSaveType: (type: string)=>Promise<void>; onDelete: ()=>Promise<void>; onFilterTag: (tag: string)=>void; onChangeCover: ()=>void }) {
   const [tab, setTab] = useState<'overview'|'examples'|'files'>('overview');
   const [showToken, setShowToken] = useState(false);
   const [token, setToken] = useState('');
@@ -320,7 +483,10 @@ function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTag
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const promptText = model.activation_prompts.join(', ');
   return <aside className="inspector hud-panel">
-    <div className="inspector-header"><div><div className="eyebrow">MODEL</div><h2>{model.civitai_name || model.filename}</h2></div><select className="type-select" value={model.model_type} onChange={async e=>{try{await onSaveType(e.target.value);}catch{e.currentTarget.value=model.model_type;}}} aria-label="Model type">{MODEL_TYPES.map(x=><option key={x.value} value={x.value}>{x.label}</option>)}</select></div>
+    <div className="inspector-header">
+      <div className="inspector-model-heading"><div><div className="eyebrow">MODEL</div><h2>{model.civitai_name || model.filename}</h2></div><button className="cover-change-btn" onClick={onChangeCover} title="Change this model's cover">CHANGE COVER</button></div>
+      <select className="type-select" value={model.model_type} onChange={async e=>{try{await onSaveType(e.target.value);}catch{e.currentTarget.value=model.model_type;}}} aria-label="Model type">{MODEL_TYPES.map(x=><option key={x.value} value={x.value}>{x.label}</option>)}</select>
+    </div>
     <div className="inspector-tabs">{(['overview','examples','files'] as const).map(t=><button className={tab===t?'active':''} onClick={()=>setTab(t)} key={t}>{t.toUpperCase()}</button>)}</div>
     {tab==='overview' && <div className="inspector-scroll">
       <section><div className="section-head">DESCRIPTION</div><p className="description">{model.description || 'No description cached from Civitai.'}</p></section>
@@ -340,7 +506,7 @@ function App() {
   const [state,setState]=useState<AppState|null>(null); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
   const refreshGeneration = useRef(0);
   const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
-  const [settingsOpen,setSettingsOpen]=useState(false); const [thumbnailFit,setThumbnailFit]=useState<ThumbnailFit>(initialThumbnailFit);
+  const [settingsOpen,setSettingsOpen]=useState(false); const [coverEditorOpen,setCoverEditorOpen]=useState(false); const [thumbnailFit,setThumbnailFit]=useState<ThumbnailFit>(initialThumbnailFit);
   useEffect(()=>{window.localStorage.setItem(THUMBNAIL_FIT_KEY,thumbnailFit);},[thumbnailFit]);
   const selected = models.find(m=>m.id===selectedId) || null;
   async function refresh(){
@@ -406,7 +572,8 @@ function App() {
         </button>
       </div></aside>
       <main className="library"><div className="library-head"><div><div className="eyebrow">{type.toUpperCase()}</div><h1>{type==='All'?'MODEL LIBRARY':type.toUpperCase()}</h1></div><div className="library-tools"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search models, tags, tag:…"/><button className={`tag-filter-button ${activeTags.length?'active':''}`} onClick={()=>setTagPanelOpen(v=>!v)}>TAGS{activeTags.length ? ` · ${activeTags.length}` : ''}</button><button className="import-btn" onClick={()=>{setImportError(null);setImportUrl('');setImportType('Other');setCustomDownloadPath(false);setDownloadPath('');setPreview({model:{},version:{id:0,name:'',base_model:null,download_url:'',filename:null,size_bytes:null,activation_prompts:[]},target_directory:'',thumbnail_path:null});}}>IMPORT CIVITAI</button><select value={sort} onChange={e=>setSort(e.target.value)}><option value="name">NAME</option><option value="size">SIZE</option><option value="path">PATH</option></select></div>{tagPanelOpen && <TagFilterPanel tags={allTags} activeTags={activeTags} onToggle={tag=>setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current.filter(x=>x.toLowerCase()!==tag.toLowerCase()):[...current,tag])} onClear={()=>setActiveTags([])}/>}</div>{activeTags.length ? <div className="active-tag-bar">{activeTags.map(tag=><button key={tag} onClick={()=>setActiveTags(current=>current.filter(x=>x.toLowerCase()!==tag.toLowerCase()))}>{tag}<span>×</span></button>)}<span className="active-tag-help">TAG FILTERS</span></div> : null}<div className="grid">{models.map(m=><ModelCard key={m.id} model={m} selected={m.id===selectedId} onClick={()=>setSelectedId(m.id)}/>)}{!models.length&&<div className="empty-state">No models match the current view.</div>}</div></main>
-      {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} onRefresh={async()=>{await api.refreshModel(selected.id); await refresh();}} onLinkCivitai={async(url)=>{await api.linkModelCivitai(selected.id,url); await refresh();}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}}/>}
+      {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} onRefresh={async()=>{await api.refreshModel(selected.id); await refresh();}} onLinkCivitai={async(url)=>{await api.linkModelCivitai(selected.id,url); await refresh();}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)}/>}
+      {selected && coverEditorOpen && <CoverEditorOverlay model={selected} onClose={()=>setCoverEditorOpen(false)} onUpdated={updated=>{setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
     </div>
     {settingsOpen && <SettingsOverlay thumbnailFit={thumbnailFit} onThumbnailFitChange={setThumbnailFit} onClose={()=>setSettingsOpen(false)}/>}
     {(preview || importUrl) && <div className="modal-backdrop" onClick={()=>{if(!busy){setPreview(null); setImportUrl(''); setDownloadPath(''); setCustomDownloadPath(false); setImportError(null);}}}><div className="import-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">CIVITAI IMPORT</div><h2>INSTALL A MODEL</h2>{!preview || preview.version.id===0 ? <>{importError ? <div className="error-box modal-error">{importError}</div> : null}<div className="import-row"><input value={importUrl} onChange={e=>setImportUrl(e.target.value)} onKeyDown={e=>e.key==='Enter'&&doImport()} placeholder="civitai.com/models/... or civitai.red/models/..." autoFocus/><button className="primary-btn" onClick={doImport} disabled={busy}>{busy?'ANALYZING…':'ANALYZE'}</button></div></> : <><div className="import-preview-grid"><div className="preview-image">{preview.thumbnail_path ? <><TypePlaceholder type={importType}/><img src={fileUrl(preview.thumbnail_path)} alt="" onError={(e)=>{e.currentTarget.style.display="none";}}/></> : <TypePlaceholder type={importType}/>}</div><div className="preview-panel"><div className="preview-topline"><span className="type-chip">{importType}</span><span className="source-domain">CIVITAI</span></div><h3>{preview.model.name || preview.version.filename || 'Model'}</h3><div className="preview-meta">{preview.version.base_model || 'Base model unavailable'} · {preview.version.filename || 'Filename automatic'}</div><div className="kv"><span>MODEL FILE</span><b>{preview.version.filename || 'Automatic filename'}</b></div><div className="kv"><span>SIZE</span><b>{preview.version.size_bytes ? fmtBytes(preview.version.size_bytes) : 'Unknown'}</b></div><div className="section-head">LIBRARY TAG</div><div className="import-type-row"><label htmlFor="import-type">CLASSIFY AS</label><select id="import-type" className="import-type-select" value={importType} onChange={e=>{const next=e.target.value as ModelType; setImportType(next); if(!customDownloadPath) setDownloadPath(defaultImportDirectory(state.models_root,next));}} disabled={busy}>{IMPORT_TYPES.map(x=><option key={x} value={x}>{x}</option>)}</select></div><div className="import-type-note">Civitai suggests <b>{preview.model.type || 'Unknown'}</b>; Raphael uses the tag you choose for its library category and default folder.</div><div className="section-head">DOWNLOAD LOCATION</div><div className="destination-box"><div className="destination-path" title={downloadPath}>{downloadPath || defaultImportDirectory(state.models_root,importType) || preview.target_directory}</div><button className="primary-btn small" onClick={async()=>{const next=await api.chooseDirectory(downloadPath || defaultImportDirectory(state.models_root,importType) || preview.target_directory); if(next){setDownloadPath(next);setCustomDownloadPath(true);setImportError(null);}}} disabled={busy || api.isWebApp}>{api.isWebApp ? 'DESKTOP ONLY' : 'BROWSE'}</button></div><div className="destination-note">Choose a folder inside your configured ComfyUI models directory. Changing the tag updates the default folder until you manually browse.</div><div className="section-head">ACTIVATION PROMPTS</div><div className="chips">{preview.version.activation_prompts.map(x=><span key={x}>{x}</span>)}</div></div></div><div className="modal-actions"><button className="text-btn" onClick={()=>{setPreview(null);setImportError(null);}}>BACK</button><button className="primary-btn" onClick={install} disabled={busy}>{busy?'DOWNLOADING…':'DOWNLOAD & INSTALL'}</button></div>{importError ? <div className="error-box modal-error">{importError}</div> : null}</>}</div></div>}
