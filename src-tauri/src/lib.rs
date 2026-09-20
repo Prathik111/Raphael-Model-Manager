@@ -817,7 +817,7 @@ fn set_cache_location_inner(app_data: &Path, path: &str) -> AppResult<CacheStats
     if old_canonical == target_canonical {
         let mut c = open_db(app_data)?;
         let bytes = dir_size(&target_canonical);
-        rewrite_cache_paths(&mut c, &old_canonical, &target_canonical, bytes)?;
+        rewrite_cache_paths(&mut c, &old, &target, bytes)?;
         return cache_stats_inner(app_data);
     }
     if target_canonical.starts_with(&old_canonical) || old_canonical.starts_with(&target_canonical) {
@@ -838,7 +838,7 @@ fn set_cache_location_inner(app_data: &Path, path: &str) -> AppResult<CacheStats
     let db_update = (|| {
         let mut c = open_db(app_data)?;
         let bytes = dir_size(&target_canonical);
-        rewrite_cache_paths(&mut c, &old_canonical, &target_canonical, bytes)?;
+        rewrite_cache_paths(&mut c, &old, &target, bytes)?;
         Ok::<(), AppError>(())
     })();
 
