@@ -1273,6 +1273,8 @@ async fn download_featured_image(
         return (image_id, FeaturedDownloadResult::ReadFailed(error.to_string()));
     }
 
+    let thumbnail_local = ensure_featured_thumbnail(&local);
+
     let mut meta = image.clone();
     if let Some(map) = meta.as_object_mut() {
         map.insert("featured".into(), json!(true));
@@ -1306,7 +1308,13 @@ async fn download_featured_image(
         FeaturedDownloadResult::Saved((
             image_id,
             Some(final_local),
-            None,
+            thumbnail_local.map(|_| {
+                active
+                    .join(version_id.to_string())
+                    .join(format!("{image_id}_thumb.webp"))
+                    .to_string_lossy()
+                    .to_string()
+            }),
             width,
             height,
             prompt,
@@ -1318,6 +1326,18 @@ async fn download_featured_image(
             serde_json::to_string(&meta).unwrap_or_else(|_| "{}".into()),
         )),
     )
+}
+
+fn ensure_featured_thumbnail(source: &Path) -> Option<String> {
+    let parent = source.parent()?;
+    let stem = source.file_stem()?.to_str()?;
+    let thumbnail = parent.join(format!("{stem}_thumb.webp"));
+    if !thumbnail.is_file() {
+        let image = decode_image_file(source).ok()?;
+        let resized = image.resize(420, 420, FilterType::Triangle);
+        resized.save_with_format(&thumbnail, ImageFormat::WebP).ok()?;
+    }
+    Some(thumbnail.to_string_lossy().to_string())
 }
 
 fn featured_extension(url: &str) -> String {
@@ -1453,6 +1473,7 @@ async fn sync_featured_examples_inner(
                 if copy_or_hard_link(source,&target).is_err() {
                     return None;
                 }
+                let thumbnail = ensure_featured_thumbnail(&target);
                 let mut meta=image.clone();
                 if let Some(map)=meta.as_object_mut() {
                     map.insert("featured".into(),json!(true));
@@ -1468,7 +1489,8 @@ async fn sync_featured_examples_inner(
                 let width=image.get("width").and_then(Value::as_i64);
                 let height=image.get("height").and_then(Value::as_i64);
                 let final_local=active.join(version_id.to_string()).join(format!("{image_id}.{ext}")).to_string_lossy().to_string();
-                Some((image_id,(image_id,Some(final_local),None,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into()))))
+                let final_thumbnail = thumbnail.map(|_| active.join(version_id.to_string()).join(format!("{image_id}_thumb.webp")).to_string_lossy().to_string());
+                Some((image_id,(image_id,Some(final_local),final_thumbnail,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into()))))
             });
 
             if let Some((image_id,record)) = reused {
