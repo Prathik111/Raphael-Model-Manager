@@ -96,7 +96,7 @@ struct ModelRecord {
     updated_at: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct ModelImage {
     id: i64,
     civitai_image_id: i64,
