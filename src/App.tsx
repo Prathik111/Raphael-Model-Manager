@@ -930,16 +930,25 @@ function App() {
     galleryTargetRef.current=200;
     const loadImages = async () => {
       try {
-        const remoteHasMore = await api.syncModelGallery(modelId,20).catch(() => false);
         const result = await api.getImages(modelId,200);
         setImages(result.images);
-        setGalleryHasMore(remoteHasMore || result.has_more);
+        setGalleryHasMore(result.has_more);
       } catch {
         setImages([]);
         setGalleryHasMore(false);
       }
     };
-    void loadImages();
+    const primePagination = async () => {
+      try {
+        const remoteHasMore = await api.syncModelGallery(modelId,20);
+        const result = await api.getImages(modelId,200);
+        setImages(result.images);
+        setGalleryHasMore(remoteHasMore || result.has_more);
+      } catch {
+        await loadImages();
+      }
+    };
+    void primePagination();
     const timer=window.setInterval(()=>void loadImages(),2000);
     return ()=>window.clearInterval(timer);
   },[selectedId, selected?.civitai_model_id]);
