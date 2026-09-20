@@ -2041,37 +2041,55 @@ async fn set_model_cover_from_image(
     image_id: i64,
 ) -> AppResult<ModelRecord> {
     let _guard=app.cache_lock.lock().await;
-    let (old_cover, source) = {
+    let (old_cover, old_cover_source_id, source) = {
         let c = open_db(&app.app_data)?;
         c.query_row(
-            "SELECT m.cover_path,COALESCE(i.local_path,i.thumbnail_path)
+            "SELECT m.cover_path,m.cover_source_image_id,COALESCE(i.local_path,i.thumbnail_path)
              FROM models m
              JOIN images i ON i.model_id=m.id
              WHERE m.id=?1 AND i.id=?2",
             params![id, image_id],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+            |r| Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            )),
         )
         .map_err(|_| AppError::Invalid("That example image is not cached for this model".into()))?
     };
     let source = source
         .map(PathBuf::from)
         .ok_or_else(|| AppError::Invalid("That example image has not finished caching yet".into()))?;
-    let new_cover = copy_cached_cover(&app, id, &source)?;
+
+    // The selected image is already part of Raphael's protected Civitai cache.
+    // Point the model cover directly at it instead of decoding/copying the entire
+    // image into a second file. cover_source_image_id protects it from eviction.
+    if !path_is_in_cache(&app.app_data, &source) || !source.is_file() {
+        return Err(AppError::Invalid("That example image is outside Raphael's Civitai cache".into()));
+    }
 
     let c = open_db(&app.app_data)?;
     c.execute(
         "UPDATE models SET cover_path=?2,cover_source_image_id=?3,cover_position_x=50,cover_position_y=50,updated_at=?4 WHERE id=?1",
-        params![id, new_cover.to_string_lossy().to_string(), image_id, now()],
+        params![id, source.to_string_lossy().to_string(), image_id, now()],
     )?;
     let rec = model_by_id(&c, id)?;
     drop(c);
-    if let Some(old) = old_cover {
-        let old_path = PathBuf::from(old);
-        if old_path != new_cover && path_is_in_cache(&app.app_data, &old_path) && old_path.is_file() {
-            let _ = fs::remove_file(old_path);
+
+    // A previous custom/stable cover is no longer referenced. Never delete a
+    // gallery-backed cover here: its image remains valid cached content.
+    if old_cover_source_id.is_none() {
+        if let Some(old) = old_cover {
+            let old_path = PathBuf::from(old);
+            if old_path != source
+                && path_is_in_cache(&app.app_data, &old_path)
+                && old_path.is_file()
+            {
+                let _ = fs::remove_file(old_path);
+            }
         }
     }
-    let _ = enforce_cache_limit_inner(&app.app_data);
+
     let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
