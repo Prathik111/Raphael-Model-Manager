@@ -998,7 +998,7 @@ function CoverEditorOverlay({
   </div>;
 }
 
-function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, onRefresh, onLinkCivitai, onSaveTags, onSaveType, onDelete, onFilterTag, onChangeCover, onChooseThumbnail, onFetchMore }: { model: ModelRecord; images: ModelImage[]; allTags: TagRecord[]; galleryHasMore: boolean; galleryFetchBusy: boolean; onRefresh: ()=>Promise<void>; onLinkCivitai: (url: string)=>Promise<void>; onSaveTags: (tags: string[])=>Promise<void>; onSaveType: (type: string)=>Promise<void>; onDelete: ()=>Promise<void>; onFilterTag: (tag: string)=>void; onChangeCover: ()=>void; onChooseThumbnail: (imageId: number)=>Promise<void>; onFetchMore: ()=>Promise<void> }) {
+function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, onRefresh, onLinkCivitai, onSaveTags, onSaveType, onDelete, onFilterTag, onChangeCover, onChooseThumbnail, onFetchMore, onOpenImage }: { model: ModelRecord; images: ModelImage[]; allTags: TagRecord[]; galleryHasMore: boolean; galleryFetchBusy: boolean; onRefresh: ()=>Promise<void>; onLinkCivitai: (url: string)=>Promise<void>; onSaveTags: (tags: string[])=>Promise<void>; onSaveType: (type: string)=>Promise<void>; onDelete: ()=>Promise<void>; onFilterTag: (tag: string)=>void; onChangeCover: ()=>void; onChooseThumbnail: (imageId: number)=>Promise<void>; onFetchMore: ()=>Promise<void>; onOpenImage: (imageId: number)=>void }) {
   const [tab, setTab] = useState<'overview'|'examples'|'files'>('overview');
   const [civitaiUrl, setCivitaiUrl] = useState(model.civitai_url || '');
   const [linkBusy, setLinkBusy] = useState(false);
@@ -1058,7 +1058,7 @@ function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, o
       <section><div className="section-head">LOCATION</div><div className="mono-box">{model.path}</div><button className="text-btn" disabled={api.isWebApp} title={api.isWebApp ? 'Opening the Windows file manager is available only in the desktop app' : undefined} onClick={()=>api.openFolder(model.path)}>{api.isWebApp ? 'OPEN FOLDER · DESKTOP' : 'OPEN FOLDER'}</button></section>
       <section><div className="section-head">CIVITAI SOURCE</div>{model.civitai_url ? <div className="civitai-source-panel"><div className="source-line"><span className="source-dot"/><span className="source-label">LINKED SOURCE</span><span className="source-domain">{new URL(model.civitai_url).hostname.replace(/^www\./,'').toUpperCase()}</span></div><div className="mono-box source-url">{model.civitai_url}</div><button className="text-btn" onClick={()=>void refreshSource()} disabled={refreshBusy || linkBusy}>{refreshBusy ? 'REFRESHING…' : 'REFRESH SOURCE DATA'}</button>{refreshError ? <div className="error-box settings-error">{refreshError}</div> : null}</div> : <div className="civitai-link-panel"><div className="source-line"><span className="source-dot"/><span className="source-label">LINK LOCAL MODEL</span><span className="source-domain">CIVITAI</span></div><p className="empty-inline">Paste a Civitai model page to pull its metadata, gallery and thumbnail into Raphael.</p><div className="link-row"><input value={civitaiUrl} onChange={e=>{setCivitaiUrl(e.target.value);setLinkError(null);}} placeholder="civitai.com/models/... or civitai.red/models/..."/><button className="primary-btn small" disabled={linkBusy} onClick={async()=>{if(!civitaiUrl.trim()) return; setLinkBusy(true); setLinkError(null); try { await onLinkCivitai(civitaiUrl.trim()); } catch (e) { setLinkError(String(e)); } finally { setLinkBusy(false); }}}>{linkBusy?'FETCHING…':'FETCH DETAILS'}</button></div>{linkError ? <div className="error-box">{linkError}</div> : null}</div>}</section>
     </div>}
-    {tab==='examples' && <div className="inspector-scroll"><section><div className="section-head section-head-row"><span>CACHED CIVITAI GALLERY · {images.length}</span><span className="section-action">PICK A THUMBNAIL</span></div><Gallery model={model} images={images} hasMore={galleryHasMore} fetchBusy={galleryFetchBusy} onChooseThumbnail={onChooseThumbnail} onFetchMore={onFetchMore}/></section></div>}
+    {tab==='examples' && <div className="inspector-scroll"><section><div className="section-head section-head-row"><span>CACHED CIVITAI GALLERY · {images.length}</span><span className="section-action">PICK A THUMBNAIL</span></div><Gallery model={model} images={images} hasMore={galleryHasMore} fetchBusy={galleryFetchBusy} onChooseThumbnail={onChooseThumbnail} onFetchMore={onFetchMore} onOpenImage={onOpenImage}/></section></div>}
     {tab==='files' && <div className="inspector-scroll"><section><div className="section-head">LOCAL FILE</div><div className="kv"><span>SIZE</span><b>{fmtBytes(model.size_bytes)}</b></div><div className="kv"><span>TYPE</span><b>{model.model_type}</b></div><div className="kv"><span>BASE</span><b>{model.base_model || '—'}</b></div><div className="kv"><span>VERSION</span><b>{model.version_name || '—'}</b></div><div className="kv"><span>CREATOR</span><b>{model.creator || '—'}</b></div><div className="kv"><span>DOWNLOADED</span><b>{fmtDateTime(model.downloaded_at)}</b></div><div className="kv"><span>SHA256</span><b className="wrap">{model.source_hash || 'Not computed'}</b></div></section><section className="danger-section"><div className="section-head">DANGER ZONE</div><p className="danger-copy">Permanently delete this model file from disk and remove its Raphael metadata and cached gallery entries.</p><button className="danger-btn" onClick={()=>{setDeleteError(null);setDeleteOpen(true);}} disabled={deleteBusy}>DELETE MODEL</button></section></div>}
     {deleteOpen && <div className={"modal-backdrop inspector-delete-backdrop" + (deleteClosing ? " overlay-leaving" : "")} onClick={()=>dismissDelete()}><div className="delete-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">DESTRUCTIVE ACTION</div><h3>DELETE MODEL?</h3><p>This will permanently remove <b>{model.filename}</b> from your ComfyUI models folder. Raphael metadata and cached gallery files for this model will also be removed.</p>{deleteError ? <div className="error-box modal-error">{deleteError}</div> : null}<div className="modal-actions"><button className="text-btn" onClick={()=>dismissDelete()} disabled={deleteBusy}>CANCEL</button><button className="danger-btn confirm" disabled={deleteBusy} onClick={async()=>{setDeleteBusy(true);setDeleteError(null);try{await onDelete();dismissDelete(true);}catch(e){setDeleteError(String(e));}finally{setDeleteBusy(false);}}}>{deleteBusy?'DELETING…':'DELETE PERMANENTLY'}</button></div></div></div>}
   </aside>;
@@ -1087,7 +1087,7 @@ function DownloadProgressWidget({ progress, onClear }: { progress: DownloadProgr
 function App() {
   const [state,setState]=useState<AppState|null>(null); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
   const refreshGeneration = useRef(0);
-  const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [galleryHasMore,setGalleryHasMore]=useState(true); const [galleryFetchBusy,setGalleryFetchBusy]=useState(false); const galleryTargetRef=useRef(20); const bulkFileInputRef=useRef<HTMLInputElement>(null); const [bulkBusy,setBulkBusy]=useState(false); const [bulkMessage,setBulkMessage]=useState<string|null>(null); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
+  const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [galleryHasMore,setGalleryHasMore]=useState(true); const [galleryFetchBusy,setGalleryFetchBusy]=useState(false); const imageViewerId,setImageViewerId] = useState<number|null>(null); const bulkFileInputRef=useRef<HTMLInputElement>(null); const [bulkBusy,setBulkBusy]=useState(false); const [bulkMessage,setBulkMessage]=useState<string|null>(null); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
   const [settingsOpen,setSettingsOpen]=useState(false);
   const [coverEditorOpen,setCoverEditorOpen]=useState(false);
   const [thumbnailFit,setThumbnailFit]=useState<ThumbnailFit>(initialThumbnailFit);
@@ -1126,7 +1126,7 @@ function App() {
         void refresh();
         const currentId = selectedIdRef.current;
         if (currentId != null) {
-          void api.getImages(currentId, 200).then(result => {
+          void api.getImages(currentId, 1000).then(result => {
             setImages(result.images);
             setGalleryHasMore(result.has_more);
           }).catch(() => {});
@@ -1225,14 +1225,14 @@ function App() {
     };
   },[type,query,sort,activeTags]);
   useEffect(()=>{
-    if(!selected){setImages([]);setGalleryHasMore(false);setGalleryFetchBusy(false);return;}
+    if(!selected){setImages([]);setGalleryHasMore(false);setGalleryFetchBusy(false);setImageViewerId(null);}
     const modelId=selected.id;
     setGalleryHasMore(false);
     setGalleryFetchBusy(false);
-    galleryTargetRef.current=200;
+    setImageViewerId(null);
     const loadImages = async () => {
       try {
-        const result = await api.getImages(modelId,200);
+        const result = await api.getImages(modelId,1000);
         setImages(result.images);
         if (result.images.length < 200) setGalleryHasMore(false);
       } catch {
@@ -1243,7 +1243,7 @@ function App() {
     const primePagination = async () => {
       try {
         const remoteHasMore = await api.syncModelGallery(modelId,20);
-        const result = await api.getImages(modelId,200);
+        const result = await api.getImages(modelId,1000);
         setImages(result.images);
         setGalleryHasMore(remoteHasMore);
       } catch {
@@ -1276,7 +1276,28 @@ function App() {
       }));
     }
   };
-  const onFetchMore = async()=>{ if(!selected || galleryFetchBusy || !galleryHasMore) return; const modelId=selected.id; const target=images.length+10; galleryTargetRef.current=target; setGalleryFetchBusy(true); try { const more=await api.syncModelGallery(modelId,target); const next=await api.getImages(modelId,target); setImages(next.images); setGalleryHasMore(more); } catch { } finally { setGalleryFetchBusy(false); } };
+  const onFetchMore = async()=>{
+    if(!selected || galleryFetchBusy || !galleryHasMore) return;
+    setGalleryFetchBusy(true);
+    try {
+      const more=await api.loadMoreModelExamples(selected.id);
+      const next=await api.getImages(selected.id,1000);
+      setImages(next.images);
+      setGalleryHasMore(more);
+    } catch {
+      setGalleryHasMore(true);
+    } finally {
+      setGalleryFetchBusy(false);
+    }
+  };
+  const openImageViewer = (imageId: number) => setImageViewerId(imageId);
+  const navigateImageViewer = (direction: -1 | 1) => {
+    if (imageViewerId == null || !images.length) return;
+    const currentIndex = images.findIndex(image => image.id === imageViewerId);
+    if (currentIndex < 0) return;
+    const nextIndex = (currentIndex + direction + images.length) % images.length;
+    setImageViewerId(images[nextIndex].id);
+  };
   const handleBulkLinkFile = async(file: File)=>{
     setBulkBusy(true);
     setBulkMessage(null);
