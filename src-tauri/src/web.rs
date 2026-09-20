@@ -307,18 +307,18 @@ async fn command_handler(
         }
         "set_model_cover_position" => {
             let args: CoverPositionArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            set_model_cover_position(handle.state(), handle.clone(), args.id, args.x, args.y)
+            set_model_cover_position(handle.state(), args.id, args.x, args.y)
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "reset_model_cover" => {
             let args: IdArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            reset_model_cover(handle.state(), handle.clone(), args.id)
+            reset_model_cover(handle.state(), args.id)
                 .await
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "set_model_cover_from_image" => {
             let args: ImageArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            set_model_cover_from_image(handle.state(), handle.clone(), args.id, args.image_id)
+            set_model_cover_from_image(handle.state(), args.id, args.image_id)
                 .await
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
