@@ -227,20 +227,20 @@ async fn command_handler(
     let handle = &state.handle;
 
     let result: AppResult<Value> = match command.as_str() {
-        "get_app_state" => get_app_state(handle.state()).map(serde_json::to_value).unwrap_or_else(|e| Err(AppError::Invalid(e.to_string()))),
+        "get_app_state" => get_app_state(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "list_models" => {
             let args: ListModelsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            list_models(handle.state(), args.r#type, args.query, args.tags).map(serde_json::to_value).unwrap_or_else(|e| Err(AppError::Invalid(e.to_string())))
+            list_models(handle.state(), args.r#type, args.query, args.tags).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
-        "get_library_counts" => get_library_counts(handle.state()).map(serde_json::to_value).unwrap_or_else(|e| Err(AppError::Invalid(e.to_string()))),
-        "get_tags" => get_tags(handle.state()).map(serde_json::to_value).unwrap_or_else(|e| Err(AppError::Invalid(e.to_string()))),
+        "get_library_counts" => get_library_counts(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "get_tags" => get_tags(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "set_model_tags" => {
             let args: TagsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            set_model_tags(handle.state(), handle.clone(), args.id, args.tags).map(serde_json::to_value).unwrap_or_else(|e| Err(AppError::Invalid(e.to_string())))
+            set_model_tags(handle.state(), handle.clone(), args.id, args.tags).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "set_model_type" => {
             let args: TypeArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            set_model_type(handle.state(), handle.clone(), args.id, args.model_type).map(serde_json::to_value).unwrap_or_else(|e| Err(AppError::Invalid(e.to_string())))
+            set_model_type(handle.state(), handle.clone(), args.id, args.model_type).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "delete_model" => {
             let args: IdArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
@@ -248,7 +248,7 @@ async fn command_handler(
         }
         "get_model_images" => {
             let args: IdArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            get_model_images(handle.state(), args.id).map(serde_json::to_value).unwrap_or_else(|e| Err(AppError::Invalid(e.to_string())))
+            get_model_images(handle.state(), args.id).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "sync_model_gallery" => {
             let args: IdArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
@@ -286,7 +286,7 @@ async fn command_handler(
                 .await
                 .map(|value: ModelRecord| serde_json::to_value(value).unwrap_or(Value::Null))
         }
-        "get_storage_stats" => get_storage_stats(handle.state()).map(serde_json::to_value).unwrap_or_else(|e| Err(AppError::Invalid(e.to_string()))),
+        "get_storage_stats" => get_storage_stats(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "set_civitai_token" => {
             let args: TokenArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             set_civitai_token(args.token).map(|_| json!(null))
