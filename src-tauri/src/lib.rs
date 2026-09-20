@@ -2060,7 +2060,7 @@ fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResu
                     if first_error.is_none() { first_error = Some(msg.clone()); }
                     store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
                         current: index + 1, total, model_id: Some(*local_id), model_name: Some(name.clone()),
-                        version_current: 0, version_total: 5, images_saved: saved_total,
+                        version_current: 0, version_total: 0, images_saved: saved_total,
                         status: format!("Failed {name}"), done: false, error: Some(msg),
                     });
                 }
