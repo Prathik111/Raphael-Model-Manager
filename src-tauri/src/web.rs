@@ -17,8 +17,8 @@ use tokio::{net::TcpListener, sync::oneshot};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
 use crate::{
-    delete_model, get_app_state, get_library_counts, get_model_images, get_storage_stats, get_tags,
-    install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
+    add_subfolder_tags, delete_model, get_app_state, get_library_counts, get_model_images, get_storage_stats,
+    get_tags, install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
     refresh_model_civitai, set_civitai_token, set_model_tags, set_model_type, sync_model_gallery,
     is_civitai_token_set, AppError, AppResult, CivitaiImportPreview, ModelRecord,
 };
@@ -234,6 +234,7 @@ async fn command_handler(
         }
         "get_library_counts" => get_library_counts(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "get_tags" => get_tags(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "add_subfolder_tags" => add_subfolder_tags(handle.state(), handle.clone()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "set_model_tags" => {
             let args: TagsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             set_model_tags(handle.state(), handle.clone(), args.id, args.tags).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
