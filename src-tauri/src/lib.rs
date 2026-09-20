@@ -676,6 +676,26 @@ fn featured_extension(url: &str) -> String {
         .unwrap_or_else(|| "jpg".into())
 }
 
+fn featured_image_key(image: &Value, version_id: i64, index: usize) -> Option<i64> {
+    let url = image.get("url").and_then(Value::as_str)?.trim();
+    if url.is_empty() {
+        return None;
+    }
+
+    // modelVersions[].images does not reliably expose an image ID.
+    // Use a deterministic negative key derived from the actual image URL
+    // and version instead of requiring an optional/absent JSON field.
+    let mut hasher = Sha256::new();
+    hasher.update(version_id.to_le_bytes());
+    hasher.update((index as u64).to_le_bytes());
+    hasher.update(url.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let positive = (u64::from_le_bytes(bytes) % (i64::MAX as u64)) + 1;
+    Some(-(positive as i64))
+}
+
 async fn sync_featured_examples_inner(
     app: AppStateInner,
     model_id: i64,
@@ -724,22 +744,22 @@ async fn sync_featured_examples_inner(
         emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index,version_total:total_versions,images_saved:saved_count,status:format!("Fetching featured images from {version_name}"),done:false,error:None});
 
         let images=version.get("images").and_then(Value::as_array).cloned().unwrap_or_default();
-        for image in images{
-            let image_id=match image.get("id").and_then(|value| {
-                value.as_i64().or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
-            }) {
+        for (image_index, image) in images.into_iter().enumerate(){
+            let remote=match image.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty()).map(str::to_string) {
                 Some(v)=>v,
                 None=>continue
             };
-            let remote=match featured_remote_url(&image){Some(v)=>v,None=>continue};
+            let image_id=match featured_image_key(&image, version_id, image_index) {
+                Some(v)=>v,
+                None=>continue
+            };
             let ext=featured_extension(&remote);
             let version_dir=staging.join(version_id.to_string());
             fs::create_dir_all(&version_dir)?;
             let local=version_dir.join(format!("{image_id}.{ext}"));
             let thumb=version_dir.join(format!("{image_id}_thumb.webp"));
             if !local.exists(){
-                let mut request=client.get(&remote);
-                if let Some(t)=token(){request=request.bearer_auth(t);}
+                let request=client.get(&remote).timeout(Duration::from_secs(60));
                 let response=match request.send().await {
                     Ok(value)=>value,
                     Err(error)=>{
@@ -829,7 +849,13 @@ async fn sync_featured_examples_inner(
 
     if records.is_empty(){
         let _=fs::remove_dir_all(&staging);
-        return Err(AppError::Api(format!("Civitai returned no featured images across {} published model versions", total_versions)));
+        emit_examples_progress(&handle,ExamplesRefreshProgress{
+            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+            version_current:total_versions,version_total:total_versions,images_saved:0,
+            status:format!("No featured images found across {total_versions} published model versions"),
+            done:false,error:None
+        });
+        return Ok(0);
     }
 
     let c = open_db(&app.app_data)?;
@@ -2572,6 +2598,19 @@ mod tests {
         });
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].get("id").and_then(Value::as_i64), Some(1));
+    }
+
+    #[test]
+    fn featured_image_key_works_without_civitai_image_id() {
+        let image = json!({
+            "url": "https://imagecache.civitai.com/example/width=450",
+            "width": 832,
+            "height": 832
+        });
+        let key = featured_image_key(&image, 8840, 0).unwrap();
+        assert!(key < 0);
+        assert_eq!(featured_image_key(&image, 8840, 0), Some(key));
+        assert_ne!(featured_image_key(&image, 8840, 1), Some(key));
     }
 
     #[test]
