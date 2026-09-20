@@ -65,11 +65,25 @@ function defaultImportDirectory(root: string | null, type: ModelType): string {
   return cleanRoot + '\\' + folderForModelType(type);
 }
 
+type ThumbnailFit = 'cover' | 'contain' | 'fill';
+const THUMBNAIL_FIT_KEY = 'raphael.thumbnailFit';
+
+function initialThumbnailFit(): ThumbnailFit {
+  if (typeof window === 'undefined') return 'cover';
+  const saved = window.localStorage.getItem(THUMBNAIL_FIT_KEY);
+  return saved === 'contain' || saved === 'fill' || saved === 'cover' ? saved : 'cover';
+}
+
 function fmtBytes(n: number) { if (n < 1024) return `${n} B`; const u=['KB','MB','GB','TB']; let i=-1,v=n; do { v/=1024; i++; } while(v>=1024 && i<u.length-1); return `${v.toFixed(v>=100?0:v>=10?1:2)} ${u[i]}`; }
 function initials(s: string) { return s.split(/\s+/).filter(Boolean).slice(0,2).map(x=>x[0]).join('').toUpperCase(); }
 
 function PulseMark() {
-  return <div className="pulse-mark" aria-label="Raphael"><span className="pulse-core"/><i/><i/><i/></div>;
+  return <div className="raphael-core" aria-label="Raphael">
+    <span className="core-dot"/>
+    <i className="core-orbit orbit-a"/>
+    <i className="core-orbit orbit-b"/>
+    <i className="core-orbit orbit-c"/>
+  </div>;
 }
 
 function Setup({ onReady }: { onReady: (state: AppState)=>void }) {
@@ -87,6 +101,102 @@ function Setup({ onReady }: { onReady: (state: AppState)=>void }) {
         : 'The manager watches this folder and everything beneath it. Your model files stay where they are.'}</p>
       {!webMode ? <><button className="primary-btn" onClick={choose} disabled={busy}>{busy ? 'OPENING…' : 'BROWSE MODELS FOLDER'}</button><div className="tiny">Example: C:\ComfyUI\models</div></> : <div className="tiny">Return to the Raphael desktop window and choose the host models folder.</div>}
     </div>
+  </div>;
+}
+
+function SettingsOverlay({
+  thumbnailFit,
+  onThumbnailFitChange,
+  onClose,
+}: {
+  thumbnailFit: ThumbnailFit;
+  onThumbnailFitChange: (fit: ThumbnailFit) => void;
+  onClose: () => void;
+}) {
+  const [folderBusy, setFolderBusy] = useState(false);
+  const [tagBusy, setTagBusy] = useState(false);
+  const [tagResult, setTagResult] = useState<string | null>(null);
+  const [tagError, setTagError] = useState<string | null>(null);
+
+  const changeFolder = async () => {
+    if (api.isWebApp || folderBusy) return;
+    setFolderBusy(true);
+    try {
+      const path = await api.chooseModelsFolder();
+      if (path) {
+        await api.setModelsRoot(path);
+        window.location.reload();
+      }
+    } catch (error) {
+      setTagError(String(error));
+    } finally {
+      setFolderBusy(false);
+    }
+  };
+
+  const addSubfolderTags = async () => {
+    if (tagBusy) return;
+    setTagBusy(true);
+    setTagResult(null);
+    setTagError(null);
+    try {
+      const count = await api.addSubfolderTags();
+      setTagResult(count === 1 ? 'ADDED SUBFOLDER TAGS TO 1 MODEL' : `ADDED SUBFOLDER TAGS TO ${count} MODELS`);
+    } catch (error) {
+      setTagError(String(error));
+    } finally {
+      setTagBusy(false);
+    }
+  };
+
+  return <div className="settings-backdrop" onClick={onClose}>
+    <section className="settings-panel hud-panel" onClick={e => e.stopPropagation()}>
+      <header className="settings-header">
+        <div>
+          <div className="eyebrow">RAPHAEL CORE</div>
+          <h2>SETTINGS</h2>
+        </div>
+        <button className="settings-close" aria-label="Close settings" onClick={onClose}>×</button>
+      </header>
+
+      <div className="settings-scroll">
+        <section className="settings-section">
+          <div className="section-head">LIBRARY LOCATION</div>
+          <div className="settings-path" title={window.location.href}>
+            {api.isWebApp ? 'HOST FOLDER IS CONTROLLED BY THE DESKTOP APP' : 'CHANGE THE COMFYUI MODELS ROOT FOLDER'}
+          </div>
+          <button className="primary-btn" onClick={changeFolder} disabled={api.isWebApp || folderBusy}>
+            {api.isWebApp ? 'DESKTOP ONLY' : folderBusy ? 'OPENING…' : 'CHANGE FOLDER'}
+          </button>
+        </section>
+
+        <section className="settings-section">
+          <div className="section-head">THUMBNAIL SCALING</div>
+          <p className="settings-copy">Controls how model thumbnails are scaled inside the fixed Raphael card and import placeholder.</p>
+          <div className="settings-options">
+            <button className={thumbnailFit === 'cover' ? 'active' : ''} onClick={() => onThumbnailFitChange('cover')}>
+              <b>COVER</b><span>Fill the frame and crop overflow.</span>
+            </button>
+            <button className={thumbnailFit === 'contain' ? 'active' : ''} onClick={() => onThumbnailFitChange('contain')}>
+              <b>FIT</b><span>Show the whole image with letterboxing.</span>
+            </button>
+            <button className={thumbnailFit === 'fill' ? 'active' : ''} onClick={() => onThumbnailFitChange('fill')}>
+              <b>STRETCH</b><span>Resize completely to the placeholder.</span>
+            </button>
+          </div>
+        </section>
+
+        <section className="settings-section">
+          <div className="section-head">FOLDER → TAGS</div>
+          <p className="settings-copy">Adds every model subfolder below its ComfyUI type folder as a tag without removing existing tags.</p>
+          <div className="folder-tag-example"><span>checkpoints/Illustrus/model.safetensors</span><b>→</b><em>Illustrus</em></div>
+          <div className="folder-tag-example"><span>loras/Illustrus/Character/model.safetensors</span><b>→</b><em>Illustrus · Character</em></div>
+          <button className="primary-btn" onClick={addSubfolderTags} disabled={tagBusy}>{tagBusy ? 'SCANNING…' : 'ADD SUBFOLDERS AS TAGS'}</button>
+          {tagResult ? <div className="settings-success">{tagResult}</div> : null}
+          {tagError ? <div className="error-box settings-error">{tagError}</div> : null}
+        </section>
+      </div>
+    </section>
   </div>;
 }
 
@@ -230,6 +340,8 @@ function App() {
   const [state,setState]=useState<AppState|null>(null); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
   const refreshGeneration = useRef(0);
   const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
+  const [settingsOpen,setSettingsOpen]=useState(false); const [thumbnailFit,setThumbnailFit]=useState<ThumbnailFit>(initialThumbnailFit);
+  useEffect(()=>{window.localStorage.setItem(THUMBNAIL_FIT_KEY,thumbnailFit);},[thumbnailFit]);
   const selected = models.find(m=>m.id===selectedId) || null;
   async function refresh(){
     const generation=++refreshGeneration.current;
@@ -285,13 +397,18 @@ function App() {
   if(!state.models_root) return <><Background/><Setup onReady={s=>{setState(s); refresh();}}/></>;
   const doImport = async()=>{ if(!importUrl.trim()) return; setBusy(true); setImportError(null); try { const result=await api.importCivitai(importUrl.trim()); const nextType=civitaiTypeToModelType(result.model.type); setImportType(nextType); setCustomDownloadPath(false); setPreview(result); setDownloadPath(defaultImportDirectory(state.models_root,nextType) || result.target_directory); } catch (e) { setImportError(String(e)); } finally {setBusy(false);} };
   const install = async()=>{ if(!importUrl.trim()) return; setBusy(true); setImportError(null); try { const m=await api.installCivitai(importUrl.trim(),customDownloadPath ? downloadPath : undefined,importType); setPreview(null); setImportUrl(''); setDownloadPath(''); setCustomDownloadPath(false); await refresh(); setSelectedId(m.id); } catch (e) { setImportError(String(e)); } finally { setBusy(false);} };
-  return <div className="app-shell"><Background/><div className="noise"/>
+  return <div className={`app-shell thumb-fit-${thumbnailFit}`}><Background/><div className="noise"/>
     <header className="topbar"><div className="brand"><PulseMark/><span>RAPHAEL MODEL MANAGER</span></div><div className="top-stats"><span>CACHED <b>{fmtBytes(state.storage.cached_bytes)}</b></span><span>TOTAL <b>{fmtBytes(state.storage.total_model_bytes)}</b></span></div><div className="top-actions"><button className={`web-app-btn ${webStatus.enabled ? 'active' : ''}`} disabled={api.isWebApp || webBusy} title={api.isWebApp ? 'LAN web app is controlled from the host desktop' : 'Expose Raphael to other devices on your private LAN'} onClick={toggleWebApp}>{webBusy ? 'STARTING…' : api.isWebApp ? 'WEB APP · CONNECTED' : webStatus.enabled ? 'WEB APP · ON' : 'ENABLE WEB APP'}</button>{webStatus.enabled && webStatus.url ? <a className="web-app-url" href={webStatus.url} target="_blank" rel="noreferrer">{webStatus.url}</a> : null}{webError ? <span className="web-app-error" title={webError}>WEB ERROR</span> : null}<div className="root-path" title={state.models_root}>{state.models_root}</div></div></header>
     <div className="workspace">
-      <aside className="sidebar hud-panel"><div className="side-title">LIBRARY</div><nav>{TYPES.map(t=><button key={t.key} className={type===t.key?'active':''} onClick={()=>setType(t.key)}><span>{t.label}</span><b>{t.key==='All' ? counts.all : (counts.by_type[t.key] ?? 0)}</b></button>)}</nav><div className="sidebar-foot"><button className="text-btn" disabled={api.isWebApp} title={api.isWebApp ? 'Change the host folder from the Raphael desktop app' : undefined} onClick={async()=>{const p=await api.chooseModelsFolder(); if(p) await api.setModelsRoot(p);}}>CHANGE FOLDER</button></div></aside>
+      <aside className="sidebar hud-panel"><div className="side-title">LIBRARY</div><nav>{TYPES.map(t=><button key={t.key} className={type===t.key?'active':''} onClick={()=>setType(t.key)}><span>{t.label}</span><b>{t.key==='All' ? counts.all : (counts.by_type[t.key] ?? 0)}</b></button>)}</nav><div className="sidebar-foot">
+        <button className="settings-trigger" aria-label="Open settings" title="SETTINGS" onClick={()=>setSettingsOpen(true)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Zm0-5.2 1 .3.7 2.1c.4.1.8.3 1.2.5l2-.9.9.7-.2 2.2c.3.3.6.6.9.9l2.2-.2.7.9-.9 2c.2.4.4.8.5 1.2l2.1.7.3 1-.3 1-2.1.7a7.4 7.4 0 0 1-.5 1.2l.9 2-.7.9-2.2-.2c-.3.3-.6.6-.9.9l.2 2.2-.9.7-2-.9c-.4.2-.8.4-1.2.5l-.7 2.1-1 .3-1-.3-.7-2.1a7.4 7.4 0 0 1-1.2-.5l-2 .9-.9-.7.2-2.2a7.2 7.2 0 0 1-.9-.9l-2.2.2-.7-.9.9-2c-.2-.4-.4-.8-.5-1.2l-2.1-.7-.3-1 .3-1 2.1-.7c.1-.4.3-.8.5-1.2l-.9-2 .7-.9 2.2.2c.3-.3.6-.6.9-.9l-.2-2.2.9-.7 2 .9c.4-.2.8-.4 1.2-.5l.7-2.1 1-.3Z"/></svg>
+        </button>
+      </div></aside>
       <main className="library"><div className="library-head"><div><div className="eyebrow">{type.toUpperCase()}</div><h1>{type==='All'?'MODEL LIBRARY':type.toUpperCase()}</h1></div><div className="library-tools"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search models, tags, tag:…"/><button className={`tag-filter-button ${activeTags.length?'active':''}`} onClick={()=>setTagPanelOpen(v=>!v)}>TAGS{activeTags.length ? ` · ${activeTags.length}` : ''}</button><button className="import-btn" onClick={()=>{setImportError(null);setImportUrl('');setImportType('Other');setCustomDownloadPath(false);setDownloadPath('');setPreview({model:{},version:{id:0,name:'',base_model:null,download_url:'',filename:null,size_bytes:null,activation_prompts:[]},target_directory:'',thumbnail_path:null});}}>IMPORT CIVITAI</button><select value={sort} onChange={e=>setSort(e.target.value)}><option value="name">NAME</option><option value="size">SIZE</option><option value="path">PATH</option></select></div>{tagPanelOpen && <TagFilterPanel tags={allTags} activeTags={activeTags} onToggle={tag=>setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current.filter(x=>x.toLowerCase()!==tag.toLowerCase()):[...current,tag])} onClear={()=>setActiveTags([])}/>}</div>{activeTags.length ? <div className="active-tag-bar">{activeTags.map(tag=><button key={tag} onClick={()=>setActiveTags(current=>current.filter(x=>x.toLowerCase()!==tag.toLowerCase()))}>{tag}<span>×</span></button>)}<span className="active-tag-help">TAG FILTERS</span></div> : null}<div className="grid">{models.map(m=><ModelCard key={m.id} model={m} selected={m.id===selectedId} onClick={()=>setSelectedId(m.id)}/>)}{!models.length&&<div className="empty-state">No models match the current view.</div>}</div></main>
       {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} onRefresh={async()=>{await api.refreshModel(selected.id); await refresh();}} onLinkCivitai={async(url)=>{await api.linkModelCivitai(selected.id,url); await refresh();}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}}/>}
     </div>
+    {settingsOpen && <SettingsOverlay thumbnailFit={thumbnailFit} onThumbnailFitChange={setThumbnailFit} onClose={()=>setSettingsOpen(false)}/>}
     {(preview || importUrl) && <div className="modal-backdrop" onClick={()=>{if(!busy){setPreview(null); setImportUrl(''); setDownloadPath(''); setCustomDownloadPath(false); setImportError(null);}}}><div className="import-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">CIVITAI IMPORT</div><h2>INSTALL A MODEL</h2>{!preview || preview.version.id===0 ? <>{importError ? <div className="error-box modal-error">{importError}</div> : null}<div className="import-row"><input value={importUrl} onChange={e=>setImportUrl(e.target.value)} onKeyDown={e=>e.key==='Enter'&&doImport()} placeholder="civitai.com/models/... or civitai.red/models/..." autoFocus/><button className="primary-btn" onClick={doImport} disabled={busy}>{busy?'ANALYZING…':'ANALYZE'}</button></div></> : <><div className="import-preview-grid"><div className="preview-image">{preview.thumbnail_path ? <><TypePlaceholder type={importType}/><img src={fileUrl(preview.thumbnail_path)} alt="" onError={(e)=>{e.currentTarget.style.display="none";}}/></> : <TypePlaceholder type={importType}/>}</div><div className="preview-panel"><div className="preview-topline"><span className="type-chip">{importType}</span><span className="source-domain">CIVITAI</span></div><h3>{preview.model.name || preview.version.filename || 'Model'}</h3><div className="preview-meta">{preview.version.base_model || 'Base model unavailable'} · {preview.version.filename || 'Filename automatic'}</div><div className="kv"><span>MODEL FILE</span><b>{preview.version.filename || 'Automatic filename'}</b></div><div className="kv"><span>SIZE</span><b>{preview.version.size_bytes ? fmtBytes(preview.version.size_bytes) : 'Unknown'}</b></div><div className="section-head">LIBRARY TAG</div><div className="import-type-row"><label htmlFor="import-type">CLASSIFY AS</label><select id="import-type" className="import-type-select" value={importType} onChange={e=>{const next=e.target.value as ModelType; setImportType(next); if(!customDownloadPath) setDownloadPath(defaultImportDirectory(state.models_root,next));}} disabled={busy}>{IMPORT_TYPES.map(x=><option key={x} value={x}>{x}</option>)}</select></div><div className="import-type-note">Civitai suggests <b>{preview.model.type || 'Unknown'}</b>; Raphael uses the tag you choose for its library category and default folder.</div><div className="section-head">DOWNLOAD LOCATION</div><div className="destination-box"><div className="destination-path" title={downloadPath}>{downloadPath || defaultImportDirectory(state.models_root,importType) || preview.target_directory}</div><button className="primary-btn small" onClick={async()=>{const next=await api.chooseDirectory(downloadPath || defaultImportDirectory(state.models_root,importType) || preview.target_directory); if(next){setDownloadPath(next);setCustomDownloadPath(true);setImportError(null);}}} disabled={busy || api.isWebApp}>{api.isWebApp ? 'DESKTOP ONLY' : 'BROWSE'}</button></div><div className="destination-note">Choose a folder inside your configured ComfyUI models directory. Changing the tag updates the default folder until you manually browse.</div><div className="section-head">ACTIVATION PROMPTS</div><div className="chips">{preview.version.activation_prompts.map(x=><span key={x}>{x}</span>)}</div></div></div><div className="modal-actions"><button className="text-btn" onClick={()=>{setPreview(null);setImportError(null);}}>BACK</button><button className="primary-btn" onClick={install} disabled={busy}>{busy?'DOWNLOADING…':'DOWNLOAD & INSTALL'}</button></div>{importError ? <div className="error-box modal-error">{importError}</div> : null}</>}</div></div>}
   </div>;
 }
