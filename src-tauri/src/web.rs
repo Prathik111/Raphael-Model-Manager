@@ -316,7 +316,7 @@ async fn command_handler(
         "refresh_all_examples" => {
             refresh_all_examples(handle.state(), handle.clone())
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
-        }
+        },
         "get_examples_refresh_status" => {
             serde_json::to_value(get_examples_refresh_status(handle.state()))
                 .map_err(|e| AppError::Invalid(e.to_string()))
