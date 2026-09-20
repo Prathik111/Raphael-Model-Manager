@@ -1994,9 +1994,7 @@ fn copy_custom_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
         return Err(AppError::Invalid("Selected cover image is not a file".into()));
     }
 
-    // Validate the image header/format without fully decoding the image. The
-    // actual cover file is then hard-linked when possible, which avoids a
-    // potentially expensive full-file copy.
+    // Validate the image header/format without fully decoding the image.
     let reader = ImageReader::open(source)
         .map_err(|e| AppError::Invalid(format!("Could not read the custom cover image: {e}")))?
         .with_guessed_format()
@@ -2012,7 +2010,11 @@ fn copy_custom_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
     fs::create_dir_all(&dir)?;
     let sequence = DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
     let target = dir.join(format!("model_{id}_{sequence}.{ext}"));
-    copy_or_hard_link(source, &target)?;
+
+    // Keep custom covers independent from the user's source file. A hard link
+    // would make later edits/replacements of that external file change the
+    // cover unexpectedly.
+    fs::copy(source, &target)?;
     Ok(target)
 }
 
@@ -2026,16 +2028,19 @@ fn copy_cached_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
     if !canonical_source.starts_with(&cache_root_path) || !canonical_source.is_file() {
         return Err(AppError::Invalid("That example image is outside Raphael's Civitai cache".into()));
     }
-    let format = detect_image_format_from_bytes(&fs::read(&canonical_source)?)?;
+    let format = ImageReader::open(&canonical_source)
+        .map_err(|e| AppError::Invalid(format!("Could not inspect the example image: {e}")))?
+        .with_guessed_format()
+        .map_err(|e| AppError::Invalid(format!("Could not inspect the example image: {e}")))?
+        .format()
+        .ok_or_else(|| AppError::Invalid("Could not determine the cached example image format".into()))?;
     let ext = image_format_extension(format)
         .ok_or_else(|| AppError::Invalid("The cached example image has an unsupported format".into()))?;
-    decode_image_file(&canonical_source)
-        .map_err(|e| AppError::Invalid(format!("Could not read the example image: {e}")))?;
     let dir = cache_root(&app.app_data).join("covers");
     fs::create_dir_all(&dir)?;
     let sequence = DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
     let target = dir.join(format!("model_{id}_{sequence}.{ext}"));
-    fs::copy(&canonical_source, &target)?;
+    copy_or_hard_link(&canonical_source, &target)?;
     Ok(target)
 }
 
@@ -2062,7 +2067,6 @@ async fn set_model_custom_cover(
     id: i64,
     source_path: String,
 ) -> AppResult<ModelRecord> {
-    let _guard=app.cache_lock.lock().await;
     let old_cover: Option<String> = {
         let c = open_db(&app.app_data)?;
         c.query_row("SELECT cover_path FROM models WHERE id=?1", [id], |r| r.get(0))?
@@ -2090,7 +2094,6 @@ async fn reset_model_cover(
     app: State<'_, AppStateInner>,
     id: i64,
 ) -> AppResult<ModelRecord> {
-    let _guard=app.cache_lock.lock().await;
     let old_cover = {
         let c = open_db(&app.app_data)?;
         c.query_row("SELECT cover_path FROM models WHERE id=?1", [id], |r| r.get::<_, Option<String>>(0))?
@@ -2118,7 +2121,6 @@ async fn set_model_cover_from_image(
     id: i64,
     image_id: i64,
 ) -> AppResult<ModelRecord> {
-    let _guard=app.cache_lock.lock().await;
     let (old_cover, old_cover_source_id, source) = {
         let c = open_db(&app.app_data)?;
         c.query_row(
@@ -2942,11 +2944,20 @@ async fn sync_gallery_inner(
         }
     }
 
-    if let Ok(c) = open_db(&app.app_data) {
-        let bytes = dir_size(&cache_root(&app.app_data));
-        let _ = put_setting(&c, "cache_bytes", &bytes.to_string());
+    // Unlimited caches do not need a full filesystem scan after every
+    // gallery request. Perform accounting/pruning only when a cache limit
+    // is actually configured.
+    let cache_limit = open_db(&app.app_data)
+        .ok()
+        .and_then(|c| read_cache_max_bytes(&c).ok())
+        .unwrap_or(0);
+    if cache_limit > 0 {
+        if let Ok(c) = open_db(&app.app_data) {
+            let bytes = dir_size(&cache_root(&app.app_data));
+            let _ = put_setting(&c, "cache_bytes", &bytes.to_string());
+        }
+        let _ = enforce_cache_limit_inner(&app.app_data);
     }
-    let _ = enforce_cache_limit_inner(&app.app_data);
     let _ = handle.emit("models-changed", ());
     Ok(has_more)
 }
