@@ -247,7 +247,7 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
         let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let mtype = file_type_from_path(&path, root);
         let hash: Option<String> = None;
-        if let Some((id,_,_,_,type_locked)) = old {
+        if let Some((id,_,_,_,_type_locked)) = old {
             c.execute("UPDATE models SET relative_path=?2,filename=?3,model_type=CASE WHEN model_type_user_modified=1 THEN model_type ELSE ?4 END,size_bytes=?5,modified_at=?6,source_hash=?7,updated_at=?8 WHERE id=?1", params![id,rel,filename,mtype,size,modified,hash,now()])?;
         } else {
             c.execute("INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,source_hash,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![path_s,rel,filename,mtype,size,modified,hash,now()])?;
@@ -821,6 +821,7 @@ async fn install_civitai_model(
                 description=excluded.description,
                 activation_json=excluded.activation_json,
                 source_hash=excluded.source_hash,
+                model_type=CASE WHEN models.model_type_user_modified=0 THEN excluded.model_type ELSE models.model_type END,
                 tags_json=CASE WHEN models.tags_user_modified=0 THEN excluded.tags_json ELSE models.tags_json END,
                 thumbnail_path=excluded.thumbnail_path,
                 updated_at=excluded.updated_at",
