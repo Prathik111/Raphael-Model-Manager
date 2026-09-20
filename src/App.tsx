@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, fileUrl, subscribeToExamplesRefresh, subscribeToModelChanges } from './tauri';
-import type { AppState, CivitaiImportPreview, DownloadProgress, ExamplesRefreshProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
+import type { AppState, CacheOperationResult, CacheStats, CivitaiImportPreview, DownloadProgress, ExamplesRefreshProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
 
 const TYPES: Array<{ key: ModelType | 'All'; label: string }> = [
   { key: 'All', label: 'ALL' }, { key: 'Checkpoint', label: 'CHECKPOINTS' }, { key: 'LoRA', label: 'LORAS' },
@@ -75,6 +75,7 @@ function initialThumbnailFit(): ThumbnailFit {
 }
 
 function fmtBytes(n: number) { if (n < 1024) return `${n} B`; const u=['KB','MB','GB','TB']; let i=-1,v=n; do { v/=1024; i++; } while(v>=1024 && i<u.length-1); return `${v.toFixed(v>=100?0:v>=10?1:2)} ${u[i]}`; }
+function fmtCount(n: number) { return new Intl.NumberFormat().format(Math.max(0, n)); }
 function fmtDateTime(seconds: number) { if (!seconds) return '—'; return new Date(seconds * 1000).toLocaleString(); }
 function initials(s: string) { return s.split(/\s+/).filter(Boolean).slice(0,2).map(x=>x[0]).join('').toUpperCase(); }
 
@@ -132,6 +133,147 @@ function SettingsOverlay({
   const [parallelDownloads, setParallelDownloads] = useState(3);
   const [parallelBusy, setParallelBusy] = useState(false);
   const [parallelMessage, setParallelMessage] = useState<string | null>(null);
+  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
+  const [cacheMaxGb, setCacheMaxGb] = useState('0');
+  const [cacheKeepPerModel, setCacheKeepPerModel] = useState('20');
+  const [cacheBusy, setCacheBusy] = useState(false);
+  const [cacheMessage, setCacheMessage] = useState<string | null>(null);
+  const [exampleLoadAmount, setExampleLoadAmount] = useState(20);
+  const [exampleLoadBusy, setExampleLoadBusy] = useState(false);
+  const [exampleLoadMessage, setExampleLoadMessage] = useState<string | null>(null);
+
+
+  const showCacheResult = (result: CacheOperationResult, label: string) => {
+    setCacheMessage(`${label} · FREED ${fmtBytes(result.freed_bytes)} · ${fmtCount(result.deleted_files)} FILES REMOVED`);
+  };
+
+  const applyCacheLimit = async () => {
+    if (cacheBusy) return;
+    const gb = Number(cacheMaxGb);
+    if (!Number.isFinite(gb) || gb < 0) {
+      setSettingsError('Cache limit must be a number greater than or equal to 0.');
+      return;
+    }
+    setCacheBusy(true);
+    setSettingsError(null);
+    setCacheMessage(null);
+    try {
+      const next = await api.setCacheMaxBytes(Math.round(gb * 1024 ** 3));
+      setCacheStats(next);
+      setCacheMessage(next.max_bytes === 0 ? 'CACHE LIMIT · UNLIMITED' : `CACHE LIMIT · ${fmtBytes(next.max_bytes)}`);
+      if (next.over_limit) {
+        setCacheMessage(`CACHE LIMIT SAVED · CURRENT CACHE IS STILL ${fmtBytes(next.used_bytes - next.max_bytes)} OVER LIMIT`);
+      }
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const changeCacheLocation = async () => {
+    if (api.isWebApp || cacheBusy) return;
+    try {
+      const path = await api.chooseCacheDirectory(cacheStats?.location);
+      if (!path) return;
+      const message = cacheStats?.used_bytes
+        ? `Move ${fmtBytes(cacheStats.used_bytes)} of Raphael cache to:\n\n${path}\n\nThe destination must be empty. Raphael verifies the copy before switching and only then removes the old cache. Continue?`
+        : `Set Raphael cache location to:\n\n${path}\n\nThe destination must be empty. Continue?`;
+      if (!window.confirm(message)) return;
+      setCacheBusy(true);
+      setSettingsError(null);
+      setCacheMessage('MOVING CACHE…');
+      await api.setCacheLocation(path);
+      window.location.reload();
+    } catch (error) {
+      setSettingsError(String(error));
+      setCacheMessage(null);
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const clearImageCache = async () => {
+    if (cacheBusy || !window.confirm('Delete all cached Civitai/gallery/featured images and their thumbnails? Stable model cover files will be preserved.')) return;
+    setCacheBusy(true);
+    setSettingsError(null);
+    try {
+      await api.clearCacheImages();
+      setCacheMessage('IMAGE CACHE CLEARED');
+      window.location.reload();
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const clearCompleteCache = async () => {
+    if (cacheBusy || !window.confirm('Delete the COMPLETE Raphael cache, including images, thumbnails, model covers, and cached metadata? Your actual model files will NOT be touched.')) return;
+    setCacheBusy(true);
+    setSettingsError(null);
+    try {
+      await api.clearCompleteCache();
+      setCacheMessage('COMPLETE CACHE CLEARED');
+      window.location.reload();
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const pruneCacheImages = async () => {
+    if (cacheBusy) return;
+    const keep = Number(cacheKeepPerModel);
+    if (!Number.isInteger(keep) || keep < 0) {
+      setSettingsError('Images kept per model must be a whole number greater than or equal to 0.');
+      return;
+    }
+    if (!window.confirm(`Keep the newest ${keep} cached images for each model and delete the rest? Selected model cover images are always preserved.`)) return;
+    setCacheBusy(true);
+    setSettingsError(null);
+    try {
+      await api.pruneCacheImages(keep);
+      setCacheMessage(`RETAINED ${keep} IMAGES / MODEL`);
+      window.location.reload();
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const saveExampleLoadAmount = async (value: number) => {
+    const next = Math.max(1, Math.min(100, Math.round(value)));
+    setExampleLoadBusy(true);
+    setSettingsError(null);
+    setExampleLoadMessage(null);
+    try {
+      const saved = await api.setExampleLoadAmount(next);
+      setExampleLoadAmount(saved);
+      setExampleLoadMessage(`LOAD MORE · ${saved} IMAGES / CLICK`);
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setExampleLoadBusy(false);
+    }
+  };
+
+  const cleanCacheOrphans = async () => {
+    if (cacheBusy) return;
+    setCacheBusy(true);
+    setSettingsError(null);
+    try {
+      const result = await api.cleanCacheOrphans();
+      showCacheResult(result, 'ORPHANED CACHE CLEANED');
+      await refreshCacheStats();
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setCacheBusy(false);
+    }
+  };
 
   const dismiss = () => {
     if (closing) return;
@@ -139,9 +281,21 @@ function SettingsOverlay({
     window.setTimeout(onClose, 180);
   };
 
+  const refreshCacheStats = async () => {
+    const next = await api.getCacheStats();
+    setCacheStats(next);
+    setCacheMaxGb(next.max_bytes > 0 ? (next.max_bytes / (1024 ** 3)).toFixed(1).replace(/\.0$/, '') : '0');
+  };
+
   useEffect(() => {
     api.getCivitaiTokenSet().then(setTokenSet).catch(() => setTokenSet(false));
     api.getParallelDownloads().then(value => setParallelDownloads(Math.max(1, Math.min(8, value)))).catch(() => setParallelDownloads(3));
+    api.getExampleLoadAmount().then(value => setExampleLoadAmount(Math.max(1, Math.min(100, value)))).catch(() => setExampleLoadAmount(20));
+    void refreshCacheStats().catch(error => setSettingsError(String(error)));
+    const timer = window.setInterval(() => {
+      void refreshCacheStats().catch(error => setSettingsError(String(error)));
+    }, 5000);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -308,6 +462,88 @@ function SettingsOverlay({
               {progress.error ? <div className="examples-refresh-error">{progress.error}</div> : null}
             </div>;
           })() : null}
+
+          <div className="cache-control example-load-control">
+            <div>
+              <span className="cache-label">COMMUNITY GALLERY LOAD AMOUNT</span>
+              <p className="settings-copy">Controls how many additional community-generated Civitai images Raphael retrieves each time you press LOAD MORE EXAMPLES.</p>
+            </div>
+            <div className="cache-input-row">
+              <input className="cache-number-input" type="number" min="1" max="100" step="1" value={exampleLoadAmount} onChange={e => setExampleLoadAmount(Math.max(1, Math.min(100, Number(e.target.value) || 1)))} disabled={exampleLoadBusy} aria-label="Community gallery images loaded per click" />
+              <span className="cache-unit">IMAGES</span>
+              <button className="primary-btn small" onClick={() => void saveExampleLoadAmount(exampleLoadAmount)} disabled={exampleLoadBusy}>{exampleLoadBusy ? 'SAVING…' : 'SAVE'}</button>
+            </div>
+          </div>
+          {exampleLoadMessage ? <div className="settings-success">{exampleLoadMessage}</div> : null}
+        </section>
+
+        <section className="settings-section">
+          <div className="section-head">CACHE MANAGEMENT</div>
+          <p className="settings-copy">Live filesystem accounting for the configured Raphael cache. Limits cover Civitai images, featured examples, thumbnails, stable covers, and temporary cache files.</p>
+
+          <div className="cache-panel">
+            {cacheStats ? <>
+              <div className="cache-summary">
+                <div className="cache-summary-main">
+                  <span className="cache-label">CACHE LOCATION</span>
+                  <b title={cacheStats.location}>{cacheStats.location}</b>
+                </div>
+                <div className="cache-usage">
+                  <span>{fmtBytes(cacheStats.used_bytes)}</span>
+                  <small>{cacheStats.max_bytes > 0 ? 'OF ' + fmtBytes(cacheStats.max_bytes) : 'UNLIMITED'}</small>
+                </div>
+              </div>
+              {cacheStats.max_bytes > 0 ? <div className="cache-progress"><div className={"cache-progress-fill" + (cacheStats.over_limit ? " over" : "")} style={{width: Math.min(100, cacheStats.used_bytes / cacheStats.max_bytes * 100) + "%"}}/></div> : null}
+              {cacheStats.over_limit ? <div className="cache-warning">CACHE LIMIT EXCEEDED BY {fmtBytes(cacheStats.used_bytes - cacheStats.max_bytes)} · OLDEST NON-COVER IMAGES ARE EVICTED AUTOMATICALLY</div> : null}
+              <div className="cache-stat-grid">
+                <div><span>FILES</span><b>{fmtCount(cacheStats.files)}</b></div>
+                <div><span>GALLERY</span><b>{fmtBytes(cacheStats.gallery_bytes)}</b></div>
+                <div><span>FEATURED</span><b>{fmtBytes(cacheStats.featured_bytes)}</b></div>
+                <div><span>THUMBNAILS</span><b>{fmtBytes(cacheStats.thumbnail_bytes)}</b></div>
+                <div><span>COVERS</span><b>{fmtBytes(cacheStats.cover_bytes)}</b></div>
+                <div><span>OTHER</span><b>{fmtBytes(cacheStats.other_bytes)}</b></div>
+              </div>
+            </> : <div className="cache-loading">READING CACHE…</div>}
+          </div>
+
+          <div className="cache-control">
+            <div>
+              <span className="cache-label">MAX CACHE MEMORY</span>
+              <p className="settings-copy">Set to 0 for unlimited. When exceeded, Raphael evicts the oldest non-cover image records first.</p>
+            </div>
+            <div className="cache-input-row">
+              <input className="cache-number-input" type="number" min="0" step="0.1" value={cacheMaxGb} onChange={e => setCacheMaxGb(e.target.value)} disabled={cacheBusy} aria-label="Maximum cache size in gigabytes" />
+              <span className="cache-unit">GB</span>
+              <button className="primary-btn small" onClick={() => void applyCacheLimit()} disabled={cacheBusy}>{cacheBusy ? 'WORKING…' : 'APPLY LIMIT'}</button>
+            </div>
+          </div>
+
+          <div className="cache-location-row">
+            <div className="cache-location-path" title={cacheStats?.location}>{cacheStats?.location || '—'}</div>
+            <button className="primary-btn small" onClick={() => void changeCacheLocation()} disabled={api.isWebApp || cacheBusy}>
+              {api.isWebApp ? 'DESKTOP ONLY' : cacheBusy ? 'MOVING…' : 'CHANGE LOCATION'}
+            </button>
+          </div>
+
+          <div className="cache-action-grid">
+            <button className="danger-btn" onClick={() => void cleanCacheOrphans()} disabled={cacheBusy}>CLEAN ORPHANS</button>
+            <button className="danger-btn" onClick={() => void clearImageCache()} disabled={cacheBusy}>DELETE IMAGES ONLY</button>
+            <button className="danger-btn" onClick={() => void clearCompleteCache()} disabled={cacheBusy}>DELETE COMPLETE CACHE</button>
+          </div>
+
+          <div className="cache-control cache-retention">
+            <div>
+              <span className="cache-label">RETAIN X IMAGES / MODEL</span>
+              <p className="settings-copy">Keeps the newest cached images for each model. Featured examples are preferred and active model cover images are protected.</p>
+            </div>
+            <div className="cache-input-row">
+              <input className="cache-number-input" type="number" min="0" step="1" value={cacheKeepPerModel} onChange={e => setCacheKeepPerModel(e.target.value)} disabled={cacheBusy} aria-label="Images to keep per model" />
+              <span className="cache-unit">IMAGES</span>
+              <button className="primary-btn small" onClick={() => void pruneCacheImages()} disabled={cacheBusy}>APPLY RETENTION</button>
+            </div>
+          </div>
+
+          {cacheMessage ? <div className="settings-success">{cacheMessage}</div> : null}
         </section>
 
         <section className="settings-section">
@@ -385,11 +621,74 @@ function ModelCard({ model, selected, onClick }: { model: ModelRecord; selected:
   </button>;
 }
 
-function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetchMore }: { model: ModelRecord; images: ModelImage[]; hasMore: boolean; fetchBusy: boolean; onChooseThumbnail: (imageId: number) => Promise<void>; onFetchMore: () => Promise<void> }) {
+function ImageViewerOverlay({ images, imageId, onClose, onNavigate }: {
+  images: ModelImage[];
+  imageId: number;
+  onClose: () => void;
+  onNavigate: (direction: -1 | 1) => void;
+}) {
+  const index = images.findIndex(image => image.id === imageId);
+  const image = index >= 0 ? images[index] : null;
+
+  useEffect(() => {
+    if (!image) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+      } else if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        onNavigate(-1);
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        onNavigate(1);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [image?.id, onClose, onNavigate]);
+
+  if (!image) return null;
+  const imagePath = image.local_path || image.thumbnail_path;
+  if (!imagePath) return null;
+
+  return <div className="image-viewer-backdrop" onClick={onClose}>
+    <div className="image-viewer hud-panel" onClick={event => event.stopPropagation()}>
+      <header className="image-viewer-header">
+        <div>
+          <div className="eyebrow">CIVITAI EXAMPLE VIEWER</div>
+          <div className="image-viewer-count">{index + 1} / {images.length}</div>
+        </div>
+        <button className="image-viewer-close" onClick={onClose} aria-label="Close image viewer">×</button>
+      </header>
+      <div className="image-viewer-stage">
+        <button className="image-viewer-nav left" onClick={() => onNavigate(-1)} aria-label="Previous image">‹</button>
+        <img src={fileUrl(imagePath)} alt={image.prompt || 'Civitai example'} />
+        <button className="image-viewer-nav right" onClick={() => onNavigate(1)} aria-label="Next image">›</button>
+      </div>
+      <div className="image-viewer-footer">
+        <div className="image-viewer-meta">
+          <span>{image.width && image.height ? `${image.width} × ${image.height}` : 'IMAGE'}</span>
+          <span>{image.sampler || 'CIVITAI EXAMPLE'}{image.steps ? ` · ${image.steps} STEPS` : ''}</span>
+        </div>
+        {image.prompt ? <div className="image-viewer-prompt">{image.prompt}</div> : null}
+        <div className="image-viewer-help"><span>← / → NAVIGATE</span><span>ESC CLOSE</span></div>
+      </div>
+    </div>
+  </div>;
+}
+
+function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetchMore, onOpenImage }: {
+  model: ModelRecord;
+  images: ModelImage[];
+  hasMore: boolean;
+  fetchBusy: boolean;
+  onChooseThumbnail: (imageId: number) => Promise<void>;
+  onFetchMore: () => Promise<void>;
+  onOpenImage: (imageId: number) => void;
+}) {
   const [busyImage, setBusyImage] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  if (!images.length) return <div className="empty-inline">No cached featured examples yet.</div>;
 
   const choose = async (imageId: number) => {
     if (busyImage !== null) return;
@@ -406,16 +705,19 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
 
   return <div className="gallery-shell">
     {error ? <div className="error-box gallery-error">{error}</div> : null}
-    <div className="gallery-grid">
+    {images.length ? <div className="gallery-grid">
       {images.map((img) => {
         const imagePath = img.local_path || img.thumbnail_path;
         const active = model.cover_source_image_id === img.id || model.cover_path === img.thumbnail_path || model.cover_path === img.local_path;
         const ready = Boolean(img.thumbnail_path || img.local_path);
         return <div className={`gallery-item ${active ? 'active-thumbnail' : ''}`} key={img.id}>
-          <div className="gallery-image-wrap">
-            {imagePath ? <img src={fileUrl(imagePath)} alt="Civitai example"/> : <div className="thumb placeholder">IMAGE</div>}
-            {active ? <span className="gallery-active-badge">ACTIVE THUMBNAIL</span> : null}
-          </div>
+          <button className="gallery-image-button" onClick={() => ready && onOpenImage(img.id)} disabled={!ready} aria-label="Open image viewer">
+            <div className="gallery-image-wrap">
+              {imagePath ? <img src={fileUrl(imagePath)} alt="Civitai example"/> : <div className="thumb placeholder">IMAGE</div>}
+              {active ? <span className="gallery-active-badge">ACTIVE THUMBNAIL</span> : null}
+              {ready ? <span className="gallery-open-hint">OPEN</span> : null}
+            </div>
+          </button>
           {img.prompt ? <div className="gallery-prompt">{img.prompt}</div> : null}
           <div className="gallery-meta">
             <span>{img.steps || img.cfg || img.sampler ? `${img.sampler || 'sampler'}${img.steps ? ` · ${img.steps} steps` : ''}` : 'CIVITAI EXAMPLE'}</span>
@@ -430,8 +732,8 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
           </button>
         </div>;
       })}
-    </div>
-    {hasMore ? <button className="gallery-more-btn" onClick={() => void onFetchMore()} disabled={fetchBusy}>{fetchBusy ? 'FETCHING 10 MORE…' : 'FETCH 10 MORE EXAMPLES'}</button> : <div className="gallery-end-note">END OF CIVITAI EXAMPLES</div>}
+    </div> : <div className="empty-inline">No community gallery examples are cached yet. Use LOAD MORE EXAMPLES to retrieve them.</div>}
+    {hasMore ? <button className="gallery-more-btn" onClick={() => void onFetchMore()} disabled={fetchBusy}>{fetchBusy ? 'FETCHING…' : 'LOAD MORE EXAMPLES'}</button> : <div className="gallery-end-note">END OF CIVITAI COMMUNITY EXAMPLES</div>}
   </div>;
 }
 
@@ -696,7 +998,7 @@ function CoverEditorOverlay({
   </div>;
 }
 
-function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, onRefresh, onLinkCivitai, onSaveTags, onSaveType, onDelete, onFilterTag, onChangeCover, onChooseThumbnail, onFetchMore }: { model: ModelRecord; images: ModelImage[]; allTags: TagRecord[]; galleryHasMore: boolean; galleryFetchBusy: boolean; onRefresh: ()=>Promise<void>; onLinkCivitai: (url: string)=>Promise<void>; onSaveTags: (tags: string[])=>Promise<void>; onSaveType: (type: string)=>Promise<void>; onDelete: ()=>Promise<void>; onFilterTag: (tag: string)=>void; onChangeCover: ()=>void; onChooseThumbnail: (imageId: number)=>Promise<void>; onFetchMore: ()=>Promise<void> }) {
+function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, onRefresh, onLinkCivitai, onSaveTags, onSaveType, onDelete, onFilterTag, onChangeCover, onChooseThumbnail, onFetchMore, onOpenImage }: { model: ModelRecord; images: ModelImage[]; allTags: TagRecord[]; galleryHasMore: boolean; galleryFetchBusy: boolean; onRefresh: ()=>Promise<void>; onLinkCivitai: (url: string)=>Promise<void>; onSaveTags: (tags: string[])=>Promise<void>; onSaveType: (type: string)=>Promise<void>; onDelete: ()=>Promise<void>; onFilterTag: (tag: string)=>void; onChangeCover: ()=>void; onChooseThumbnail: (imageId: number)=>Promise<void>; onFetchMore: ()=>Promise<void>; onOpenImage: (imageId: number)=>void }) {
   const [tab, setTab] = useState<'overview'|'examples'|'files'>('overview');
   const [civitaiUrl, setCivitaiUrl] = useState(model.civitai_url || '');
   const [linkBusy, setLinkBusy] = useState(false);
@@ -756,7 +1058,7 @@ function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, o
       <section><div className="section-head">LOCATION</div><div className="mono-box">{model.path}</div><button className="text-btn" disabled={api.isWebApp} title={api.isWebApp ? 'Opening the Windows file manager is available only in the desktop app' : undefined} onClick={()=>api.openFolder(model.path)}>{api.isWebApp ? 'OPEN FOLDER · DESKTOP' : 'OPEN FOLDER'}</button></section>
       <section><div className="section-head">CIVITAI SOURCE</div>{model.civitai_url ? <div className="civitai-source-panel"><div className="source-line"><span className="source-dot"/><span className="source-label">LINKED SOURCE</span><span className="source-domain">{new URL(model.civitai_url).hostname.replace(/^www\./,'').toUpperCase()}</span></div><div className="mono-box source-url">{model.civitai_url}</div><button className="text-btn" onClick={()=>void refreshSource()} disabled={refreshBusy || linkBusy}>{refreshBusy ? 'REFRESHING…' : 'REFRESH SOURCE DATA'}</button>{refreshError ? <div className="error-box settings-error">{refreshError}</div> : null}</div> : <div className="civitai-link-panel"><div className="source-line"><span className="source-dot"/><span className="source-label">LINK LOCAL MODEL</span><span className="source-domain">CIVITAI</span></div><p className="empty-inline">Paste a Civitai model page to pull its metadata, gallery and thumbnail into Raphael.</p><div className="link-row"><input value={civitaiUrl} onChange={e=>{setCivitaiUrl(e.target.value);setLinkError(null);}} placeholder="civitai.com/models/... or civitai.red/models/..."/><button className="primary-btn small" disabled={linkBusy} onClick={async()=>{if(!civitaiUrl.trim()) return; setLinkBusy(true); setLinkError(null); try { await onLinkCivitai(civitaiUrl.trim()); } catch (e) { setLinkError(String(e)); } finally { setLinkBusy(false); }}}>{linkBusy?'FETCHING…':'FETCH DETAILS'}</button></div>{linkError ? <div className="error-box">{linkError}</div> : null}</div>}</section>
     </div>}
-    {tab==='examples' && <div className="inspector-scroll"><section><div className="section-head section-head-row"><span>CACHED CIVITAI GALLERY · {images.length}</span><span className="section-action">PICK A THUMBNAIL</span></div><Gallery model={model} images={images} hasMore={galleryHasMore} fetchBusy={galleryFetchBusy} onChooseThumbnail={onChooseThumbnail} onFetchMore={onFetchMore}/></section></div>}
+    {tab==='examples' && <div className="inspector-scroll"><section><div className="section-head section-head-row"><span>COMMUNITY EXAMPLES · {images.length}</span><span className="section-action">PICK A THUMBNAIL</span></div><Gallery model={model} images={images} hasMore={galleryHasMore} fetchBusy={galleryFetchBusy} onChooseThumbnail={onChooseThumbnail} onFetchMore={onFetchMore} onOpenImage={onOpenImage}/></section></div>}
     {tab==='files' && <div className="inspector-scroll"><section><div className="section-head">LOCAL FILE</div><div className="kv"><span>SIZE</span><b>{fmtBytes(model.size_bytes)}</b></div><div className="kv"><span>TYPE</span><b>{model.model_type}</b></div><div className="kv"><span>BASE</span><b>{model.base_model || '—'}</b></div><div className="kv"><span>VERSION</span><b>{model.version_name || '—'}</b></div><div className="kv"><span>CREATOR</span><b>{model.creator || '—'}</b></div><div className="kv"><span>DOWNLOADED</span><b>{fmtDateTime(model.downloaded_at)}</b></div><div className="kv"><span>SHA256</span><b className="wrap">{model.source_hash || 'Not computed'}</b></div></section><section className="danger-section"><div className="section-head">DANGER ZONE</div><p className="danger-copy">Permanently delete this model file from disk and remove its Raphael metadata and cached gallery entries.</p><button className="danger-btn" onClick={()=>{setDeleteError(null);setDeleteOpen(true);}} disabled={deleteBusy}>DELETE MODEL</button></section></div>}
     {deleteOpen && <div className={"modal-backdrop inspector-delete-backdrop" + (deleteClosing ? " overlay-leaving" : "")} onClick={()=>dismissDelete()}><div className="delete-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">DESTRUCTIVE ACTION</div><h3>DELETE MODEL?</h3><p>This will permanently remove <b>{model.filename}</b> from your ComfyUI models folder. Raphael metadata and cached gallery files for this model will also be removed.</p>{deleteError ? <div className="error-box modal-error">{deleteError}</div> : null}<div className="modal-actions"><button className="text-btn" onClick={()=>dismissDelete()} disabled={deleteBusy}>CANCEL</button><button className="danger-btn confirm" disabled={deleteBusy} onClick={async()=>{setDeleteBusy(true);setDeleteError(null);try{await onDelete();dismissDelete(true);}catch(e){setDeleteError(String(e));}finally{setDeleteBusy(false);}}}>{deleteBusy?'DELETING…':'DELETE PERMANENTLY'}</button></div></div></div>}
   </aside>;
@@ -785,7 +1087,7 @@ function DownloadProgressWidget({ progress, onClear }: { progress: DownloadProgr
 function App() {
   const [state,setState]=useState<AppState|null>(null); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
   const refreshGeneration = useRef(0);
-  const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [galleryHasMore,setGalleryHasMore]=useState(true); const [galleryFetchBusy,setGalleryFetchBusy]=useState(false); const galleryTargetRef=useRef(20); const bulkFileInputRef=useRef<HTMLInputElement>(null); const [bulkBusy,setBulkBusy]=useState(false); const [bulkMessage,setBulkMessage]=useState<string|null>(null); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
+  const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [galleryHasMore,setGalleryHasMore]=useState(true); const [galleryFetchBusy,setGalleryFetchBusy]=useState(false); const [imageViewerId,setImageViewerId]=useState<number|null>(null); const bulkFileInputRef=useRef<HTMLInputElement>(null); const [bulkBusy,setBulkBusy]=useState(false); const [bulkMessage,setBulkMessage]=useState<string|null>(null); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
   const [settingsOpen,setSettingsOpen]=useState(false);
   const [coverEditorOpen,setCoverEditorOpen]=useState(false);
   const [thumbnailFit,setThumbnailFit]=useState<ThumbnailFit>(initialThumbnailFit);
@@ -824,9 +1126,8 @@ function App() {
         void refresh();
         const currentId = selectedIdRef.current;
         if (currentId != null) {
-          void api.getImages(currentId, 200).then(result => {
+          void api.getImages(currentId, 1000).then(result => {
             setImages(result.images);
-            setGalleryHasMore(result.has_more);
           }).catch(() => {});
         }
       }
@@ -923,34 +1224,48 @@ function App() {
     };
   },[type,query,sort,activeTags]);
   useEffect(()=>{
-    if(!selected){setImages([]);setGalleryHasMore(false);setGalleryFetchBusy(false);return;}
+    let cancelled=false;
+    if(!selected){
+      setImages([]);
+      setGalleryHasMore(false);
+      setGalleryFetchBusy(false);
+      setImageViewerId(null);
+      return;
+    }
     const modelId=selected.id;
     setGalleryHasMore(false);
     setGalleryFetchBusy(false);
-    galleryTargetRef.current=200;
+    setImageViewerId(null);
+
     const loadImages = async () => {
       try {
-        const result = await api.getImages(modelId,200);
+        const result = await api.getImages(modelId,1000);
+        if(cancelled) return;
         setImages(result.images);
-        if (result.images.length < 200) setGalleryHasMore(false);
       } catch {
+        if(cancelled) return;
         setImages([]);
-        setGalleryHasMore(false);
       }
     };
+
     const primePagination = async () => {
       try {
         const remoteHasMore = await api.syncModelGallery(modelId,20);
-        const result = await api.getImages(modelId,200);
+        const result = await api.getImages(modelId,1000);
+        if(cancelled) return;
         setImages(result.images);
         setGalleryHasMore(remoteHasMore);
       } catch {
         await loadImages();
       }
     };
+
     void primePagination();
     const timer=window.setInterval(()=>void loadImages(),2000);
-    return ()=>window.clearInterval(timer);
+    return ()=>{
+      cancelled=true;
+      window.clearInterval(timer);
+    };
   },[selectedId, selected?.civitai_model_id]);
   useEffect(()=>{const t=setTimeout(()=>refresh(),180); return ()=>clearTimeout(t);},[query,type,sort,activeTags]);
   if(!state) return <div className="loading-shell"><PulseMark/></div>;
@@ -974,7 +1289,30 @@ function App() {
       }));
     }
   };
-  const onFetchMore = async()=>{ if(!selected || galleryFetchBusy || !galleryHasMore) return; const modelId=selected.id; const target=images.length+10; galleryTargetRef.current=target; setGalleryFetchBusy(true); try { const more=await api.syncModelGallery(modelId,target); const next=await api.getImages(modelId,target); setImages(next.images); setGalleryHasMore(more); } catch { } finally { setGalleryFetchBusy(false); } };
+  const onFetchMore = async()=>{
+    if(!selected || galleryFetchBusy || !galleryHasMore) return;
+    const modelId=selected.id;
+    setGalleryFetchBusy(true);
+    try {
+      const more=await api.loadMoreModelExamples(modelId);
+      const next=await api.getImages(modelId,1000);
+      if(selectedIdRef.current!==modelId) return;
+      setImages(next.images);
+      setGalleryHasMore(more);
+    } catch {
+      if(selectedIdRef.current===modelId) setGalleryHasMore(true);
+    } finally {
+      setGalleryFetchBusy(false);
+    }
+  };
+  const openImageViewer = (imageId: number) => setImageViewerId(imageId);
+  const navigateImageViewer = (direction: -1 | 1) => {
+    if (imageViewerId == null || !images.length) return;
+    const currentIndex = images.findIndex(image => image.id === imageViewerId);
+    if (currentIndex < 0) return;
+    const nextIndex = (currentIndex + direction + images.length) % images.length;
+    setImageViewerId(images[nextIndex].id);
+  };
   const handleBulkLinkFile = async(file: File)=>{
     setBulkBusy(true);
     setBulkMessage(null);
@@ -1006,8 +1344,10 @@ function App() {
         </button>
       </div></aside>
       <main className="library"><div className="library-head"><div><div className="eyebrow">{type.toUpperCase()}</div><h1>{type==='All'?'MODEL LIBRARY':type.toUpperCase()}</h1></div><div className="library-tools"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search models, tags, tag:…"/><button className={`tag-filter-button ${activeTags.length?'active':''}`} onClick={()=>setTagPanelOpen(v=>!v)}>TAGS{activeTags.length ? ` · ${activeTags.length}` : ''}</button><button className="import-btn" onClick={()=>{setImportClosing(false);setImportError(null);setImportUrl('');setImportType('Other');setCustomDownloadPath(false);setDownloadPath('');setPreview({model:{},version:{id:0,name:'',base_model:null,download_url:'',filename:null,size_bytes:null,activation_prompts:[]},target_directory:'',thumbnail_path:null});}}>IMPORT CIVITAI</button><select value={sort} onChange={e=>setSort(e.target.value)}><option value="name">NAME</option><option value="size">SIZE</option><option value="path">PATH</option></select></div>{tagPanelOpen && <TagFilterPanel tags={allTags} activeTags={activeTags} onToggle={tag=>setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current.filter(x=>x.toLowerCase()!==tag.toLowerCase()):[...current,tag])} onClear={()=>setActiveTags([])}/>}</div>{activeTags.length ? <div className="active-tag-bar">{activeTags.map(tag=><button key={tag} onClick={()=>setActiveTags(current=>current.filter(x=>x.toLowerCase()!==tag.toLowerCase()))}>{tag}<span>×</span></button>)}<span className="active-tag-help">TAG FILTERS</span></div> : null}<div className="grid">{models.map(m=><ModelCard key={m.id} model={m} selected={m.id===selectedId} onClick={()=>setSelectedId(m.id)}/>)}{!models.length&&<div className="empty-state">No models match the current view.</div>}</div></main>
-      {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} galleryHasMore={galleryHasMore} galleryFetchBusy={galleryFetchBusy} onFetchMore={onFetchMore} onRefresh={async()=>{await api.refreshModel(selected.id); await refresh(); const result=await api.getImages(selected.id,200); setImages(result.images); setGalleryHasMore(result.has_more);}} onLinkCivitai={async(url)=>{await api.linkModelCivitai(selected.id,url); await refresh(); const result=await api.getImages(selected.id,200); setImages(result.images); setGalleryHasMore(result.has_more);}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)} onChooseThumbnail={async imageId=>{const updated=await api.setModelCoverFromImage(selected.id,imageId); setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
+      {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} galleryHasMore={galleryHasMore} galleryFetchBusy={galleryFetchBusy} onFetchMore={onFetchMore} onOpenImage={openImageViewer} onRefresh={async()=>{await api.refreshModel(selected.id); await refresh(); const more=await api.syncModelGallery(selected.id,20); const result=await api.getImages(selected.id,1000); setImages(result.images); setGalleryHasMore(more);}} onLinkCivitai={async(url)=>{await api.linkModelCivitai(selected.id,url); await refresh(); const more=await api.syncModelGallery(selected.id,20); const result=await api.getImages(selected.id,1000); setImages(result.images); setGalleryHasMore(more);}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)} onChooseThumbnail={async imageId=>{const updated=await api.setModelCoverFromImage(selected.id,imageId); setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
       {selected && coverEditorOpen && <CoverEditorOverlay model={selected} onClose={()=>setCoverEditorOpen(false)} onUpdated={updated=>{setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
+      {imageViewerId !== null && images.some(image => image.id === imageViewerId) && <ImageViewerOverlay images={images} imageId={imageViewerId} onClose={()=>setImageViewerId(null)} onNavigate={navigateImageViewer}/>}
+
     </div>
     {settingsOpen && <SettingsOverlay thumbnailFit={thumbnailFit} onThumbnailFitChange={setThumbnailFit} progress={examplesRefreshProgress} running={examplesRefreshRunning} onRefreshExamples={refreshAllExamples} onClose={()=>setSettingsOpen(false)}/>} 
     {(preview || importUrl) && <div className={"modal-backdrop" + (importClosing ? " overlay-leaving" : "")} onClick={()=>{if(!busy) closeImport();}}><div className="import-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">CIVITAI IMPORT</div><h2>INSTALL A MODEL</h2>{!preview || preview.version.id===0 ? <>{importError ? <div className="error-box modal-error">{importError}</div> : null}<div className="import-row"><input value={importUrl} onChange={e=>setImportUrl(e.target.value)} onKeyDown={e=>e.key==='Enter'&&doImport()} placeholder="civitai.com/models/... or civitai.red/models/..." autoFocus/><button className="primary-btn" onClick={doImport} disabled={busy || bulkBusy}>{busy?'ANALYZING…':'ANALYZE'}</button></div><div className="bulk-link-row"><input ref={bulkFileInputRef} className="bulk-link-input" type="file" accept=".txt,text/plain" onChange={e=>{const file=e.target.files?.[0];if(file)void handleBulkLinkFile(file);}}/><button className="text-btn" onClick={()=>bulkFileInputRef.current?.click()} disabled={busy || bulkBusy}>{bulkBusy?'QUEUING LINKS…':'UPLOAD LINK FILE'}</button><span className="bulk-link-status">ONE CIVITAI LINK PER LINE · DOWNLOADS FOLLOW YOUR PARALLEL SETTING</span>{bulkMessage ? <span className="bulk-link-status">{bulkMessage}</span> : null}</div></> : <><div className="import-preview-grid"><div className="preview-image">{preview.thumbnail_path ? <><TypePlaceholder type={importType}/><img src={fileUrl(preview.thumbnail_path)} alt="" onError={(e)=>{e.currentTarget.style.display="none";}}/></> : <TypePlaceholder type={importType}/>}</div><div className="preview-panel"><div className="preview-topline"><span className="type-chip">{importType}</span><span className="source-domain">CIVITAI</span></div><h3>{preview.model.name || preview.version.filename || 'Model'}</h3><div className="preview-meta">{preview.version.base_model || 'Base model unavailable'} · {preview.version.filename || 'Filename automatic'}</div><div className="kv"><span>MODEL FILE</span><b>{preview.version.filename || 'Automatic filename'}</b></div><div className="kv"><span>SIZE</span><b>{preview.version.size_bytes ? fmtBytes(preview.version.size_bytes) : 'Unknown'}</b></div><div className="section-head">LIBRARY TAG</div><div className="import-type-row"><label htmlFor="import-type">CLASSIFY AS</label><select id="import-type" className="import-type-select" value={importType} onChange={e=>{const next=e.target.value as ModelType; setImportType(next); if(!customDownloadPath) setDownloadPath(defaultImportDirectory(state.models_root,next));}} disabled={busy}>{IMPORT_TYPES.map(x=><option key={x} value={x}>{x}</option>)}</select></div><div className="import-type-note">Civitai suggests <b>{preview.model.type || 'Unknown'}</b>; Raphael uses the tag you choose for its library category and default folder.</div><div className="section-head">DOWNLOAD LOCATION</div><div className="destination-box"><div className="destination-path" title={downloadPath}>{downloadPath || defaultImportDirectory(state.models_root,importType) || preview.target_directory}</div><button className="primary-btn small" onClick={async()=>{const next=await api.chooseDirectory(downloadPath || defaultImportDirectory(state.models_root,importType) || preview.target_directory); if(next){setDownloadPath(next);setCustomDownloadPath(true);setImportError(null);}}} disabled={busy || api.isWebApp}>{api.isWebApp ? 'DESKTOP ONLY' : 'BROWSE'}</button></div><div className="destination-note">Choose a folder inside your configured ComfyUI models directory. Changing the tag updates the default folder until you manually browse.</div><div className="section-head">ACTIVATION PROMPTS</div><div className="chips">{preview.version.activation_prompts.map(x=><span key={x}>{x}</span>)}</div></div></div><div className="modal-actions"><button className="text-btn" onClick={closeImport}>BACK</button><button className="primary-btn" onClick={install} disabled={busy}>{busy?'STARTING…':'DOWNLOAD & INSTALL'}</button></div>{importError ? <div className="error-box modal-error">{importError}</div> : null}</>}</div></div>}
