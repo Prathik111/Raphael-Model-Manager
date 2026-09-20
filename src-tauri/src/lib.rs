@@ -556,18 +556,41 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn rewrite_cache_paths(c: &mut Connection, old_root: &Path, new_root: &Path) -> AppResult<()> {
+fn rewrite_cache_paths(
+    c: &mut Connection,
+    old_root: &Path,
+    new_root: &Path,
+    cache_bytes: i64,
+) -> AppResult<()> {
     let old = old_root.to_string_lossy().to_string();
     let new = new_root.to_string_lossy().to_string();
+    let separator = std::path::MAIN_SEPARATOR.to_string();
     let tx = c.transaction()?;
+
     for column in ["local_path", "thumbnail_path"] {
-        let sql = format!("UPDATE images SET {column}=?2 || substr({column}, length(?1)+1) WHERE {column} IS NOT NULL AND substr({column},1,length(?1))=?1");
-        tx.execute(&sql, params![old, new])?;
+        let sql = format!(
+            "UPDATE images SET {column}=?2 || substr({column}, length(?1)+1)
+             WHERE {column}=?1 OR substr({column},1,length(?1)+1)=?1 || ?3"
+        );
+        tx.execute(&sql, params![old, new, separator])?;
     }
     for column in ["thumbnail_path", "cover_path"] {
-        let sql = format!("UPDATE models SET {column}=?2 || substr({column}, length(?1)+1) WHERE {column} IS NOT NULL AND substr({column},1,length(?1))=?1");
-        tx.execute(&sql, params![old, new])?;
+        let sql = format!(
+            "UPDATE models SET {column}=?2 || substr({column}, length(?1)+1)
+             WHERE {column}=?1 OR substr({column},1,length(?1)+1)=?1 || ?3"
+        );
+        tx.execute(&sql, params![old, new, separator])?;
     }
+    tx.execute(
+        "INSERT INTO settings(key,value) VALUES('cache_location',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [&new],
+    )?;
+    tx.execute(
+        "INSERT INTO settings(key,value) VALUES('cache_bytes',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [cache_bytes.to_string()],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -628,7 +651,13 @@ fn referenced_cache_paths(c: &Connection) -> AppResult<HashSet<PathBuf>> {
         let mut stmt = c.prepare(sql)?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         for row in rows {
-            if let Ok(value) = row { paths.insert(PathBuf::from(value)); }
+            if let Ok(value) = row {
+                let path = PathBuf::from(value);
+                if let Ok(canonical) = path.canonicalize() {
+                    paths.insert(canonical);
+                }
+                paths.insert(path);
+            }
         }
     }
     Ok(paths)
@@ -643,7 +672,9 @@ fn clean_cache_orphans_inner(app_data: &Path) -> AppResult<CacheOperationResult>
     if root.exists() {
         for entry in WalkDir::new(&root).follow_links(false).into_iter().filter_map(Result::ok) {
             let path = entry.path();
-            if !path.is_file() || references.contains(path) { continue; }
+            let referenced = references.contains(path)
+                || path.canonicalize().map(|canonical| references.contains(&canonical)).unwrap_or(false);
+            if !path.is_file() || referenced { continue; }
             let bytes = fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
             if fs::remove_file(path).is_ok() {
                 deleted_files += 1;
@@ -725,11 +756,10 @@ fn clear_complete_cache_inner(app_data: &Path) -> AppResult<CacheOperationResult
     fs::create_dir_all(root.join("civitai"))?;
     fs::create_dir_all(root.join("covers"))?;
     let c = open_db(app_data)?;
-    let root_string = root.to_string_lossy().to_string();
     c.execute_batch("DELETE FROM images;")?;
     c.execute(
-        "UPDATE models SET thumbnail_path=NULL, cover_path=CASE WHEN cover_path IS NOT NULL AND substr(cover_path,1,length(?1))=?1 THEN NULL ELSE cover_path END, cover_source_image_id=NULL",
-        [&root_string],
+        "UPDATE models SET thumbnail_path=NULL,cover_path=NULL,cover_source_image_id=NULL",
+        [],
     )?;
     let _ = put_setting(&c, "cache_bytes", "0");
     let stats = cache_stats_inner(app_data)?;
@@ -783,39 +813,39 @@ fn set_cache_location_inner(app_data: &Path, path: &str) -> AppResult<CacheStats
     let target_canonical = target.canonicalize().unwrap_or_else(|_| target.clone());
 
     if old_canonical == target_canonical {
-        let c = open_db(app_data)?;
-        put_setting(&c, "cache_location", &target_canonical.to_string_lossy())?;
+        let mut c = open_db(app_data)?;
+        let bytes = dir_size(&target_canonical);
+        rewrite_cache_paths(&mut c, &old_canonical, &target_canonical, bytes)?;
         return cache_stats_inner(app_data);
     }
     if target_canonical.starts_with(&old_canonical) || old_canonical.starts_with(&target_canonical) {
         return Err(AppError::Invalid("The new cache location cannot contain the current cache location or be inside it".into()));
     }
-    if fs::read_dir(&target)?.next().is_some() {
+    if fs::read_dir(&target_canonical)?.next().is_some() {
         return Err(AppError::Invalid("Choose an empty folder for the new Raphael cache location".into()));
     }
 
     let before = cache_file_counts(&old);
-    copy_dir_recursive(&old, &target)?;
-    let after = cache_file_counts(&target);
+    copy_dir_recursive(&old, &target_canonical)?;
+    let after = cache_file_counts(&target_canonical);
     if before != after {
-        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&target_canonical);
         return Err(AppError::Invalid("Cache relocation verification failed; the original cache was preserved".into()));
     }
 
     let db_update = (|| {
         let mut c = open_db(app_data)?;
-        rewrite_cache_paths(&mut c, &old, &target)?;
-        put_setting(&c, "cache_location", &target.to_string_lossy())?;
-        let bytes = dir_size(&target);
-        put_setting(&c, "cache_bytes", &bytes.to_string())?;
+        let bytes = dir_size(&target_canonical);
+        rewrite_cache_paths(&mut c, &old, &target_canonical, bytes)?;
         Ok::<(), AppError>(())
     })();
 
     if let Err(error) = db_update {
-        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&target_canonical);
         return Err(error);
     }
-    fs::remove_dir_all(&old)?;
+
+    let _ = fs::remove_dir_all(&old);
     cache_stats_inner(app_data)
 }
 
@@ -1271,6 +1301,7 @@ async fn sync_featured_examples_inner(
     }
 
     let c = open_db(&app.app_data)?;
+    let mut preserved_featured_cover_key: Option<i64> = None;
     let old_cover: Option<String> = c.query_row(
         "SELECT cover_path FROM models WHERE id=?1",
         [model_id],
@@ -1281,16 +1312,16 @@ async fn sync_featured_examples_inner(
         if old_path.starts_with(&active) {
             if old_path.is_file() {
                 let new_cover = copy_cached_cover(&app, model_id, &old_path)?;
-                let cover_source_image_id: Option<i64> = c
+                preserved_featured_cover_key = c
                     .query_row(
-                        "SELECT id FROM images WHERE model_id=?1 AND (local_path=?2 OR thumbnail_path=?2) LIMIT 1",
+                        "SELECT civitai_image_id FROM images WHERE model_id=?1 AND (local_path=?2 OR thumbnail_path=?2) AND meta_json LIKE '%\"featured\":true%' LIMIT 1",
                         params![model_id, old_path.to_string_lossy().to_string()],
                         |r| r.get(0),
                     )
                     .optional()?;
                 c.execute(
-                    "UPDATE models SET cover_path=?2,cover_source_image_id=?3,updated_at=?4 WHERE id=?1",
-                    params![model_id, new_cover.to_string_lossy().to_string(), cover_source_image_id, now()],
+                    "UPDATE models SET cover_path=?2,cover_source_image_id=NULL,updated_at=?3 WHERE id=?1",
+                    params![model_id, new_cover.to_string_lossy().to_string(), now()],
                 )?;
             } else {
                 c.execute("UPDATE models SET cover_path=NULL,cover_source_image_id=NULL,updated_at=?2 WHERE id=?1", params![model_id, now()])?;
@@ -1325,6 +1356,19 @@ async fn sync_featured_examples_inner(
                     meta_json=excluded.meta_json,
                     cached_at=excluded.cached_at",
                 params![model_id,record.0,record.1,record.2,record.3,record.4,record.5,record.6,record.7,record.8,record.9,record.10,record.11],
+            )?;
+        }
+        if let Some(cover_key) = preserved_featured_cover_key {
+            let new_source_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM images WHERE model_id=?1 AND civitai_image_id=?2 AND meta_json LIKE '%\"featured\":true%' LIMIT 1",
+                    params![model_id, cover_key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            tx.execute(
+                "UPDATE models SET cover_source_image_id=?2,updated_at=?3 WHERE id=?1",
+                params![model_id, new_source_id, now()],
             )?;
         }
         tx.commit()?;
@@ -1572,7 +1616,9 @@ async fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppRe
         (PathBuf::from(model.path), model.thumbnail_path, model.cover_path, image_paths)
     };
 
-    if !path.starts_with(&root) {
+    let root_canonical = root.canonicalize()?;
+    let path_canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+    if !path_canonical.starts_with(&root_canonical) {
         return Err(AppError::Invalid("Refusing to delete a model outside the configured models folder".into()));
     }
 
