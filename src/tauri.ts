@@ -58,6 +58,77 @@ async function webCommand<T>(command: string, args: Record<string, unknown> = {}
   return payload as T;
 }
 
+type WebTaskStart = { task_id: string; state: 'queued' };
+type WebTaskStatus = {
+  task_id: string;
+  state: 'queued' | 'running' | 'completed' | 'failed';
+  result: unknown | null;
+  error: string | null;
+};
+
+const sleep = (ms: number) => new Promise<void>(resolve => window.setTimeout(resolve, ms));
+
+async function webTaskCommand<T>(commandName: string, args: Record<string, unknown> = {}): Promise<T> {
+  if (!isWebApp) {
+    return invoke<T>(commandName, args);
+  }
+
+  const startResponse = await webFetch('/api/task/start', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ command: commandName, args }),
+  }, 5000);
+
+  const startPayload = await startResponse.json().catch(() => null);
+  if (!startResponse.ok) {
+    throw new Error(startPayload?.error || `Web task start failed: ${startResponse.status}`);
+  }
+
+  const { task_id } = startPayload as WebTaskStart;
+  if (!task_id) throw new Error('Web task start returned no task ID');
+
+  const deadline = Date.now() + 15 * 60 * 1000;
+  let connectionFailures = 0;
+  let delayMs = 400;
+
+  while (Date.now() < deadline) {
+    try {
+      const response = await webFetch(
+        '/api/tasks/' + encodeURIComponent(task_id),
+        {},
+        5000,
+      );
+      const payload = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        throw new Error(payload?.error || `Web task status failed: ${response.status}`);
+      }
+
+      connectionFailures = 0;
+      delayMs = 400;
+
+      const task = payload as WebTaskStatus;
+      if (task.state === 'completed') {
+        return task.result as T;
+      }
+      if (task.state === 'failed') {
+        throw new Error(task.error || 'Web task failed');
+      }
+
+      await sleep(delayMs);
+      delayMs = Math.min(1200, delayMs + 100);
+    } catch (error) {
+      connectionFailures += 1;
+      if (connectionFailures >= 20) {
+        throw error instanceof Error ? error : new Error(String(error));
+      }
+      await sleep(Math.min(5000, 500 * connectionFailures));
+    }
+  }
+
+  throw new Error(`Web task timed out after 15 minutes (task ${task_id})`);
+}
+
 const command = <T,>(name: string, args: Record<string, unknown> = {}) =>
   isWebApp ? webCommand<T>(name, args) : invoke<T>(name, args);
 
@@ -99,7 +170,7 @@ export const api = {
     command<ModelRecord[]>('list_models', { ...params }),
   getLibraryCounts: () => command<LibraryCounts>('get_library_counts'),
   getTags: () => command<TagRecord[]>('get_tags'),
-  addSubfolderTags: () => command<number>('add_subfolder_tags'),
+  addSubfolderTags: () => isWebApp ? webTaskCommand<number>('add_subfolder_tags') : command<number>('add_subfolder_tags'),
   setModelTags: (id: number, tags: string[]) =>
     command<ModelRecord>('set_model_tags', { id, tags }),
   setModelType: (id: number, modelType: string) =>
@@ -113,13 +184,13 @@ export const api = {
   resetModelCover: (id: number) =>
     command<ModelRecord>('reset_model_cover', { id }),
   deleteModel: (id: number) =>
-    command<void>('delete_model', { id }),
+    isWebApp ? webTaskCommand<void>('delete_model', { id }) : command<void>('delete_model', { id }),
   getImages: (id: number, limit = 20) =>
     command<ModelImagesResponse>('get_model_images', { id, limit }),
   syncModelGallery: (id: number, targetCount = 20) =>
-    command<boolean>('sync_model_gallery', { id, targetCount }),
+    isWebApp ? webTaskCommand<boolean>('sync_model_gallery', { id, targetCount }) : command<boolean>('sync_model_gallery', { id, targetCount }),
   loadMoreModelExamples: (id: number, amount?: number) =>
-    command<boolean>('load_more_model_examples', { id, amount }),
+    isWebApp ? webTaskCommand<boolean>('load_more_model_examples', { id, amount }) : command<boolean>('load_more_model_examples', { id, amount }),
   getExampleLoadAmount: () =>
     command<number>('get_example_load_amount'),
   setExampleLoadAmount: (amount: number) =>
@@ -129,7 +200,7 @@ export const api = {
   getExamplesRefreshStatus: () =>
     command<ExamplesRefreshProgress | null>('get_examples_refresh_status'),
   importCivitai: (url: string) =>
-    command<CivitaiImportPreview>('preview_civitai_import', { url }),
+    isWebApp ? webTaskCommand<CivitaiImportPreview>('preview_civitai_import', { url }) : command<CivitaiImportPreview>('preview_civitai_import', { url }),
   installCivitai: (
     url: string,
     targetDirectory?: string,
@@ -149,9 +220,9 @@ export const api = {
   clearDownloadProgress: (taskId: string) =>
     command<void>('clear_download_progress', { taskId }),
   refreshModel: (id: number) =>
-    command<ModelRecord>('refresh_model_civitai', { id }),
+    isWebApp ? webTaskCommand<ModelRecord>('refresh_model_civitai', { id }) : command<ModelRecord>('refresh_model_civitai', { id }),
   linkModelCivitai: (id: number, url: string) =>
-    command<ModelRecord>('link_model_civitai', { id, url }),
+    isWebApp ? webTaskCommand<ModelRecord>('link_model_civitai', { id, url }) : command<ModelRecord>('link_model_civitai', { id, url }),
   openFolder: (path: string) =>
     command<void>('open_in_file_manager', { path }),
   setCivitaiToken: (token: string) =>
@@ -163,17 +234,17 @@ export const api = {
   getCacheStats: () =>
     command<CacheStats>('get_cache_stats'),
   setCacheMaxBytes: (maxBytes: number) =>
-    command<CacheStats>('set_cache_max_bytes', { maxBytes }),
+    isWebApp ? webTaskCommand<CacheStats>('set_cache_max_bytes', { maxBytes }) : command<CacheStats>('set_cache_max_bytes', { maxBytes }),
   setCacheLocation: (path: string) =>
-    command<CacheStats>('set_cache_location', { path }),
+    isWebApp ? webTaskCommand<CacheStats>('set_cache_location', { path }) : command<CacheStats>('set_cache_location', { path }),
   clearCacheImages: () =>
-    command<CacheOperationResult>('clear_cache_images'),
+    isWebApp ? webTaskCommand<CacheOperationResult>('clear_cache_images') : command<CacheOperationResult>('clear_cache_images'),
   clearCompleteCache: () =>
-    command<CacheOperationResult>('clear_complete_cache'),
+    isWebApp ? webTaskCommand<CacheOperationResult>('clear_complete_cache') : command<CacheOperationResult>('clear_complete_cache'),
   pruneCacheImages: (keepPerModel: number) =>
-    command<CacheOperationResult>('prune_cache_images', { keepPerModel }),
+    isWebApp ? webTaskCommand<CacheOperationResult>('prune_cache_images', { keepPerModel }) : command<CacheOperationResult>('prune_cache_images', { keepPerModel }),
   cleanCacheOrphans: () =>
-    command<CacheOperationResult>('clean_cache_orphans'),
+    isWebApp ? webTaskCommand<CacheOperationResult>('clean_cache_orphans') : command<CacheOperationResult>('clean_cache_orphans'),
   getWebAppStatus: async () => {
     if (!isWebApp) return invoke<WebAppStatus>('get_web_app_status');
     const response = await webFetch('/api/status', {}, WEB_STATUS_TIMEOUT_MS);
@@ -197,23 +268,38 @@ export const api = {
 export async function subscribeToModelChanges(cb: () => void) {
   if (isWebApp) {
     let disposed = false;
-    let inFlight = false;
-    const poll = async () => {
-      if (disposed || inFlight) return;
-      inFlight = true;
-      try {
-        await api.getWebAppStatus();
-        if (!disposed) cb();
-      } catch {
-        // The dedicated web-connection monitor reports the offline state.
-      } finally {
-        inFlight = false;
+    let revision = 0;
+
+    const waitForChanges = async () => {
+      while (!disposed) {
+        try {
+          const response = await webFetch(
+            '/api/changes?since=' + encodeURIComponent(String(revision)),
+            {},
+            32_000,
+          );
+          if (!response.ok) {
+            throw new Error(`Web change monitor failed: ${response.status}`);
+          }
+
+          const payload = await response.json().catch(() => null) as { revision?: number } | null;
+          const nextRevision = Number(payload?.revision ?? revision);
+          if (nextRevision !== revision) {
+            revision = nextRevision;
+            if (!disposed) cb();
+          } else if (!disposed) {
+            // The long-poll timed out without a change; immediately wait again.
+          }
+        } catch {
+          if (disposed) return;
+          await sleep(1500);
+        }
       }
     };
-    const timer = window.setInterval(() => void poll(), 5000);
+
+    void waitForChanges();
     return () => {
       disposed = true;
-      window.clearInterval(timer);
     };
   }
   return listen('models-changed', cb);
