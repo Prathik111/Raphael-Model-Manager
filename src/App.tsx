@@ -678,6 +678,119 @@ function ImageViewerOverlay({ images, imageId, onClose, onNavigate }: {
   </div>;
 }
 
+const GALLERY_LOAD_CONCURRENCY = 6;
+let activeGalleryImageLoads = 0;
+type GalleryLoadJob = {
+  cancelled: boolean;
+  started: boolean;
+  finished: boolean;
+  begin: () => void;
+  release?: () => void;
+};
+
+const galleryLoadQueue: GalleryLoadJob[] = [];
+
+function drainGalleryImageQueue() {
+  while (activeGalleryImageLoads < GALLERY_LOAD_CONCURRENCY && galleryLoadQueue.length) {
+    const job = galleryLoadQueue.shift()!;
+    if (job.cancelled) continue;
+    job.started = true;
+    activeGalleryImageLoads += 1;
+    let released = false;
+    job.release = () => {
+      if (released) return;
+      released = true;
+      job.finished = true;
+      activeGalleryImageLoads = Math.max(0, activeGalleryImageLoads - 1);
+      drainGalleryImageQueue();
+    };
+    job.begin();
+  }
+}
+
+function enqueueGalleryImageLoad(begin: (release: () => void) => void) {
+  const job: GalleryLoadJob = {
+    cancelled: false,
+    started: false,
+    finished: false,
+    begin: () => undefined,
+  };
+  job.begin = () => begin(job.release!);
+  galleryLoadQueue.push(job);
+  drainGalleryImageQueue();
+
+  return () => {
+    if (job.finished) return;
+    job.cancelled = true;
+    if (job.started) {
+      job.release?.();
+    } else {
+      const index = galleryLoadQueue.indexOf(job);
+      if (index >= 0) galleryLoadQueue.splice(index, 1);
+    }
+  };
+}
+
+function GalleryImage({ src, alt }: { src: string; alt: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [nearViewport, setNearViewport] = useState(false);
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(null);
+  const releaseRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element) return;
+    if (!('IntersectionObserver' in window)) {
+      setNearViewport(true);
+      return;
+    }
+
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        setNearViewport(true);
+        observer.disconnect();
+      }
+    }, { rootMargin: '700px 0px' });
+
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    setLoadedSrc(null);
+    releaseRef.current?.();
+    releaseRef.current = null;
+    if (!nearViewport || !src) return;
+
+    return enqueueGalleryImageLoad((release) => {
+      releaseRef.current = release;
+      setLoadedSrc(src);
+    });
+  }, [nearViewport, src]);
+
+  const finishLoad = () => {
+    releaseRef.current?.();
+    releaseRef.current = null;
+  };
+
+  return (
+    <div ref={containerRef} className="gallery-image-loader">
+      {loadedSrc ? (
+        <img
+          src={fileUrl(loadedSrc)}
+          alt={alt}
+          loading="lazy"
+          decoding="async"
+          onLoad={finishLoad}
+          onError={finishLoad}
+        />
+      ) : (
+        <div className="thumb placeholder" aria-hidden="true">IMAGE</div>
+      )}
+    </div>
+  );
+}
+
 function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetchMore, onOpenImage }: {
   model: ModelRecord;
   images: ModelImage[];
@@ -689,6 +802,25 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
 }) {
   const [busyImage, setBusyImage] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [renderCount, setRenderCount] = useState(() => Math.min(48, images.length));
+  const renderSentinelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setRenderCount(Math.min(48, images.length));
+  }, [model.id]);
+
+  useEffect(() => {
+    if (renderCount >= images.length) return;
+    const element = renderSentinelRef.current;
+    if (!element || !('IntersectionObserver' in window)) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        setRenderCount(current => Math.min(current + 48, images.length));
+      }
+    }, { rootMargin: '900px 0px' });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [renderCount, images.length]);
 
   const choose = async (imageId: number) => {
     if (busyImage !== null) return;
@@ -706,14 +838,14 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
   return <div className="gallery-shell">
     {error ? <div className="error-box gallery-error">{error}</div> : null}
     {images.length ? <div className="gallery-grid">
-      {images.map((img) => {
-        const imagePath = img.local_path || img.thumbnail_path;
+      {images.slice(0, renderCount).map((img) => {
+        const imagePath = img.thumbnail_path || img.local_path;
         const active = model.cover_source_image_id === img.id || model.cover_path === img.thumbnail_path || model.cover_path === img.local_path;
         const ready = Boolean(img.thumbnail_path || img.local_path);
         return <div className={`gallery-item ${active ? 'active-thumbnail' : ''}`} key={img.id}>
           <button className="gallery-image-button" onClick={() => ready && onOpenImage(img.id)} disabled={!ready} aria-label="Open image viewer">
             <div className="gallery-image-wrap">
-              {imagePath ? <img src={fileUrl(imagePath)} alt="Civitai example"/> : <div className="thumb placeholder">IMAGE</div>}
+              {imagePath ? <GalleryImage src={imagePath} alt="Civitai example"/> : <div className="thumb placeholder">IMAGE</div>}
               {active ? <span className="gallery-active-badge">ACTIVE THUMBNAIL</span> : null}
               {ready ? <span className="gallery-open-hint">OPEN</span> : null}
             </div>
@@ -732,6 +864,7 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
           </button>
         </div>;
       })}
+      {renderCount < images.length ? <div ref={renderSentinelRef} className="gallery-render-sentinel" aria-hidden="true" /> : null}
     </div> : <div className="empty-inline">No community gallery examples are cached yet. Use LOAD MORE EXAMPLES to retrieve them.</div>}
     {hasMore ? <button className="gallery-more-btn" onClick={() => void onFetchMore()} disabled={fetchBusy}>{fetchBusy ? 'FETCHING…' : 'LOAD MORE EXAMPLES'}</button> : <div className="gallery-end-note">END OF CIVITAI COMMUNITY EXAMPLES</div>}
   </div>;
@@ -1259,26 +1392,43 @@ function App() {
 
     let disposed = false;
     let consecutiveFailures = 0;
+    let inFlight = false;
+    let wasConnected = false;
     const checkConnection = async () => {
+      if (disposed || inFlight) return;
+      inFlight = true;
       try {
-        const status = await api.getWebAppStatus();
+        await api.checkWebHealth();
         if (disposed) return;
+        const recovered = !wasConnected;
+        wasConnected = true;
         consecutiveFailures = 0;
-        setWebStatus(status);
         setWebConnected(true);
         setWebError(null);
+
+        if (recovered) {
+          try {
+            const status = await api.getWebAppStatus();
+            if (!disposed) setWebStatus(status);
+          } catch {
+            // The dedicated health endpoint already proved connectivity.
+          }
+        }
       } catch (error) {
         if (disposed) return;
         consecutiveFailures += 1;
-        if (consecutiveFailures >= 2) {
+        if (consecutiveFailures >= 3) {
+          wasConnected = false;
           setWebConnected(false);
           setWebError(String(error));
         }
+      } finally {
+        inFlight = false;
       }
     };
 
     void checkConnection();
-    const timer = window.setInterval(() => void checkConnection(), 2500);
+    const timer = window.setInterval(() => void checkConnection(), 3000);
     const onReconnect = () => void checkConnection();
     window.addEventListener('online', onReconnect);
     window.addEventListener('focus', onReconnect);
