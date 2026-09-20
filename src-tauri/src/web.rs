@@ -237,12 +237,11 @@ fn web_url() -> String {
 }
 
 fn validate_cached_file(path: &Path, app_data: &Path) -> AppResult<PathBuf> {
-    let app_data = app_data.canonicalize().map_err(AppError::Io)?;
     let cache = crate::cache_root(app_data);
     let cache = cache.canonicalize().unwrap_or(cache);
     let path = path.canonicalize().map_err(AppError::Io)?;
-    if (!path.starts_with(&app_data) && !path.starts_with(&cache)) || !path.is_file() {
-        return Err(AppError::Invalid("Requested file is outside Raphael's allowed cache locations".into()));
+    if !path.starts_with(&cache) || !path.is_file() {
+        return Err(AppError::Invalid("Requested file is outside Raphael's configured cache".into()));
     }
     Ok(path)
 }
@@ -314,11 +313,13 @@ async fn command_handler(
         "reset_model_cover" => {
             let args: IdArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             reset_model_cover(handle.state(), handle.clone(), args.id)
+                .await
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "set_model_cover_from_image" => {
             let args: ImageArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             set_model_cover_from_image(handle.state(), handle.clone(), args.id, args.image_id)
+                .await
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "set_model_custom_cover" => {
@@ -326,7 +327,7 @@ async fn command_handler(
         }
         "delete_model" => {
             let args: IdArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            delete_model(handle.state(), handle.clone(), args.id).map(|_| json!(null))
+            delete_model(handle.state(), handle.clone(), args.id).await.map(|_| json!(null))
         }
         "get_model_images" => {
             let args: ModelImagesArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
@@ -387,19 +388,19 @@ async fn command_handler(
         "get_cache_stats" => get_cache_stats(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "set_cache_max_bytes" => {
             let args: CacheMaxBytesArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            set_cache_max_bytes(handle.state(), args.max_bytes).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+            set_cache_max_bytes(handle.state(), args.max_bytes).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         },
         "set_cache_location" => {
             let args: CacheLocationArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            set_cache_location(handle.state(), args.path).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+            set_cache_location(handle.state(), args.path).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         },
-        "clear_cache_images" => clear_cache_images(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
-        "clear_complete_cache" => clear_complete_cache(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "clear_cache_images" => clear_cache_images(handle.state()).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "clear_complete_cache" => clear_complete_cache(handle.state()).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "prune_cache_images" => {
             let args: KeepImagesArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            prune_cache_images(handle.state(), args.keep_per_model).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+            prune_cache_images(handle.state(), args.keep_per_model).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         },
-        "clean_cache_orphans" => clean_cache_orphans(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "clean_cache_orphans" => clean_cache_orphans(handle.state()).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "clear_download_progress" => {
             let args: DownloadProgressArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             clear_download_progress(handle.state(), args.task_id).map(|_| Value::Null)
