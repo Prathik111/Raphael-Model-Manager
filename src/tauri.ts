@@ -1,7 +1,7 @@
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
-import type { AppState, CivitaiImportPreview, ModelImage, ModelRecord, StorageStats } from './types';
+import type { AppState, CivitaiImportPreview, ModelImage, ModelRecord, StorageStats, LibraryCounts } from './types';
 
 export const fileUrl = (path: string) => convertFileSrc(path);
 
@@ -13,11 +13,13 @@ export const api = {
   },
   setModelsRoot: (path: string) => invoke<AppState>('set_models_root', { path }),
   listModels: (params?: { type?: string; query?: string }) => invoke<ModelRecord[]>('list_models', { ...params }),
+  getLibraryCounts: () => invoke<LibraryCounts>('get_library_counts'),
   getImages: (id: number) => invoke<ModelImage[]>('get_model_images', { id }),
   syncModelGallery: (id: number) => invoke<void>('sync_model_gallery', { id }),
   importCivitai: (url: string) => invoke<CivitaiImportPreview>('preview_civitai_import', { url }),
   installCivitai: (url: string) => invoke<ModelRecord>('install_civitai_model', { url }),
   refreshModel: (id: number) => invoke<ModelRecord>('refresh_model_civitai', { id }),
+  linkModelCivitai: (id: number, url: string) => invoke<ModelRecord>('link_model_civitai', { id, url }),
   openFolder: (path: string) => invoke<void>('open_in_file_manager', { path }),
   setCivitaiToken: (token: string) => invoke<void>('set_civitai_token', { token }),
   getCivitaiTokenSet: () => invoke<boolean>('is_civitai_token_set'),
