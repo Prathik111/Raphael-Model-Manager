@@ -1358,6 +1358,8 @@ function App() {
     const nextIndex = (currentIndex + direction + images.length) % images.length;
     setImageViewerId(images[nextIndex].id);
   };
+  const activeDownloadCount=downloadProgress.filter(item=>item.phase!=='COMPLETED'&&item.phase!=='FAILED'&&item.phase!=='ALREADY INSTALLED'&&item.phase!=='ALREADY QUEUED').length;
+  const queuedDownloadCount=downloadProgress.filter(item=>item.phase==='QUEUED').length;
   const handleBulkLinkFile = async(file: File)=>{
     setBulkBusy(true);
     setBulkMessage(null);
@@ -1428,7 +1430,7 @@ function App() {
           <div className="download-queue-header">
             <div>
               <div className="download-queue-title">DOWNLOADS</div>
-              <div className="download-queue-subtitle">{downloadProgress.length ? 'ACTIVE · QUEUED · FINISHED' : 'NO DOWNLOADS'}</div>
+              <div className="download-queue-subtitle">{downloadProgress.length ? 'ACTIVE ' + activeDownloadCount + '/' + parallelDownloads + ' · QUEUED ' + queuedDownloadCount : 'NO DOWNLOADS'}</div>
             </div>
             <span className="download-queue-count">{downloadProgress.length}</span>
           </div>
@@ -1440,8 +1442,8 @@ function App() {
         </div>
         <div className="sidebar-foot">
           <button className="settings-trigger" aria-label="Open settings" title="SETTINGS" onClick={()=>setSettingsOpen(true)}>
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0-0.9.9l-2.2-.2-.7.9.9 2c-.2.4-.4.8-.5 1.2l-2.1.7-.3 1 .3 1 2.1.7c.1.4.3.8.5 1.2l-.9 2 .7.9 2.2-.2c.3.3.6.6.9.9l-.2 2.2.9.7 2-.9c.4.2.8.4 1.2.5l.7 2.1 1 .3 1-.3.7-2.1c.4-.1.8-.3 1.2-.5l2 .9.9-.7-.2-2.2c.3-.3.6-.6.9-.9l2.2.2.7-.9-.9-2c.2-.4.4-.8.5-1.2l2.1-.7.3-1-.3-1-2.1-.7c-.1-.4-.3-.8-.5-1.2l.9-2-.7-.9-2.2.2c-.3-.3-.6-.6-.9-.9l.2-2.2-.9-.7-2 .9c-.4-.2-.8-.4-1.2-.5l-.7-2.1-1-.3-1 .3-.7 2.1c-.4.1-.8.3-1.2.5l-2-.9-.9.7.2 2.2c-.3.3-.6.6-.9.9Z"/></svg>
-          </button>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Zm0-5.2 1 .3.7 2.1c.4.1.8.3 1.2.5l2-.9.9.7-.2 2.2c.3.3.6.6.9.9l2.2-.2.7.9-.9 2c.2.4.4.8.5 1.2l2.1.7.3 1-.3 1-2.1.7a7.4 7.4 0 0 1-.5 1.2l.9 2-.7.9-2.2-.2c-.3.3-.6.6-.9.9l.2 2.2-.9.7-2-.9c-.4.2-.8.4-1.2.5l-.7 2.1-1 .3-1-.3-.7-2.1a7.4 7.4 0 0 1-1.2-.5l-2 .9-.9-.7.2-2.2a7.2 7.2 0 0 1-.9-.9l-2.2.2-.7-.9.9-2c-.2-.4-.4-.8-.5-1.2l-2.1-.7-.3-1 .3-1 2.1-.7c.1-.4.3-.8.5-1.2l-.9-2 .7-.9 2.2.2c.3-.3.6-.6.9-.9l-.2-2.2.9-.7 2 .9c.4-.2.8-.4 1.2-.5l.7-2.1 1-.3Z"/></svg>
+        </button>
         </div>
       </aside>
       <main className="library"><div className="library-head"><div><div className="eyebrow">{type.toUpperCase()}</div><h1>{type==='All'?'MODEL LIBRARY':type.toUpperCase()}</h1></div><div className="library-tools"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search models, tags, tag:…"/><button className={`tag-filter-button ${activeTags.length?'active':''}`} onClick={()=>setTagPanelOpen(v=>!v)}>TAGS{activeTags.length ? ` · ${activeTags.length}` : ''}</button><button className="import-btn" onClick={()=>{setImportClosing(false);setImportError(null);setImportUrl('');setImportType('Other');setCustomDownloadPath(false);setDownloadPath('');setPreview({model:{},version:{id:0,name:'',base_model:null,download_url:'',filename:null,size_bytes:null,activation_prompts:[]},target_directory:'',thumbnail_path:null});}}>IMPORT CIVITAI</button><select value={sort} onChange={e=>setSort(e.target.value)}><option value="name">NAME</option><option value="size">SIZE</option><option value="path">PATH</option></select></div>{tagPanelOpen && <TagFilterPanel tags={allTags} activeTags={activeTags} onToggle={tag=>setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current.filter(x=>x.toLowerCase()!==tag.toLowerCase()):[...current,tag])} onClear={()=>setActiveTags([])}/>}</div>{activeTags.length ? <div className="active-tag-bar">{activeTags.map(tag=><button key={tag} onClick={()=>setActiveTags(current=>current.filter(x=>x.toLowerCase()!==tag.toLowerCase()))}>{tag}<span>×</span></button>)}<span className="active-tag-help">TAG FILTERS</span></div> : null}<div className="grid">{models.map(m=><ModelCard key={m.id} model={m} selected={m.id===selectedId} onClick={()=>setSelectedId(m.id)}/>)}{!models.length&&<div className="empty-state">No models match the current view.</div>}</div></main>
