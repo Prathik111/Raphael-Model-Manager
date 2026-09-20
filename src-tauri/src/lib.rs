@@ -1828,7 +1828,7 @@ fn set_model_cover_from_image(
 #[tauri::command]
 fn get_model_images(app: State<AppStateInner>, id: i64, limit: Option<i64>) -> AppResult<ModelImagesResponse> {
     let c = open_db(&app.app_data)?;
-    let limit = limit.unwrap_or(20).clamp(1, 200);
+    let limit = limit.unwrap_or(20).clamp(1, 1000);
     let mut stmt = c.prepare(
         "SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json
          FROM images
@@ -2203,7 +2203,7 @@ async fn sync_gallery_inner(
     target_count: i64,
 ) -> AppResult<bool> {
     let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
-    let target_count = target_count.clamp(1, 200);
+    let target_count = target_count.clamp(1, 1000);
     let model = { let c = open_db(&app.app_data)?; model_by_id(&c, model_id)? };
     let civitai_id = match model.civitai_model_id { Some(x) => x, None => return Ok(false) };
     let cache = cache_root(&app.app_data).join(civitai_id.to_string());
@@ -2212,7 +2212,11 @@ async fn sync_gallery_inner(
     let client = civitai_client(&app)?;
     let mut cached_count: i64 = {
         let c = open_db(&app.app_data)?;
-        c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1", [model_id], |r| r.get(0))?
+        c.query_row(
+            "SELECT COUNT(*) FROM images WHERE model_id=?1 AND meta_json NOT LIKE '%\"featured\":true%'",
+            [model_id],
+            |r| r.get(0),
+        )?
     };
     let has_more = loop {
         let mut url = format!("{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true");
@@ -2345,7 +2349,7 @@ async fn load_more_model_examples(
         app.inner().clone(),
         id,
         handle,
-        current_count.saturating_add(requested).clamp(1, 300),
+        current_count.saturating_add(requested).clamp(1, 1000),
     ).await
 }
 
