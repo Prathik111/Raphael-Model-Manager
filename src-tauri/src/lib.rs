@@ -1265,6 +1265,7 @@ async fn sync_featured_examples_inner(
     handle: AppHandle,
     progress_model: Option<(usize, usize)>,
     maintain_cache: bool,
+    emit_model_change: bool,
 ) -> AppResult<usize> {
     let model_record = { let c = open_db(&app.app_data)?; model_by_id(&c, model_id)? };
     let civitai_id = model_record.civitai_model_id.ok_or_else(|| AppError::Invalid("This model is not linked to Civitai".into()))?;
@@ -1384,11 +1385,7 @@ async fn sync_featured_examples_inner(
             if let Some((image_id,record)) = reused {
                 records.push(record);
                 saved_count+=1;
-                emit_examples_progress(&handle,ExamplesRefreshProgress{
-                    current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                    version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                    status:format!("Reused cached featured image {image_id}"),done:false,error:None
-                });
+
             } else {
                 jobs.push((remote,image_id,image));
             }
@@ -1417,35 +1414,28 @@ async fn sync_featured_examples_inner(
                 }
                 FeaturedDownloadResult::DownloadFailed(error) => {
                     download_failures+=1;
-                    let _=handle.emit("examples-refresh-progress",ExamplesRefreshProgress{
-                        current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                        version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                        status:format!("Could not download featured image {image_id}"),done:false,error:Some(error)
-                    });
+                    if first_image_error.is_none() { first_image_error=Some(error); }
                 }
                 FeaturedDownloadResult::ReadFailed(error) => {
                     read_failures+=1;
-                    let _=handle.emit("examples-refresh-progress",ExamplesRefreshProgress{
-                        current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                        version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                        status:format!("Could not read featured image {image_id}"),done:false,error:Some(error)
-                    });
+                    if first_image_error.is_none() { first_image_error=Some(error); }
                 }
                 FeaturedDownloadResult::EmptyResponse => {
                     empty_responses+=1;
                 }
                 FeaturedDownloadResult::InvalidImage(error) => {
                     read_failures+=1;
-                    let _=handle.emit("examples-refresh-progress",ExamplesRefreshProgress{
-                        current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                        version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                        status:format!("Could not identify featured image {image_id}"),done:false,error:Some(error)
-                    });
+                    if first_image_error.is_none() { first_image_error=Some(error); }
                 }
             }
         }
 
-        emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index+1,version_total:total_versions,images_saved:saved_count,status:format!("Saved featured examples from {version_name} ({} failures)",download_failures+read_failures+empty_responses),done:false,error:None});
+        emit_examples_progress(&handle,ExamplesRefreshProgress{
+            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+            version_current:version_index+1,version_total:total_versions,images_saved:saved_count,
+            status:format!("Finished {version_name}: {saved_count} images ready, {} failures",download_failures+read_failures+empty_responses),
+            done:false,error:first_image_error.clone(),
+        });
     }
 
     if records.is_empty(){
@@ -1550,7 +1540,9 @@ async fn sync_featured_examples_inner(
                 if let Ok(c)=open_db(&app.app_data){let _=put_setting(&c,"cache_bytes",&bytes.to_string());}
                 let _=enforce_cache_limit_inner(&app.app_data);
             }
-            let _=handle.emit("models-changed",());
+            if emit_model_change {
+                let _=handle.emit("models-changed",());
+            }
             Ok(saved_count)
         }
         Err(error)=>{let _=fs::remove_dir_all(&active);if backup.exists(){let _=fs::rename(&backup,&active);}Err(error)}
@@ -2742,7 +2734,7 @@ async fn link_model_civitai(
     };
     let _=handle.emit("models-changed",());
     drop(_guard);
-    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None, true).await?;
+    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None, true, true).await?;
     Ok(rec)
 }
 
@@ -2884,7 +2876,7 @@ fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResu
                     version_current:0,version_total:0,images_saved:0,
                     status:format!("Refreshing {name}"),done:false,error:None,
                 });
-                let result=sync_featured_examples_inner(state,local_id,handle,Some((index,total)),false).await;
+                let result=sync_featured_examples_inner(state,local_id,handle,Some((index,total)),false,false).await;
                 (local_id,name,result)
             }
         }))
