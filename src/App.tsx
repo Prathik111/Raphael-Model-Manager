@@ -1299,6 +1299,8 @@ function App() {
       if(selectedIdRef.current!==modelId) return;
       setImages(next.images);
       setGalleryHasMore(more);
+    } catch {
+      if(selectedIdRef.current===modelId) setGalleryHasMore(true);
     } finally {
       setGalleryFetchBusy(false);
     }
