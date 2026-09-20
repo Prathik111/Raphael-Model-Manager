@@ -5,13 +5,15 @@ import type {
   AppState,
   CivitaiImportPreview,
   DownloadProgress,
-  ModelImage,
   ModelRecord,
   StorageStats,
   LibraryCounts,
   TagRecord,
   WebAppStatus,
   ExamplesRefreshProgress,
+  ModelImagesResponse,
+  CacheStats,
+  CacheOperationResult,
 } from './types';
 
 export const isWebApp = typeof window !== 'undefined' && !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
@@ -51,6 +53,11 @@ export const api = {
     const result = await open({ directory: true, multiple: false, title: 'Choose model download folder', defaultPath });
     return Array.isArray(result) ? result[0] ?? null : result;
   },
+  chooseCacheDirectory: async (defaultPath?: string) => {
+    if (isWebApp) throw new Error('Folder browsing is only available in the Raphael desktop app.');
+    const result = await open({ directory: true, multiple: false, title: 'Select Raphael cache folder', defaultPath });
+    return Array.isArray(result) ? result[0] ?? null : result;
+  },
   chooseImageFile: async () => {
     if (isWebApp) throw new Error('Custom cover selection is only available in the Raphael desktop app.');
     const result = await open({
@@ -82,11 +89,19 @@ export const api = {
   deleteModel: (id: number) =>
     command<void>('delete_model', { id }),
   getImages: (id: number, limit = 20) =>
-    command<ModelImage[]>('get_model_images', { id, limit }),
+    command<ModelImagesResponse>('get_model_images', { id, limit }),
   syncModelGallery: (id: number, targetCount = 20) =>
     command<boolean>('sync_model_gallery', { id, targetCount }),
+  loadMoreModelExamples: (id: number, amount?: number) =>
+    command<boolean>('load_more_model_examples', { id, targetCount: amount }),
+  getExampleLoadAmount: () =>
+    command<number>('get_example_load_amount'),
+  setExampleLoadAmount: (amount: number) =>
+    command<number>('set_example_load_amount', { amount }),
   refreshAllExamples: () =>
-    command<void>('refresh_all_examples'),
+    command<ExamplesRefreshProgress>('refresh_all_examples'),
+  getExamplesRefreshStatus: () =>
+    command<ExamplesRefreshProgress | null>('get_examples_refresh_status'),
   importCivitai: (url: string) =>
     command<CivitaiImportPreview>('preview_civitai_import', { url }),
   installCivitai: (
@@ -119,6 +134,20 @@ export const api = {
     command<boolean>('is_civitai_token_set'),
   getStorage: () =>
     command<StorageStats>('get_storage_stats'),
+  getCacheStats: () =>
+    command<CacheStats>('get_cache_stats'),
+  setCacheMaxBytes: (maxBytes: number) =>
+    command<CacheStats>('set_cache_max_bytes', { maxBytes }),
+  setCacheLocation: (path: string) =>
+    command<CacheStats>('set_cache_location', { path }),
+  clearCacheImages: () =>
+    command<CacheOperationResult>('clear_cache_images'),
+  clearCompleteCache: () =>
+    command<CacheOperationResult>('clear_complete_cache'),
+  pruneCacheImages: (keepPerModel: number) =>
+    command<CacheOperationResult>('prune_cache_images', { keepPerModel }),
+  cleanCacheOrphans: () =>
+    command<CacheOperationResult>('clean_cache_orphans'),
   getWebAppStatus: async () => {
     if (!isWebApp) return invoke<WebAppStatus>('get_web_app_status');
     const response = await fetch('/api/status');
@@ -142,7 +171,25 @@ export async function subscribeToModelChanges(cb: () => void) {
 
 export async function subscribeToExamplesRefresh(cb: (progress: ExamplesRefreshProgress) => void) {
   if (isWebApp) {
-    return () => {};
+    let disposed = false;
+    const poll = async () => {
+      try {
+        const response = await fetch('/api/command/get_examples_refresh_status', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        });
+        if (!response.ok) return;
+        const payload = await response.json().catch(() => null);
+        if (!disposed && payload) cb(payload as ExamplesRefreshProgress);
+      } catch {}
+    };
+    await poll();
+    const timer = window.setInterval(() => void poll(), 750);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
   }
   return listen<ExamplesRefreshProgress>('examples-refresh-progress', event => cb(event.payload));
 }

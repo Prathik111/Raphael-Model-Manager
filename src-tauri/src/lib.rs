@@ -15,6 +15,7 @@ use std::{
     sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use thiserror::Error;
 use url::Url;
@@ -23,7 +24,6 @@ use walkdir::WalkDir;
 mod web;
 
 const API_BASE: &str = "https://civitai.com/api/v1";
-const IMAGE_CDN_BASE: &str = "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA";
 const USER_AGENT: &str = "RaphaelModelManager/0.1.0";
 static DOWNLOAD_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -64,7 +64,8 @@ struct AppStateInner {
     active_download_paths: Arc<Mutex<HashSet<PathBuf>>>,
     active_downloads: Arc<Mutex<usize>>,
     parallel_downloads: Arc<Mutex<usize>>,
-    examples_refresh_lock: Arc<Mutex<bool>>,
+    examples_refresh_state: Arc<Mutex<ExamplesRefreshState>>,
+    cache_lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -89,13 +90,14 @@ struct ModelRecord {
     source_hash: Option<String>,
     thumbnail_path: Option<String>,
     cover_path: Option<String>,
+    cover_source_image_id: Option<i64>,
     cover_position_x: f64,
     cover_position_y: f64,
     downloaded_at: i64,
     updated_at: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct ModelImage {
     id: i64,
     civitai_image_id: i64,
@@ -114,6 +116,33 @@ struct ModelImage {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CategoryStats { r#type: String, count: i64, bytes: i64 }
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct CacheStats {
+    pub(crate) location: String,
+    pub(crate) used_bytes: i64,
+    pub(crate) max_bytes: i64,
+    pub(crate) over_limit: bool,
+    pub(crate) files: i64,
+    pub(crate) image_files: i64,
+    pub(crate) image_bytes: i64,
+    pub(crate) featured_files: i64,
+    pub(crate) featured_bytes: i64,
+    pub(crate) gallery_files: i64,
+    pub(crate) gallery_bytes: i64,
+    pub(crate) thumbnail_files: i64,
+    pub(crate) thumbnail_bytes: i64,
+    pub(crate) cover_files: i64,
+    pub(crate) cover_bytes: i64,
+    pub(crate) other_files: i64,
+    pub(crate) other_bytes: i64,
+}
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct CacheOperationResult {
+    pub(crate) deleted_files: i64,
+    pub(crate) freed_bytes: i64,
+    pub(crate) remaining_bytes: i64,
+    pub(crate) over_limit: bool,
+}
 #[derive(Debug, Serialize, Deserialize)]
 struct StorageStats { total_model_bytes: i64, cached_bytes: i64, categories: Vec<CategoryStats> }
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,6 +187,17 @@ struct ExamplesRefreshProgress {
     error: Option<String>,
 }
 
+#[derive(Clone, Default)]
+struct ExamplesRefreshState {
+    progress: Option<ExamplesRefreshProgress>,
+    running: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ModelImagesResponse {
+    images: Vec<ModelImage>,
+    has_more: bool,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CivitaiEnvelope { metadata: Option<Value>, items: Vec<Value> }
@@ -273,7 +313,22 @@ async fn acquire_download_slot(state: &AppStateInner) -> AppResult<DownloadSlot>
 }
 
 fn db_path(app_data: &Path) -> PathBuf { app_data.join("raphael.db") }
-fn cache_root(app_data: &Path) -> PathBuf { app_data.join("cache").join("civitai") }
+fn cache_base_default(app_data: &Path) -> PathBuf { app_data.join("cache") }
+pub(crate) fn cache_root(app_data: &Path) -> PathBuf {
+    let fallback = cache_base_default(app_data);
+    let connection = match Connection::open(db_path(app_data)) {
+        Ok(value) => value,
+        Err(_) => return fallback,
+    };
+    let _ = connection.busy_timeout(Duration::from_secs(5));
+    setting(&connection, "cache_location")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or(fallback)
+}
 fn open_db(app_data: &Path) -> AppResult<Connection> {
     fs::create_dir_all(app_data)?;
     let c = Connection::open(db_path(app_data))?;
@@ -307,6 +362,7 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
         cover_path TEXT,
         cover_position_x REAL NOT NULL DEFAULT 50,
         cover_position_y REAL NOT NULL DEFAULT 50,
+        cover_source_image_id INTEGER,
         downloaded_at INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_models_type ON models(model_type);
@@ -326,6 +382,7 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
         sampler TEXT,
         seed INTEGER,
         meta_json TEXT,
+        cached_at INTEGER NOT NULL DEFAULT 0,
         UNIQUE(model_id, civitai_image_id)
       );
     "#)?;
@@ -341,12 +398,21 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
     if has_cover_x==0 { c.execute("ALTER TABLE models ADD COLUMN cover_position_x REAL NOT NULL DEFAULT 50",[])?; }
     let has_cover_y:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_position_y'",[],|r|r.get(0))?;
     if has_cover_y==0 { c.execute("ALTER TABLE models ADD COLUMN cover_position_y REAL NOT NULL DEFAULT 50",[])?; }
+    let has_cover_source_image_id:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_source_image_id'",[],|r|r.get(0))?;
+    if has_cover_source_image_id==0 { c.execute("ALTER TABLE models ADD COLUMN cover_source_image_id INTEGER",[])?; }
     let has_downloaded_at:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='downloaded_at'",[],|r|r.get(0))?;
     if has_downloaded_at==0 {
         c.execute("ALTER TABLE models ADD COLUMN downloaded_at INTEGER NOT NULL DEFAULT 0",[])?;
         c.execute("UPDATE models SET downloaded_at=?1 WHERE downloaded_at=0",[now()])?;
     }
+    let has_cached_at:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('images') WHERE name='cached_at'",[],|r|r.get(0))?;
+    if has_cached_at==0 {
+        c.execute("ALTER TABLE images ADD COLUMN cached_at INTEGER NOT NULL DEFAULT 0",[])?;
+        c.execute("UPDATE images SET cached_at=?1 WHERE cached_at=0",[now()])?;
+    }
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('parallel_downloads','3')",[])?;
+    c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('cache_max_bytes','0')",[])?;
+    c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('example_load_amount','20')",[])?;
     Ok(c)
 }
 
@@ -361,6 +427,425 @@ fn put_setting(c: &Connection, key: &str, value: &str) -> AppResult<()> {
 fn clamp_parallel_downloads(value: i64) -> i64 { value.clamp(1, 8) }
 fn read_parallel_downloads(c: &Connection) -> AppResult<usize> {
     Ok(setting(c, "parallel_downloads")?.and_then(|value| value.parse::<i64>().ok()).map(clamp_parallel_downloads).unwrap_or(3) as usize)
+}
+
+
+fn read_example_load_amount(c: &Connection) -> AppResult<i64> {
+    Ok(setting(c, "example_load_amount")?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100))
+}
+
+fn read_cache_max_bytes(c: &Connection) -> AppResult<i64> {
+    Ok(setting(c, "cache_max_bytes")?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0))
+}
+
+fn cache_file_counts(path: &Path) -> (i64, i64) {
+    if !path.exists() { return (0, 0); }
+    let mut files = 0i64;
+    let mut bytes = 0i64;
+    for entry in WalkDir::new(path).follow_links(false).into_iter().filter_map(Result::ok) {
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                files += 1;
+                bytes += meta.len() as i64;
+            }
+        }
+    }
+    (files, bytes)
+}
+
+fn cache_stats_inner(app_data: &Path) -> AppResult<CacheStats> {
+    let c = open_db(app_data)?;
+    let root = cache_root(app_data);
+    let max_bytes = read_cache_max_bytes(&c)?;
+    let mut stats = CacheStats {
+        location: root.to_string_lossy().to_string(),
+        used_bytes: 0,
+        max_bytes,
+        over_limit: false,
+        files: 0,
+        image_files: 0,
+        image_bytes: 0,
+        featured_files: 0,
+        featured_bytes: 0,
+        gallery_files: 0,
+        gallery_bytes: 0,
+        thumbnail_files: 0,
+        thumbnail_bytes: 0,
+        cover_files: 0,
+        cover_bytes: 0,
+        other_files: 0,
+        other_bytes: 0,
+    };
+    if !root.exists() { return Ok(stats); }
+
+    for entry in WalkDir::new(&root).follow_links(false).into_iter().filter_map(Result::ok) {
+        let meta = match entry.metadata() {
+            Ok(value) if value.is_file() => value,
+            _ => continue,
+        };
+        let bytes = meta.len() as i64;
+        stats.files += 1;
+        stats.used_bytes += bytes;
+        let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+        let components: Vec<String> = relative.components()
+            .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_ascii_lowercase()))
+            .collect();
+
+        if components.first().map(String::as_str) == Some("covers") {
+            stats.cover_files += 1;
+            stats.cover_bytes += bytes;
+        } else if components.first().map(String::as_str) == Some("civitai") {
+            stats.image_files += 1;
+            stats.image_bytes += bytes;
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if components.iter().any(|c| c == "featured") ||
+               components.iter().any(|c| c == "featured.__staging" || c == "featured.__backup") {
+                stats.featured_files += 1;
+                stats.featured_bytes += bytes;
+            } else if name.starts_with("thumbnail.") || name.contains("_thumb.") {
+                stats.thumbnail_files += 1;
+                stats.thumbnail_bytes += bytes;
+            } else {
+                stats.gallery_files += 1;
+                stats.gallery_bytes += bytes;
+            }
+        } else {
+            stats.other_files += 1;
+            stats.other_bytes += bytes;
+        }
+    }
+    stats.over_limit = stats.max_bytes > 0 && stats.used_bytes > stats.max_bytes;
+    Ok(stats)
+}
+
+fn remove_path_with_stats(path: &Path) -> AppResult<(i64, i64)> {
+    if !path.exists() { return Ok((0, 0)); }
+    let (files, bytes) = cache_file_counts(path);
+    if path.is_dir() { fs::remove_dir_all(path)?; } else { fs::remove_file(path)?; }
+    Ok((files, bytes))
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> AppResult<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = target.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else if kind.is_file() {
+            fs::copy(&src, &dst)?;
+        } else if kind.is_symlink() {
+            return Err(AppError::Invalid(format!(
+                "Cache relocation encountered an unsupported symbolic link: {}",
+                src.to_string_lossy()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_cache_paths(
+    c: &mut Connection,
+    old_root: &Path,
+    new_root: &Path,
+    cache_bytes: i64,
+) -> AppResult<()> {
+    let old = old_root.to_string_lossy().to_string();
+    let new = new_root.to_string_lossy().to_string();
+    let separator = std::path::MAIN_SEPARATOR.to_string();
+    let alternate_separator = if separator == "/" { "\\".to_string() } else { "/".to_string() };
+    let tx = c.transaction()?;
+
+    for column in ["local_path", "thumbnail_path"] {
+        let sql = format!(
+            "UPDATE images SET {column}=?2 || substr({column}, length(?1)+1)
+             WHERE {column}=?1
+                OR substr({column},1,length(?1)+1)=?1 || ?3
+                OR substr({column},1,length(?1)+1)=?1 || ?4"
+        );
+        tx.execute(&sql, params![old, new, separator, alternate_separator])?;
+    }
+    for column in ["thumbnail_path", "cover_path"] {
+        let sql = format!(
+            "UPDATE models SET {column}=?2 || substr({column}, length(?1)+1)
+             WHERE {column}=?1
+                OR substr({column},1,length(?1)+1)=?1 || ?3
+                OR substr({column},1,length(?1)+1)=?1 || ?4"
+        );
+        tx.execute(&sql, params![old, new, separator, alternate_separator])?;
+    }
+    tx.execute(
+        "INSERT INTO settings(key,value) VALUES('cache_location',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [&new],
+    )?;
+    tx.execute(
+        "INSERT INTO settings(key,value) VALUES('cache_bytes',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [cache_bytes.to_string()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn delete_image_records(c: &mut Connection, cache_root: &Path, ids: &[i64]) -> AppResult<(i64, i64)> {
+    if ids.is_empty() { return Ok((0, 0)); }
+    let mut paths = HashSet::<PathBuf>::new();
+    for id in ids {
+        if let Ok((local, thumb)) = c.query_row(
+            "SELECT local_path,thumbnail_path FROM images WHERE id=?1",
+            [id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+        ) {
+            if let Some(value) = local { paths.insert(PathBuf::from(value)); }
+            if let Some(value) = thumb { paths.insert(PathBuf::from(value)); }
+        }
+    }
+    {
+        let tx = c.transaction()?;
+        for id in ids { tx.execute("DELETE FROM images WHERE id=?1", [id])?; }
+        tx.commit()?;
+    }
+
+    let canonical_root = cache_root.canonicalize().unwrap_or_else(|_| cache_root.to_path_buf());
+    let mut deleted_files = 0i64;
+    let mut freed_bytes = 0i64;
+    for path in paths {
+        if !path.is_file() { continue; }
+        let canonical_path = match path.canonicalize() { Ok(value) => value, Err(_) => continue };
+        if !canonical_path.starts_with(&canonical_root) { continue; }
+        let value = path.to_string_lossy().to_string();
+        let image_refs: i64 = c.query_row(
+            "SELECT COUNT(*) FROM images WHERE local_path=?1 OR thumbnail_path=?1",
+            [&value], |r| r.get(0),
+        )?;
+        let model_refs: i64 = c.query_row(
+            "SELECT COUNT(*) FROM models WHERE thumbnail_path=?1 OR cover_path=?1",
+            [&value], |r| r.get(0),
+        )?;
+        if image_refs == 0 && model_refs == 0 {
+            let bytes = fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
+            fs::remove_file(&path)?;
+            deleted_files += 1;
+            freed_bytes += bytes;
+        }
+    }
+    Ok((deleted_files, freed_bytes))
+}
+
+fn referenced_cache_paths(c: &Connection) -> AppResult<HashSet<PathBuf>> {
+    let mut paths = HashSet::new();
+    for sql in [
+        "SELECT local_path FROM images WHERE local_path IS NOT NULL",
+        "SELECT thumbnail_path FROM images WHERE thumbnail_path IS NOT NULL",
+        "SELECT thumbnail_path FROM models WHERE thumbnail_path IS NOT NULL",
+        "SELECT cover_path FROM models WHERE cover_path IS NOT NULL",
+    ] {
+        let mut stmt = c.prepare(sql)?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for value in rows.flatten() {
+            let path = PathBuf::from(value);
+            if let Ok(canonical) = path.canonicalize() {
+                paths.insert(canonical);
+            }
+            paths.insert(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn clean_cache_orphans_inner(app_data: &Path) -> AppResult<CacheOperationResult> {
+    let root = cache_root(app_data);
+    let c = open_db(app_data)?;
+    let references = referenced_cache_paths(&c)?;
+    let mut deleted_files = 0i64;
+    let mut freed_bytes = 0i64;
+    if root.exists() {
+        for entry in WalkDir::new(&root).follow_links(false).into_iter().filter_map(Result::ok) {
+            let path = entry.path();
+            let referenced = references.contains(path)
+                || path.canonicalize().map(|canonical| references.contains(&canonical)).unwrap_or(false);
+            if !path.is_file() || referenced { continue; }
+            let bytes = fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
+            if fs::remove_file(path).is_ok() {
+                deleted_files += 1;
+                freed_bytes += bytes;
+            }
+        }
+    }
+    for stale in [root.join("civitai").join("featured.__staging"),root.join("civitai").join("featured.__backup")] {
+        if let Ok((files,bytes))=remove_path_with_stats(&stale) {
+            deleted_files+=files;
+            freed_bytes+=bytes;
+        }
+    }
+    let stats = cache_stats_inner(app_data)?;
+    Ok(CacheOperationResult { deleted_files, freed_bytes, remaining_bytes: stats.used_bytes, over_limit: stats.over_limit })
+}
+
+fn enforce_cache_limit_inner(app_data: &Path) -> AppResult<CacheOperationResult> {
+    let initial = cache_stats_inner(app_data)?;
+    if initial.max_bytes == 0 || initial.used_bytes <= initial.max_bytes {
+        return Ok(CacheOperationResult { deleted_files: 0, freed_bytes: 0, remaining_bytes: initial.used_bytes, over_limit: false });
+    }
+
+    let mut c = open_db(app_data)?;
+    let root = cache_root(app_data);
+    let mut stmt = c.prepare(
+        "SELECT i.id FROM images i
+         WHERE NOT EXISTS (SELECT 1 FROM models m WHERE m.cover_source_image_id=i.id)
+         ORDER BY CASE WHEN i.meta_json LIKE '%\"featured\":true%' THEN 1 ELSE 0 END, i.cached_at ASC, i.id ASC"
+    )?;
+    let ids: Vec<i64> = stmt.query_map([], |r| r.get(0))?.filter_map(Result::ok).collect();
+    drop(stmt);
+
+    let mut deleted_files = 0i64;
+    let mut freed_bytes = 0i64;
+    let mut current_bytes = initial.used_bytes;
+    for id in ids {
+        if current_bytes <= initial.max_bytes { break; }
+        let (files, bytes) = delete_image_records(&mut c, &root.join("civitai"), &[id])?;
+        deleted_files += files;
+        freed_bytes += bytes;
+        current_bytes = current_bytes.saturating_sub(bytes);
+    }
+
+    if current_bytes > initial.max_bytes {
+        let result = clean_cache_orphans_inner(app_data)?;
+        deleted_files += result.deleted_files;
+        freed_bytes += result.freed_bytes;
+    }
+
+    let stats = cache_stats_inner(app_data)?;
+    Ok(CacheOperationResult { deleted_files, freed_bytes, remaining_bytes: stats.used_bytes, over_limit: stats.over_limit })
+}
+
+fn set_cache_max_bytes_inner(app_data: &Path, value: i64) -> AppResult<CacheStats> {
+    let value = value.max(0);
+    let c = open_db(app_data)?;
+    put_setting(&c, "cache_max_bytes", &value.to_string())?;
+    drop(c);
+    let _ = enforce_cache_limit_inner(app_data)?;
+    cache_stats_inner(app_data)
+}
+
+fn clear_cache_images_inner(app_data: &Path) -> AppResult<CacheOperationResult> {
+    let root = cache_root(app_data);
+    let image_root = root.join("civitai");
+    let (deleted_files, freed_bytes) = remove_path_with_stats(&image_root)?;
+    fs::create_dir_all(&image_root)?;
+    let c = open_db(app_data)?;
+    c.execute_batch("DELETE FROM images;")?;
+    c.execute("UPDATE models SET thumbnail_path=NULL,cover_source_image_id=NULL", [])?;
+    let stats = cache_stats_inner(app_data)?;
+    Ok(CacheOperationResult { deleted_files, freed_bytes, remaining_bytes: stats.used_bytes, over_limit: stats.over_limit })
+}
+
+fn clear_complete_cache_inner(app_data: &Path) -> AppResult<CacheOperationResult> {
+    let root = cache_root(app_data);
+    let (deleted_files, freed_bytes) = remove_path_with_stats(&root)?;
+    fs::create_dir_all(root.join("civitai"))?;
+    fs::create_dir_all(root.join("covers"))?;
+    let c = open_db(app_data)?;
+    c.execute_batch("DELETE FROM images;")?;
+    c.execute(
+        "UPDATE models SET thumbnail_path=NULL,cover_path=NULL,cover_source_image_id=NULL",
+        [],
+    )?;
+    let _ = put_setting(&c, "cache_bytes", "0");
+    let stats = cache_stats_inner(app_data)?;
+    Ok(CacheOperationResult { deleted_files, freed_bytes, remaining_bytes: stats.used_bytes, over_limit: stats.over_limit })
+}
+
+fn prune_cache_images_inner(app_data: &Path, keep_per_model: i64) -> AppResult<CacheOperationResult> {
+    let keep = keep_per_model.clamp(0, 10000);
+    let mut c = open_db(app_data)?;
+    let root = cache_root(app_data);
+    let model_ids: Vec<i64> = {
+        let mut stmt = c.prepare("SELECT DISTINCT model_id FROM images ORDER BY model_id")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.filter_map(Result::ok).collect()
+    };
+    let mut deleted_files = 0i64;
+    let mut freed_bytes = 0i64;
+
+    for model_id in model_ids {
+        let mut stmt = c.prepare(
+            "SELECT i.id FROM images i
+             WHERE i.model_id=?1
+               AND NOT EXISTS (SELECT 1 FROM models m WHERE m.cover_source_image_id=i.id)
+             ORDER BY CASE WHEN i.meta_json LIKE '%\"featured\":true%' THEN 0 ELSE 1 END, i.cached_at DESC, i.id DESC"
+        )?;
+        let ids: Vec<i64> = stmt.query_map([model_id], |r| r.get(0))?.filter_map(Result::ok).collect();
+        drop(stmt);
+        if ids.len() <= keep as usize { continue; }
+        let remove_ids: Vec<i64> = ids.into_iter().skip(keep as usize).collect();
+        let (files, bytes) = delete_image_records(&mut c, &root.join("civitai"), &remove_ids)?;
+        deleted_files += files;
+        freed_bytes += bytes;
+    }
+
+    let orphan_result=clean_cache_orphans_inner(app_data)?;
+    deleted_files+=orphan_result.deleted_files;
+    freed_bytes+=orphan_result.freed_bytes;
+    let stats = cache_stats_inner(app_data)?;
+    Ok(CacheOperationResult { deleted_files, freed_bytes, remaining_bytes: stats.used_bytes, over_limit: stats.over_limit })
+}
+
+fn set_cache_location_inner(app_data: &Path, path: &str) -> AppResult<CacheStats> {
+    let target = PathBuf::from(path.trim());
+    if target.as_os_str().is_empty() || !target.is_absolute() {
+        return Err(AppError::Invalid("Cache location must be an absolute folder path".into()));
+    }
+    fs::create_dir_all(&target)?;
+    let old = cache_root(app_data);
+    if !old.exists() { fs::create_dir_all(&old)?; }
+    let old_canonical = old.canonicalize().unwrap_or_else(|_| old.clone());
+    let target_canonical = target.canonicalize().unwrap_or_else(|_| target.clone());
+
+    if old_canonical == target_canonical {
+        let mut c = open_db(app_data)?;
+        let bytes = dir_size(&target_canonical);
+        rewrite_cache_paths(&mut c, &old, &target, bytes)?;
+        return cache_stats_inner(app_data);
+    }
+    if target_canonical.starts_with(&old_canonical) || old_canonical.starts_with(&target_canonical) {
+        return Err(AppError::Invalid("The new cache location cannot contain the current cache location or be inside it".into()));
+    }
+    if fs::read_dir(&target_canonical)?.next().is_some() {
+        return Err(AppError::Invalid("Choose an empty folder for the new Raphael cache location".into()));
+    }
+
+    let before = cache_file_counts(&old);
+    copy_dir_recursive(&old, &target_canonical)?;
+    let after = cache_file_counts(&target_canonical);
+    if before != after {
+        let _ = fs::remove_dir_all(&target_canonical);
+        return Err(AppError::Invalid("Cache relocation verification failed; the original cache was preserved".into()));
+    }
+
+    let db_update = (|| {
+        let mut c = open_db(app_data)?;
+        let bytes = dir_size(&target_canonical);
+        rewrite_cache_paths(&mut c, &old, &target, bytes)?;
+        Ok::<(), AppError>(())
+    })();
+
+    if let Err(error) = db_update {
+        let _ = fs::remove_dir_all(&target_canonical);
+        return Err(error);
+    }
+
+    let _ = fs::remove_dir_all(&old);
+    cache_stats_inner(app_data)
 }
 
 fn file_type_from_path(path: &Path, root: &Path) -> String {
@@ -398,11 +883,26 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
     let _guard = app.scan_lock.lock().unwrap();
     let c = open_db(&app.app_data)?;
     let mut seen = Vec::<String>::new();
-    for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(Result::ok) {
+    let mut scan_complete = true;
+
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                scan_complete = false;
+                continue;
+            }
+        };
         if !entry.file_type().is_file() || !is_model_file(entry.path()) { continue; }
         let path = entry.path().to_path_buf();
         let path_s = path.to_string_lossy().to_string();
-        let meta = match fs::metadata(&path) { Ok(m)=>m, Err(_)=>continue };
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => {
+                scan_complete = false;
+                continue;
+            }
+        };
         let size = meta.len() as i64;
         let modified = mtime(&path);
         seen.push(path_s.clone());
@@ -423,10 +923,24 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
             c.execute("INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,source_hash,updated_at,downloaded_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![path_s,rel,filename,mtype,size,modified,hash,now(),now()])?;
         }
     }
+
+    prune_unseen_models(&c, &seen, scan_complete)?;
+
+    Ok(())
+}
+
+fn prune_unseen_models(c: &Connection, seen: &[String], scan_complete: bool) -> AppResult<()> {
+    if !scan_complete {
+        return Ok(());
+    }
     let mut stmt = c.prepare("SELECT path FROM models")?;
     let existing: Vec<String> = stmt.query_map([], |r| r.get(0))?.filter_map(Result::ok).collect();
     drop(stmt);
-    for path in existing { if !seen.contains(&path) { c.execute("DELETE FROM models WHERE path=?1", [&path])?; } }
+    for path in existing {
+        if !seen.contains(&path) {
+            c.execute("DELETE FROM models WHERE path=?1", [&path])?;
+        }
+    }
     Ok(())
 }
 
@@ -445,16 +959,16 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
         creator:r.get(13)?, description:r.get(14)?, tags:serde_json::from_str(&tags).unwrap_or_default(),
         activation_prompts:serde_json::from_str(&activ).unwrap_or_default(), source_hash:r.get(17)?,
         thumbnail_path:r.get(18)?, updated_at:r.get(19)?, cover_path:r.get(20)?,
-        cover_position_x:r.get(21)?, cover_position_y:r.get(22)?, downloaded_at:r.get(23)?
+        cover_source_image_id:r.get(21)?, cover_position_x:r.get(22)?, cover_position_y:r.get(23)?, downloaded_at:r.get(24)?
     })
 }
-const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,thumbnail_path,updated_at,cover_path,cover_position_x,cover_position_y,downloaded_at FROM models";
+const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,thumbnail_path,updated_at,cover_path,cover_source_image_id,cover_position_x,cover_position_y,downloaded_at FROM models";
 fn model_by_id(c: &Connection, id: i64) -> AppResult<ModelRecord> {
     Ok(c.query_row(&format!("{MODEL_SELECT} WHERE id=?1"), [id], model_from_row)?)
 }
 
 fn civitai_client(_app: &AppStateInner) -> AppResult<Client> {
-    let mut b=Client::builder().user_agent(USER_AGENT);
+    let mut b=Client::builder().user_agent(USER_AGENT).timeout(Duration::from_secs(30));
     let _ = &mut b;
     Ok(b.build()?)
 }
@@ -587,15 +1101,22 @@ fn emit_examples_progress(handle: &AppHandle, progress: ExamplesRefreshProgress)
     let _ = handle.emit("examples-refresh-progress", progress);
 }
 
-fn featured_remote_url(image: &Value) -> Option<String> {
-    let raw = image.get("url").and_then(Value::as_str)?.trim();
-    if raw.is_empty() { return None; }
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        return Some(raw.to_string());
+fn store_examples_refresh_state(
+    state: &Arc<Mutex<ExamplesRefreshState>>,
+    handle: &AppHandle,
+    progress: ExamplesRefreshProgress,
+) {
+    if let Ok(mut guard) = state.lock() {
+        guard.progress = Some(progress.clone());
+        guard.running = !progress.done;
     }
-    let image_id = raw.trim_matches('/');
-    let filename = image.get("name").and_then(Value::as_str).filter(|x| !x.trim().is_empty()).unwrap_or("image.jpg");
-    Some(format!("{IMAGE_CDN_BASE}/{image_id}/original=true/{filename}"))
+    emit_examples_progress(handle, progress);
+}
+
+fn get_examples_refresh_state(
+    state: &Arc<Mutex<ExamplesRefreshState>>,
+) -> Option<ExamplesRefreshProgress> {
+    state.lock().ok().and_then(|guard| guard.progress.clone())
 }
 
 type FeaturedImageRecord = (i64, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<f64>, Option<String>, Option<i64>, String);
@@ -605,7 +1126,27 @@ fn featured_extension(url: &str) -> String {
         .ok()
         .and_then(|u| Path::new(u.path()).extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase()))
         .filter(|x| !x.is_empty() && x.len() <= 8)
-        .unwrap_or_else(|| "jpg".into())
+        .unwrap_or_else(|| "jpeg".into())
+}
+
+fn featured_image_key(image: &Value, version_id: i64, index: usize) -> Option<i64> {
+    let url = image.get("url").and_then(Value::as_str)?.trim();
+    if url.is_empty() {
+        return None;
+    }
+
+    // modelVersions[].images does not reliably expose an image ID.
+    // Use a deterministic negative key derived from the actual image URL
+    // and version instead of requiring an optional/absent JSON field.
+    let mut hasher = Sha256::new();
+    hasher.update(version_id.to_le_bytes());
+    hasher.update((index as u64).to_le_bytes());
+    hasher.update(url.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let positive = (u64::from_le_bytes(bytes) % (i64::MAX as u64)) + 1;
+    Some(-(positive as i64))
 }
 
 async fn sync_featured_examples_inner(
@@ -614,6 +1155,7 @@ async fn sync_featured_examples_inner(
     handle: AppHandle,
     progress_model: Option<(usize, usize)>,
 ) -> AppResult<usize> {
+    let _guard=app.cache_lock.lock().await;
     let model_record = { let c = open_db(&app.app_data)?; model_by_id(&c, model_id)? };
     let civitai_id = model_record.civitai_model_id.ok_or_else(|| AppError::Invalid("This model is not linked to Civitai".into()))?;
     let model_name = model_record.civitai_name.clone().unwrap_or_else(|| model_record.filename.clone());
@@ -623,13 +1165,19 @@ async fn sync_featured_examples_inner(
     versions.sort_by(|a,b| {
         let ac=a.get("createdAt").and_then(Value::as_str).unwrap_or("");
         let bc=b.get("createdAt").and_then(Value::as_str).unwrap_or("");
-        let ai=a.get("id").and_then(Value::as_i64).unwrap_or_default();
-        let bi=b.get("id").and_then(Value::as_i64).unwrap_or_default();
+        let ai=a.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))).unwrap_or_default();
+        let bi=b.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))).unwrap_or_default();
         bc.cmp(ac).then_with(|| bi.cmp(&ai))
     });
-    versions.truncate(5);
-    if versions.is_empty() { return Err(AppError::Api("Civitai returned no model versions".into())); }
 
+    if versions.is_empty() {
+        return Err(AppError::Api("Civitai returned no published model versions".into()));
+    }
+
+    // Process every published model version returned by Civitai and every
+    // creator-uploaded image in version.images[]. There is intentionally no
+    // version limit here: the prototype and the Civitai model endpoint expose
+    // featured images on every returned model version.
     let total_versions=versions.len();
     let (model_index, model_total)=progress_model.unwrap_or((0,1));
     let cache=cache_root(&app.app_data).join(civitai_id.to_string());
@@ -642,91 +1190,83 @@ async fn sync_featured_examples_inner(
 
     let mut records:Vec<FeaturedImageRecord>=Vec::new();
     let mut saved_count=0usize;
+    let mut image_entries=0usize;
+    let mut image_urls=0usize;
+    let mut download_failures=0usize;
+    let mut read_failures=0usize;
+    let mut empty_responses=0usize;
 
-    for (version_index,summary) in versions.iter().enumerate(){
-        let version_id=summary.get("id").and_then(Value::as_i64).ok_or_else(||AppError::Api("Civitai returned a model version without an ID".into()))?;
-        let version=match api_get(&app,&format!("{API_BASE}/model-versions/{version_id}")).await {
-            Ok(value)=>value,
-            Err(error)=>{
-                emit_examples_progress(&handle,ExamplesRefreshProgress{
-                    current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                    version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                    status:format!("Could not fetch version {version_id}"),
-                    done:false,error:Some(error.to_string())
-                });
-                continue;
-            }
-        };
+    for (version_index,version) in versions.iter().enumerate(){
+        let version_id=version.get("id").and_then(Value::as_i64).ok_or_else(||AppError::Api("Civitai returned a model version without an ID".into()))?;
         let version_name=version.get("name").and_then(Value::as_str).unwrap_or("version");
         emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index,version_total:total_versions,images_saved:saved_count,status:format!("Fetching featured images from {version_name}"),done:false,error:None});
 
         let images=version.get("images").and_then(Value::as_array).cloned().unwrap_or_default();
-        for image in images{
-            let image_id=match image.get("id").and_then(Value::as_i64){Some(v)=>v,None=>continue};
-            let remote=match featured_remote_url(&image){Some(v)=>v,None=>continue};
+        image_entries += images.len();
+        for (image_index, image) in images.into_iter().enumerate(){
+            let remote=match image.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty()).map(str::to_string) {
+                Some(v)=>{
+                    image_urls += 1;
+                    v
+                }
+                None=>continue
+            };
+            let image_id=match featured_image_key(&image, version_id, image_index) {
+                Some(v)=>v,
+                None=>continue
+            };
             let ext=featured_extension(&remote);
             let version_dir=staging.join(version_id.to_string());
             fs::create_dir_all(&version_dir)?;
             let local=version_dir.join(format!("{image_id}.{ext}"));
-            let thumb=version_dir.join(format!("{image_id}_thumb.webp"));
-            if !local.exists(){
-                let mut request=client.get(&remote);
-                if let Some(t)=token(){request=request.bearer_auth(t);}
-                let response=match request.send().await {
-                    Ok(value)=>value,
-                    Err(error)=>{
-                        emit_examples_progress(&handle,ExamplesRefreshProgress{
-                            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                            version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                            status:format!("Could not download featured image {image_id}"),done:false,error:Some(error.to_string())
-                        });
-                        continue;
-                    }
-                };
-                if !response.status().is_success(){
+
+            // Match the reference prototype: always fetch the exact Civitai URL
+            // and replace the cached file on refresh. Do not inspect/decode the
+            // response as part of retrieval.
+            let request=client.get(&remote).timeout(Duration::from_secs(60));
+            let response=match request.send().await {
+                Ok(value)=>value,
+                Err(error)=>{
+                    download_failures += 1;
                     emit_examples_progress(&handle,ExamplesRefreshProgress{
                         current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                         version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                        status:format!("Civitai returned {} for image {image_id}", response.status()),done:false,error:None
+                        status:format!("Could not download featured image {image_id}"),done:false,error:Some(error.to_string())
                     });
                     continue;
                 }
-                let bytes=match response.bytes().await {
-                    Ok(value)=>value,
-                    Err(error)=>{
-                        emit_examples_progress(&handle,ExamplesRefreshProgress{
-                            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                            version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                            status:format!("Could not read featured image {image_id}"),done:false,error:Some(error.to_string())
-                        });
-                        continue;
-                    }
-                };
-                if bytes.is_empty(){continue;}
-                fs::write(&local,&bytes)?;
+            };
+            if !response.status().is_success(){
+                download_failures += 1;
+                emit_examples_progress(&handle,ExamplesRefreshProgress{
+                    current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                    version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                    status:format!("Civitai returned {} for image {image_id}", response.status()),done:false,error:None
+                });
+                continue;
             }
-            if !thumb.exists(){
-                let img=match image::open(&local) {
-                    Ok(value)=>value,
-                    Err(error)=>{
-                        emit_examples_progress(&handle,ExamplesRefreshProgress{
-                            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                            version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                            status:format!("Could not decode featured image {image_id}"),done:false,error:Some(error.to_string())
-                        });
-                        continue;
-                    }
-                };
-                let thumb_image=img.thumbnail(420,420);
-                if let Err(error)=thumb_image.save_with_format(&thumb,image::ImageFormat::WebP){
+            let bytes=match response.bytes().await {
+                Ok(value)=>value,
+                Err(error)=>{
+                    read_failures += 1;
                     emit_examples_progress(&handle,ExamplesRefreshProgress{
                         current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                         version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                        status:format!("Could not create thumbnail {image_id}"),done:false,error:Some(error.to_string())
+                        status:format!("Could not read featured image {image_id}"),done:false,error:Some(error.to_string())
                     });
                     continue;
                 }
+            };
+            if bytes.is_empty(){
+                empty_responses += 1;
+                emit_examples_progress(&handle,ExamplesRefreshProgress{
+                    current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                    version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                    status:format!("Civitai returned an empty featured image {image_id}"),done:false,error:None
+                });
+                continue;
             }
+            fs::write(&local,&bytes)?;
             let mut meta=image.clone();
             if let Some(map)=meta.as_object_mut(){
                 map.insert("featured".into(),json!(true));
@@ -742,16 +1282,48 @@ async fn sync_featured_examples_inner(
             let width=image.get("width").and_then(Value::as_i64);
             let height=image.get("height").and_then(Value::as_i64);
             let final_local=active.join(version_id.to_string()).join(format!("{image_id}.{ext}")).to_string_lossy().to_string();
-            let final_thumb=active.join(version_id.to_string()).join(format!("{image_id}_thumb.webp")).to_string_lossy().to_string();
-            records.push((image_id,Some(final_local),Some(final_thumb),width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into())));
+            records.push((image_id,Some(final_local),None,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into())));
             saved_count+=1;
         }
-        emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index+1,version_total:total_versions,images_saved:saved_count,status:format!("Saved featured examples from {version_name}"),done:false,error:None});
+        emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index+1,version_total:total_versions,images_saved:saved_count,status:format!("Saved featured examples from {version_name} ({} download failures, {} read failures, {} empty responses)",download_failures,read_failures,empty_responses),done:false,error:None});
     }
 
     if records.is_empty(){
         let _=fs::remove_dir_all(&staging);
-        return Err(AppError::Api("Civitai returned no featured images for the newest five versions".into()));
+        emit_examples_progress(&handle,ExamplesRefreshProgress{
+            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+            version_current:total_versions,version_total:total_versions,images_saved:0,
+            status:format!("No featured images could be downloaded across {total_versions} published model versions ({} entries, {} usable URLs, {} download failures, {} read failures, {} empty responses)", image_entries, image_urls, download_failures, read_failures, empty_responses),
+            done:false,error:None
+        });
+        return Ok(0);
+    }
+
+    let mut preserved_featured_cover_key: Option<i64> = None;
+    let mut preserved_featured_cover_path: Option<PathBuf> = None;
+    let mut clear_stale_featured_cover = false;
+    let c = open_db(&app.app_data)?;
+    let old_cover: Option<String> = c.query_row(
+        "SELECT cover_path FROM models WHERE id=?1",
+        [model_id],
+        |r| r.get(0),
+    )?;
+    if let Some(old_cover) = old_cover {
+        let old_path = PathBuf::from(old_cover);
+        if old_path.starts_with(&active) {
+            if old_path.is_file() {
+                preserved_featured_cover_path = Some(copy_cached_cover(&app, model_id, &old_path)?);
+                preserved_featured_cover_key = c
+                    .query_row(
+                        "SELECT civitai_image_id FROM images WHERE model_id=?1 AND (local_path=?2 OR thumbnail_path=?2) AND meta_json LIKE '%\"featured\":true%' LIMIT 1",
+                        params![model_id, old_path.to_string_lossy().to_string()],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?;
+            } else {
+                clear_stale_featured_cover = true;
+            }
+        }
     }
 
     let backup=cache.join("featured.__backup");
@@ -765,8 +1337,8 @@ async fn sync_featured_examples_inner(
         tx.execute("DELETE FROM images WHERE model_id=?1 AND meta_json LIKE '%\"featured\":true%'", [model_id])?;
         for record in &records{
             tx.execute(
-                "INSERT INTO images(model_id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                "INSERT INTO images(model_id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json,cached_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,CAST(strftime('%s','now') AS INTEGER))
                  ON CONFLICT(model_id,civitai_image_id) DO UPDATE SET
                     local_path=excluded.local_path,
                     thumbnail_path=excluded.thumbnail_path,
@@ -778,8 +1350,31 @@ async fn sync_featured_examples_inner(
                     cfg=excluded.cfg,
                     sampler=excluded.sampler,
                     seed=excluded.seed,
-                    meta_json=excluded.meta_json",
+                    meta_json=excluded.meta_json,
+                    cached_at=excluded.cached_at",
                 params![model_id,record.0,record.1,record.2,record.3,record.4,record.5,record.6,record.7,record.8,record.9,record.10,record.11],
+            )?;
+        }
+        if let Some(new_cover) = preserved_featured_cover_path.as_ref() {
+            let new_source_id = if let Some(cover_key) = preserved_featured_cover_key {
+                tx
+                    .query_row(
+                        "SELECT id FROM images WHERE model_id=?1 AND civitai_image_id=?2 AND meta_json LIKE '%\"featured\":true%' LIMIT 1",
+                        params![model_id, cover_key],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?
+            } else {
+                None
+            };
+            tx.execute(
+                "UPDATE models SET cover_path=?2,cover_source_image_id=?3,updated_at=?4 WHERE id=?1",
+                params![model_id, new_cover.to_string_lossy().to_string(), new_source_id, now()],
+            )?;
+        } else if clear_stale_featured_cover {
+            tx.execute(
+                "UPDATE models SET cover_path=NULL,cover_source_image_id=NULL,updated_at=?2 WHERE id=?1",
+                params![model_id, now()],
             )?;
         }
         tx.commit()?;
@@ -787,7 +1382,14 @@ async fn sync_featured_examples_inner(
     })();
 
     match db_result{
-        Ok(())=>{if backup.exists(){let _=fs::remove_dir_all(&backup);} let _=handle.emit("models-changed",()); Ok(saved_count)}
+        Ok(())=>{
+            if backup.exists(){let _=fs::remove_dir_all(&backup);}
+            let bytes=dir_size(&cache_root(&app.app_data));
+            if let Ok(c)=open_db(&app.app_data){let _=put_setting(&c,"cache_bytes",&bytes.to_string());}
+            let _=enforce_cache_limit_inner(&app.app_data);
+            let _=handle.emit("models-changed",());
+            Ok(saved_count)
+        }
         Err(error)=>{let _=fs::remove_dir_all(&active);if backup.exists(){let _=fs::rename(&backup,&active);}Err(error)}
     }
 }
@@ -1004,7 +1606,8 @@ fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult
 }
 
 #[tauri::command]
-fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<()> {
+async fn delete_model(app:State<'_, AppStateInner>, handle:AppHandle, id:i64)->AppResult<()> {
+    let _guard=app.cache_lock.lock().await;
     let root = app.models_root.read().unwrap().clone()
         .ok_or_else(|| AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
 
@@ -1019,7 +1622,9 @@ fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<(
         (PathBuf::from(model.path), model.thumbnail_path, model.cover_path, image_paths)
     };
 
-    if !path.starts_with(&root) {
+    let root_canonical = root.canonicalize()?;
+    let path_canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+    if !path_canonical.starts_with(&root_canonical) {
         return Err(AppError::Invalid("Refusing to delete a model outside the configured models folder".into()));
     }
 
@@ -1034,7 +1639,7 @@ fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<(
     for (local_path, thumb_path) in image_paths {
         for cached in [local_path, thumb_path].into_iter().flatten() {
             let cached_path = PathBuf::from(cached);
-            if cached_path.starts_with(&app.app_data) && cached_path.is_file() {
+            if path_is_in_cache(&app.app_data,&cached_path) && cached_path.is_file() {
                 let _ = fs::remove_file(cached_path);
             }
         }
@@ -1042,14 +1647,14 @@ fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<(
 
     if let Some(thumbnail) = thumbnail_path {
         let thumbnail_path = PathBuf::from(thumbnail);
-        if thumbnail_path.starts_with(&app.app_data) && thumbnail_path.is_file() {
+        if path_is_in_cache(&app.app_data,&thumbnail_path) && thumbnail_path.is_file() {
             let _ = fs::remove_file(thumbnail_path);
         }
     }
 
     if let Some(cover) = cover_path {
         let cover_path = PathBuf::from(cover);
-        if cover_path.starts_with(&app.app_data) && cover_path.is_file() {
+        if path_is_in_cache(&app.app_data,&cover_path) && cover_path.is_file() {
             let _ = fs::remove_file(cover_path);
         }
     }
@@ -1108,18 +1713,33 @@ fn copy_custom_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
         .ok_or_else(|| AppError::Invalid("Custom covers must be PNG, JPG, JPEG, or WebP images".into()))?;
     image::open(source)
         .map_err(|e| AppError::Invalid(format!("Could not read the custom cover image: {e}")))?;
-    let dir = app.app_data.join("cache").join("covers");
+    let dir = cache_root(&app.app_data).join("covers");
     fs::create_dir_all(&dir)?;
-    let target = dir.join(format!("model_{id}.{ext}"));
-
-    for candidate in ["png", "jpg", "webp"] {
-        let path = dir.join(format!("model_{id}.{candidate}"));
-        if path != target && path.is_file() {
-            let _ = fs::remove_file(path);
-        }
-    }
-
+    let sequence = DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let target = dir.join(format!("model_{id}_{sequence}.{ext}"));
     fs::copy(source, &target)?;
+    Ok(target)
+}
+
+fn copy_cached_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<PathBuf> {
+    let cache_root_path = cache_root(&app.app_data)
+        .canonicalize()
+        .map_err(|_| AppError::Invalid("Raphael's Civitai cache is unavailable".into()))?;
+    let canonical_source = source
+        .canonicalize()
+        .map_err(|_| AppError::Invalid("That example image is no longer available in Raphael's cache".into()))?;
+    if !canonical_source.starts_with(&cache_root_path) || !canonical_source.is_file() {
+        return Err(AppError::Invalid("That example image is outside Raphael's Civitai cache".into()));
+    }
+    image::open(&canonical_source)
+        .map_err(|e| AppError::Invalid(format!("Could not read the example image: {e}")))?;
+    let ext = custom_cover_extension(&canonical_source)
+        .ok_or_else(|| AppError::Invalid("The cached example image has an unsupported format".into()))?;
+    let dir = cache_root(&app.app_data).join("covers");
+    fs::create_dir_all(&dir)?;
+    let sequence = DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let target = dir.join(format!("model_{id}_{sequence}.{ext}"));
+    fs::copy(&canonical_source, &target)?;
     Ok(target)
 }
 
@@ -1144,48 +1764,62 @@ fn set_model_cover_position(
 }
 
 #[tauri::command]
-fn set_model_custom_cover(
-    app: State<AppStateInner>,
+async fn set_model_custom_cover(
+    app: State<'_, AppStateInner>,
     handle: AppHandle,
     id: i64,
     source_path: String,
 ) -> AppResult<ModelRecord> {
+    let _guard=app.cache_lock.lock().await;
+    let old_cover: Option<String> = {
+        let c = open_db(&app.app_data)?;
+        c.query_row("SELECT cover_path FROM models WHERE id=?1", [id], |r| r.get(0))?
+    };
     let source = PathBuf::from(source_path);
     let target = copy_custom_cover(&app, id, &source)?;
     let c = open_db(&app.app_data)?;
     c.execute(
-        "UPDATE models SET cover_path=?2,cover_position_x=50,cover_position_y=50,updated_at=?3 WHERE id=?1",
+        "UPDATE models SET cover_path=?2,cover_source_image_id=NULL,cover_position_x=50,cover_position_y=50,updated_at=?3 WHERE id=?1",
         params![id, target.to_string_lossy().to_string(), now()],
     )?;
     let rec = model_by_id(&c, id)?;
+    drop(c);
+    if let Some(old) = old_cover {
+        let old_path = PathBuf::from(old);
+        if old_path != target && path_is_in_cache(&app.app_data, &old_path) && old_path.is_file() {
+            let _ = fs::remove_file(old_path);
+        }
+    }
+    let _ = enforce_cache_limit_inner(&app.app_data);
     let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
 
 #[tauri::command]
-fn reset_model_cover(
-    app: State<AppStateInner>,
+async fn reset_model_cover(
+    app: State<'_, AppStateInner>,
     handle: AppHandle,
     id: i64,
 ) -> AppResult<ModelRecord> {
+    let _guard=app.cache_lock.lock().await;
     let old_cover = {
         let c = open_db(&app.app_data)?;
         c.query_row("SELECT cover_path FROM models WHERE id=?1", [id], |r| r.get::<_, Option<String>>(0))?
     };
 
-    if let Some(path) = old_cover {
-        let cover = PathBuf::from(path);
-        if cover.starts_with(&app.app_data) && cover.is_file() {
-            let _ = fs::remove_file(cover);
-        }
-    }
-
     let c = open_db(&app.app_data)?;
     c.execute(
-        "UPDATE models SET cover_path=NULL,cover_position_x=50,cover_position_y=50,updated_at=?2 WHERE id=?1",
+        "UPDATE models SET cover_path=NULL,cover_source_image_id=NULL,cover_position_x=50,cover_position_y=50,updated_at=?2 WHERE id=?1",
         params![id, now()],
     )?;
     let rec = model_by_id(&c, id)?;
+    drop(c);
+    if let Some(path) = old_cover {
+        let cover = PathBuf::from(path);
+        if path_is_in_cache(&app.app_data,&cover) && cover.is_file() {
+            let _ = fs::remove_file(cover);
+        }
+    }
     let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
@@ -1202,12 +1836,13 @@ fn get_library_counts(app:State<AppStateInner>)->AppResult<LibraryCounts>{
 }
 
 #[tauri::command]
-fn set_model_cover_from_image(
-    app: State<AppStateInner>,
+async fn set_model_cover_from_image(
+    app: State<'_, AppStateInner>,
     handle: AppHandle,
     id: i64,
     image_id: i64,
 ) -> AppResult<ModelRecord> {
+    let _guard=app.cache_lock.lock().await;
     let (old_cover, source) = {
         let c = open_db(&app.app_data)?;
         c.query_row(
@@ -1220,45 +1855,57 @@ fn set_model_cover_from_image(
         )
         .map_err(|_| AppError::Invalid("That example image is not cached for this model".into()))?
     };
-
     let source = source
         .map(PathBuf::from)
         .ok_or_else(|| AppError::Invalid("That example image has not finished caching yet".into()))?;
-    let cache_root = cache_root(&app.app_data)
-        .canonicalize()
-        .map_err(|_| AppError::Invalid("Raphael's Civitai cache is unavailable".into()))?;
-    let canonical_source = source
-        .canonicalize()
-        .map_err(|_| AppError::Invalid("That example image is no longer available in Raphael's cache".into()))?;
-    if !canonical_source.starts_with(&cache_root) || !canonical_source.is_file() {
-        return Err(AppError::Invalid("That example image is outside Raphael's Civitai cache".into()));
-    }
-
-    if let Some(old) = old_cover {
-        let old_path = PathBuf::from(old);
-        let covers_root = app.app_data.join("cache").join("covers");
-        if old_path.starts_with(&covers_root) && old_path.is_file() {
-            let _ = fs::remove_file(old_path);
-        }
-    }
+    let new_cover = copy_cached_cover(&app, id, &source)?;
 
     let c = open_db(&app.app_data)?;
     c.execute(
-        "UPDATE models SET cover_path=?2,cover_position_x=50,cover_position_y=50,updated_at=?3 WHERE id=?1",
-        params![id, source.to_string_lossy().to_string(), now()],
+        "UPDATE models SET cover_path=?2,cover_source_image_id=?3,cover_position_x=50,cover_position_y=50,updated_at=?4 WHERE id=?1",
+        params![id, new_cover.to_string_lossy().to_string(), image_id, now()],
     )?;
     let rec = model_by_id(&c, id)?;
+    drop(c);
+    if let Some(old) = old_cover {
+        let old_path = PathBuf::from(old);
+        if old_path != new_cover && path_is_in_cache(&app.app_data, &old_path) && old_path.is_file() {
+            let _ = fs::remove_file(old_path);
+        }
+    }
+    let _ = enforce_cache_limit_inner(&app.app_data);
     let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
 
 #[tauri::command]
-fn get_model_images(app:State<AppStateInner>, id:i64, limit:Option<i64>)->AppResult<Vec<ModelImage>>{
-    let c=open_db(&app.app_data)?;
-    let limit=limit.unwrap_or(20).clamp(1,200);
-    let mut stmt=c.prepare("SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json FROM images WHERE model_id=?1 AND meta_json LIKE '%\"featured\":true%' ORDER BY id LIMIT ?2")?;
-    let rows=stmt.query_map(params![id,limit],|r|Ok(ModelImage{id:r.get(0)?,civitai_image_id:r.get(1)?,local_path:r.get(2)?,thumbnail_path:r.get(3)?,width:r.get(4)?,height:r.get(5)?,prompt:r.get(6)?,negative_prompt:r.get(7)?,steps:r.get(8)?,cfg:r.get(9)?,sampler:r.get(10)?,seed:r.get(11)?,meta_json:r.get(12)?}))?;
-    Ok(rows.filter_map(Result::ok).collect())
+fn get_model_images(app: State<AppStateInner>, id: i64, limit: Option<i64>) -> AppResult<ModelImagesResponse> {
+    let c = open_db(&app.app_data)?;
+    let limit = limit.unwrap_or(20).clamp(1, 1000);
+    let mut stmt = c.prepare(
+        "SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json
+         FROM images
+         WHERE model_id=?1
+         ORDER BY CASE WHEN meta_json LIKE '%\"featured\":true%' THEN 0 ELSE 1 END, id
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![id, limit], |r| Ok(ModelImage {
+        id: r.get(0)?,
+        civitai_image_id: r.get(1)?,
+        local_path: r.get(2)?,
+        thumbnail_path: r.get(3)?,
+        width: r.get(4)?,
+        height: r.get(5)?,
+        prompt: r.get(6)?,
+        negative_prompt: r.get(7)?,
+        steps: r.get(8)?,
+        cfg: r.get(9)?,
+        sampler: r.get(10)?,
+        seed: r.get(11)?,
+        meta_json: r.get(12)?,
+    }))?;
+    let images: Vec<ModelImage> = rows.filter_map(Result::ok).collect();
+    Ok(ModelImagesResponse { has_more: images.len() as i64 >= limit, images })
 }
 #[tauri::command]
 async fn preview_civitai_import(app:State<'_,AppStateInner>,url:String)->AppResult<CivitaiImportPreview>{
@@ -1266,7 +1913,15 @@ async fn preview_civitai_import(app:State<'_,AppStateInner>,url:String)->AppResu
     let root=app.models_root.read().unwrap().clone().ok_or_else(||AppError::Invalid("Choose your ComfyUI models folder first".into()))?; let typ=model.get("type").and_then(Value::as_str).unwrap_or("Other"); let target=root.join(civitai_type_to_folder(typ));
     let activation=json_strings(version.get("trainedWords"));
     let mid=model.get("id").and_then(Value::as_i64);
-    let thumb=match mid { Some(model_id)=>ensure_model_thumbnail(&app,model_id,&model,&version,&url).await?, None=>None };
+    let thumb=match mid {
+        Some(model_id)=>{
+            let _guard=app.cache_lock.lock().await;
+            let result=ensure_model_thumbnail(&app,model_id,&model,&version,&url).await?;
+            let _=enforce_cache_limit_inner(&app.app_data);
+            result
+        },
+        None=>None
+    };
     Ok(CivitaiImportPreview{model:json!({"id":model.get("id"),"name":model.get("name"),"type":typ,"description":model.get("description"),"tags":model.get("tags"),"creator":model.get("creator").and_then(|v|v.get("username")),"thumbnail_path":thumb}),version:json!({"id":version.get("id"),"name":version.get("name"),"base_model":version.get("baseModel"),"download_url":dl,"filename":filename,"size_bytes":size,"sha256":sha256,"activation_prompts":activation}),target_directory:target.to_string_lossy().to_string(),thumbnail_path:thumb,images_count_hint:version.get("images").and_then(Value::as_array).map(|x|x.len() as i64)})
 }
 
@@ -1362,11 +2017,12 @@ async fn install_civitai_model(
 
     if let Some(vid) = version_id {
         let c0 = open_db(&app.app_data)?;
-        if let Ok(existing_id) = c0.query_row(
+        let existing_id: Result<i64, rusqlite::Error> = c0.query_row(
             "SELECT id FROM models WHERE civitai_version_id=?1 AND path IS NOT NULL",
             [vid],
             |r| r.get::<_, i64>(0),
-        ) {
+        );
+        if let Ok(existing_id) = existing_id {
             let existing = model_by_id(&c0, existing_id)?;
             let progress = DownloadProgress {
                 visible: true,
@@ -1482,7 +2138,12 @@ async fn install_civitai_model(
             let vid = version.get("id").and_then(Value::as_i64);
             let civitai_url = canonical_civitai_url(&url, mid, vid)?;
             let thumb = match mid {
-                Some(model_id) => ensure_model_thumbnail(&state, model_id, &model, &version, &url).await?,
+                Some(model_id) => {
+                    let _guard=state.cache_lock.lock().await;
+                    let result=ensure_model_thumbnail(&state, model_id, &model, &version, &url).await?;
+                    let _=enforce_cache_limit_inner(&state.app_data);
+                    result
+                },
                 None => None
             };
 
@@ -1592,7 +2253,8 @@ async fn sync_gallery_inner(
     handle: AppHandle,
     target_count: i64,
 ) -> AppResult<bool> {
-    let target_count = target_count.clamp(1, 200);
+    let _guard=app.cache_lock.lock().await;
+    let target_count = target_count.clamp(1, 1000);
     let model = { let c = open_db(&app.app_data)?; model_by_id(&c, model_id)? };
     let civitai_id = match model.civitai_model_id { Some(x) => x, None => return Ok(false) };
     let cache = cache_root(&app.app_data).join(civitai_id.to_string());
@@ -1601,7 +2263,11 @@ async fn sync_gallery_inner(
     let client = civitai_client(&app)?;
     let mut cached_count: i64 = {
         let c = open_db(&app.app_data)?;
-        c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1", [model_id], |r| r.get(0))?
+        c.query_row(
+            "SELECT COUNT(*) FROM images WHERE model_id=?1 AND meta_json NOT LIKE '%\"featured\":true%'",
+            [model_id],
+            |r| r.get(0),
+        )?
     };
     let has_more = loop {
         let mut url = format!("{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true");
@@ -1659,7 +2325,7 @@ async fn sync_gallery_inner(
                     model_id,civitai_image_id,local_path,thumbnail_path,width,height,
                     prompt,negative_prompt,steps,cfg,sampler,seed,meta_json
                  )
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,CAST(strftime('%s','now') AS INTEGER))
                  ON CONFLICT(model_id,civitai_image_id) DO UPDATE SET
                     local_path=excluded.local_path,
                     thumbnail_path=excluded.thumbnail_path,
@@ -1671,7 +2337,11 @@ async fn sync_gallery_inner(
                     cfg=excluded.cfg,
                     sampler=excluded.sampler,
                     seed=excluded.seed,
-                    meta_json=excluded.meta_json",
+                    meta_json=CASE
+                        WHEN images.meta_json LIKE '%\"featured\":true%' THEN images.meta_json
+                        ELSE excluded.meta_json
+                    END,
+                    cached_at=excluded.cached_at",
                 params![
                     model_id,iid,local_path,
                     if thumb.exists(){Some(thumb.to_string_lossy().to_string())}else{None::<String>},
@@ -1694,6 +2364,7 @@ async fn sync_gallery_inner(
         let bytes = dir_size(&cache_root(&app.app_data));
         let _ = put_setting(&c, "cache_bytes", &bytes.to_string());
     }
+    let _=enforce_cache_limit_inner(&app.app_data);
     let _ = handle.emit("models-changed", ());
     Ok(has_more)
 }
@@ -1708,6 +2379,48 @@ async fn sync_model_gallery(
     let target_count = target_count.unwrap_or(20).clamp(1, 200);
     sync_gallery_inner(app.inner().clone(), id, handle, target_count).await
 }
+#[tauri::command]
+async fn load_more_model_examples(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    amount: Option<i64>,
+) -> AppResult<bool> {
+    let requested = amount.unwrap_or_else(|| {
+        open_db(&app.app_data)
+            .ok()
+            .and_then(|c| read_example_load_amount(&c).ok())
+            .unwrap_or(20)
+    }).clamp(1, 100);
+    let current_count = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT COUNT(*) FROM images WHERE model_id=?1 AND meta_json NOT LIKE '%\"featured\":true%'",
+            [id],
+            |r| r.get::<_, i64>(0),
+        )?
+    };
+    sync_gallery_inner(
+        app.inner().clone(),
+        id,
+        handle,
+        current_count.saturating_add(requested).clamp(1, 1000),
+    ).await
+}
+
+#[tauri::command]
+fn get_example_load_amount(app: State<AppStateInner>) -> AppResult<i64> {
+    let c = open_db(&app.app_data)?;
+    read_example_load_amount(&c)
+}
+
+#[tauri::command]
+fn set_example_load_amount(app: State<AppStateInner>, amount: i64) -> AppResult<i64> {
+    let value = amount.clamp(1, 100);
+    let c = open_db(&app.app_data)?;
+    put_setting(&c, "example_load_amount", &value.to_string())?;
+    Ok(value)
+}
 
 #[tauri::command]
 async fn link_model_civitai(
@@ -1716,6 +2429,7 @@ async fn link_model_civitai(
     id:i64,
     url:String,
 )->AppResult<ModelRecord>{
+    let _guard=app.cache_lock.lock().await;
     let trimmed=url.trim();
     let (_mid,_vid)=model_id_and_version(trimmed)?;
     let (model,version)=fetch_model_and_version(&app,trimmed).await?;
@@ -1726,7 +2440,14 @@ async fn link_model_civitai(
     let mid=model.get("id").and_then(Value::as_i64);
     let vid=version.get("id").and_then(Value::as_i64);
     let canonical=canonical_civitai_url(trimmed,mid,vid)?;
-    let thumbnail_path=match mid { Some(model_id)=>ensure_model_thumbnail(&app,model_id,&model,&version,trimmed).await?, None=>None };
+    let thumbnail_path=match mid {
+        Some(model_id)=>{
+            let result=ensure_model_thumbnail(&app,model_id,&model,&version,trimmed).await?;
+            let _=enforce_cache_limit_inner(&app.app_data);
+            result
+        },
+        None=>None
+    };
     let rec={
         let c=open_db(&app.app_data)?;
         c.execute(
@@ -1762,8 +2483,9 @@ async fn link_model_civitai(
         )?;
         model_by_id(&c,id)?
     };
-    let _ = sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await;
     let _=handle.emit("models-changed",());
+    drop(_guard);
+    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
     Ok(rec)
 }
 
@@ -1773,6 +2495,7 @@ async fn refresh_model_civitai(
     handle: AppHandle,
     id: i64,
 ) -> AppResult<ModelRecord> {
+    let _guard=app.cache_lock.lock().await;
     let current = {
         let c = open_db(&app.app_data)?;
         model_by_id(&c, id)?
@@ -1795,7 +2518,14 @@ async fn refresh_model_civitai(
         .and_then(|v| v.get("username"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let thumbnail_path=match model.get("id").and_then(Value::as_i64) { Some(mid)=>ensure_model_thumbnail(&app,mid,&model,&version,&url).await?, None=>None };
+    let thumbnail_path=match model.get("id").and_then(Value::as_i64) {
+        Some(mid)=>{
+            let result=ensure_model_thumbnail(&app,mid,&model,&version,&url).await?;
+            let _=enforce_cache_limit_inner(&app.app_data);
+            result
+        },
+        None=>None
+    };
 
     let rec = {
         let c = open_db(&app.app_data)?;
@@ -1831,57 +2561,105 @@ async fn refresh_model_civitai(
         model_by_id(&c, id)?
     };
 
-    let _ = sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await;
     let _ = handle.emit("models-changed", ());
+    drop(_guard);
+    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
     Ok(rec)
 }
 #[tauri::command]
-fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResult<()> {
+fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResult<ExamplesRefreshProgress> {
+    let initial = ExamplesRefreshProgress {
+        current: 0, total: 0, model_id: None, model_name: None,
+        version_current: 0, version_total: 0, images_saved: 0,
+        status: "Starting featured example refresh".into(), done: false, error: None,
+    };
     {
-        let mut running=app.examples_refresh_lock.lock().map_err(|_|AppError::Invalid("Featured example refresh state is unavailable".into()))?;
-        if *running { return Err(AppError::Invalid("Featured example refresh is already running".into())); }
-        *running=true;
+        let mut guard = app.examples_refresh_state.lock()
+            .map_err(|_| AppError::Invalid("Featured example refresh state is unavailable".into()))?;
+        if guard.running {
+            return Err(AppError::Invalid("Featured example refresh is already running".into()));
+        }
+        guard.running = true;
+        guard.progress = Some(initial.clone());
     }
+    emit_examples_progress(&handle, initial.clone());
 
-    let state=app.inner().clone();
-    let refresh_lock=state.examples_refresh_lock.clone();
-    tauri::async_runtime::spawn(async move{
-        let models:Vec<(i64,String)>=match open_db(&state.app_data).and_then(|c|{
-            let mut stmt=c.prepare("SELECT id,COALESCE(civitai_name,filename) FROM models WHERE civitai_model_id IS NOT NULL ORDER BY id")?;
-            let rows=stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let state = app.inner().clone();
+    let refresh_state = state.examples_refresh_state.clone();
+    tauri::async_runtime::spawn(async move {
+        let models: Vec<(i64, String)> = match open_db(&state.app_data).and_then(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id,COALESCE(civitai_name,filename) FROM models WHERE civitai_model_id IS NOT NULL ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             Ok(rows.filter_map(Result::ok).collect())
-        }){
-            Ok(v)=>v,
-            Err(e)=>{
-                emit_examples_progress(&handle,ExamplesRefreshProgress{current:0,total:0,model_id:None,model_name:None,version_current:0,version_total:0,images_saved:0,status:"Could not read linked models".into(),done:true,error:Some(e.to_string())});
-                *refresh_lock.lock().unwrap()=false;
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+                    current: 0, total: 0, model_id: None, model_name: None,
+                    version_current: 0, version_total: 0, images_saved: 0,
+                    status: "Could not read linked models".into(), done: true, error: Some(e.to_string()),
+                });
                 return;
             }
         };
-        let total=models.len();
-        emit_examples_progress(&handle,ExamplesRefreshProgress{current:0,total,model_id:None,model_name:None,version_current:0,version_total:if total>0{5}else{0},images_saved:0,status:if total==0{"No Civitai-linked models found".into()}else{"Starting featured example refresh".into()},done:total==0,error:None});
-        if total==0{*refresh_lock.lock().unwrap()=false;return;}
+        let total = models.len();
+        store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+            current: 0, total, model_id: None, model_name: None,
+            version_current: 0, version_total: 0,
+            images_saved: 0,
+            status: if total == 0 { "No Civitai-linked models found".into() } else { "Starting featured example refresh".into() },
+            done: total == 0, error: None,
+        });
+        if total == 0 { return; }
 
-        let mut saved_total=0usize;
-        let mut first_error=None;
-        for (index,(local_id,name)) in models.iter().enumerate(){
-            match sync_featured_examples_inner(state.clone(),*local_id,handle.clone(),Some((index,total))).await{
-                Ok(saved)=>{
-                    saved_total+=saved;
-                    emit_examples_progress(&handle,ExamplesRefreshProgress{current:index+1,total,model_id:Some(*local_id),model_name:Some(name.clone()),version_current:5,version_total:5,images_saved:saved_total,status:format!("Finished {name} ({saved} examples)"),done:false,error:None});
+        let mut saved_total = 0usize;
+        let mut first_error: Option<String> = None;
+        for (index, (local_id, name)) in models.iter().enumerate() {
+            store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+                current: index, total, model_id: Some(*local_id), model_name: Some(name.clone()),
+                version_current: 0, version_total: 0, images_saved: saved_total,
+                status: format!("Refreshing {name}"), done: false, error: None,
+            });
+            match sync_featured_examples_inner(state.clone(), *local_id, handle.clone(), Some((index, total))).await {
+                Ok(saved) => {
+                    saved_total += saved;
+                    store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+                        current: index + 1, total, model_id: Some(*local_id), model_name: Some(name.clone()),
+                        version_current: 0, version_total: 0, images_saved: saved_total,
+                        status: format!("Finished {name} ({saved} examples)"), done: false, error: None,
+                    });
                 }
-                Err(e)=>{
-                    let msg=e.to_string();
-                    if first_error.is_none(){first_error=Some(msg.clone());}
-                    emit_examples_progress(&handle,ExamplesRefreshProgress{current:index+1,total,model_id:Some(*local_id),model_name:Some(name.clone()),version_current:0,version_total:5,images_saved:saved_total,status:format!("Failed {name}"),done:false,error:Some(msg)});
+                Err(e) => {
+                    let msg = e.to_string();
+                    if first_error.is_none() { first_error = Some(msg.clone()); }
+                    store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+                        current: index + 1, total, model_id: Some(*local_id), model_name: Some(name.clone()),
+                        version_current: 0, version_total: 0, images_saved: saved_total,
+                        status: format!("Failed {name}"), done: false, error: Some(msg),
+                    });
                 }
             }
         }
-        emit_examples_progress(&handle,ExamplesRefreshProgress{current:total,total,model_id:None,model_name:None,version_current:0,version_total:0,images_saved:saved_total,status:format!("Finished refreshing {total} model{}",if total==1{""}else{"s"}),done:true,error:first_error});
-        let _=handle.emit("models-changed",());
-        *refresh_lock.lock().unwrap()=false;
+        store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+            current: total, total, model_id: None, model_name: None,
+            version_current: 0, version_total: 0, images_saved: saved_total,
+            status: if first_error.is_some() {
+                format!("Finished refreshing {total} model{} with errors", if total == 1 { "" } else { "s" })
+            } else {
+                format!("Finished refreshing {total} model{}", if total == 1 { "" } else { "s" })
+            },
+            done: true, error: first_error,
+        });
+        let _ = handle.emit("models-changed", ());
     });
-    Ok(())
+    Ok(initial)
+}
+
+#[tauri::command]
+fn get_examples_refresh_status(app: State<AppStateInner>) -> Option<ExamplesRefreshProgress> {
+    get_examples_refresh_state(&app.examples_refresh_state)
 }
 
 #[tauri::command]
@@ -1894,10 +2672,47 @@ fn clear_download_progress(app: State<AppStateInner>, task_id: String) -> AppRes
     remove_download_progress(&app.downloads, &task_id)
 }
 
-fn storage_stats_inner(app_data:&Path)->AppResult<StorageStats>{let c=open_db(app_data)?;let total:i64=c.query_row("SELECT COALESCE(SUM(size_bytes),0) FROM models",[],|r|r.get(0))?;let cached=match setting(&c,"cache_bytes")?{Some(v)=>v.parse::<i64>().unwrap_or(0),None=>{let v=dir_size(&cache_root(app_data));let _=put_setting(&c,"cache_bytes",&v.to_string());v}};let mut stmt=c.prepare("SELECT model_type,COUNT(*),COALESCE(SUM(size_bytes),0) FROM models GROUP BY model_type ORDER BY model_type")?;let categories=stmt.query_map([],|r|Ok(CategoryStats{r#type:r.get(0)?,count:r.get(1)?,bytes:r.get(2)?}))?.filter_map(Result::ok).collect();Ok(StorageStats{total_model_bytes:total,cached_bytes:cached,categories})}
+fn storage_stats_inner(app_data:&Path)->AppResult<StorageStats>{let c=open_db(app_data)?;let total:i64=c.query_row("SELECT COALESCE(SUM(size_bytes),0) FROM models",[],|r|r.get(0))?;let cached=dir_size(&cache_root(app_data));let _=put_setting(&c,"cache_bytes",&cached.to_string());let mut stmt=c.prepare("SELECT model_type,COUNT(*),COALESCE(SUM(size_bytes),0) FROM models GROUP BY model_type ORDER BY model_type")?;let categories=stmt.query_map([],|r|Ok(CategoryStats{r#type:r.get(0)?,count:r.get(1)?,bytes:r.get(2)?}))?.filter_map(Result::ok).collect();Ok(StorageStats{total_model_bytes:total,cached_bytes:cached,categories})}
 fn dir_size(path:&Path)->i64{if !path.exists(){return 0} WalkDir::new(path).into_iter().filter_map(Result::ok).filter_map(|e|e.metadata().ok()).filter(|m|m.is_file()).map(|m|m.len() as i64).sum()}
+fn path_is_in_cache(app_data:&Path,path:&Path)->bool{
+    let root=cache_root(app_data).canonicalize().unwrap_or_else(|_|cache_root(app_data));
+    let candidate=path.canonicalize().unwrap_or_else(|_|path.to_path_buf());
+    candidate.starts_with(root)
+}
 #[tauri::command]
 fn get_storage_stats(app:State<AppStateInner>)->AppResult<StorageStats>{storage_stats_inner(&app.app_data)}
+#[tauri::command]
+fn get_cache_stats(app:State<AppStateInner>)->AppResult<CacheStats>{cache_stats_inner(&app.app_data)}
+#[tauri::command]
+async fn set_cache_max_bytes(app:State<'_, AppStateInner>, max_bytes:i64)->AppResult<CacheStats>{
+    let _guard=app.cache_lock.lock().await;
+    set_cache_max_bytes_inner(&app.app_data,max_bytes)
+}
+#[tauri::command]
+async fn set_cache_location(app:State<'_, AppStateInner>, path:String)->AppResult<CacheStats>{
+    let _guard=app.cache_lock.lock().await;
+    set_cache_location_inner(&app.app_data,&path)
+}
+#[tauri::command]
+async fn clear_cache_images(app:State<'_, AppStateInner>)->AppResult<CacheOperationResult>{
+    let _guard=app.cache_lock.lock().await;
+    clear_cache_images_inner(&app.app_data)
+}
+#[tauri::command]
+async fn clear_complete_cache(app:State<'_, AppStateInner>)->AppResult<CacheOperationResult>{
+    let _guard=app.cache_lock.lock().await;
+    clear_complete_cache_inner(&app.app_data)
+}
+#[tauri::command]
+async fn prune_cache_images(app:State<'_, AppStateInner>, keep_per_model:i64)->AppResult<CacheOperationResult>{
+    let _guard=app.cache_lock.lock().await;
+    prune_cache_images_inner(&app.app_data,keep_per_model)
+}
+#[tauri::command]
+async fn clean_cache_orphans(app:State<'_, AppStateInner>)->AppResult<CacheOperationResult>{
+    let _guard=app.cache_lock.lock().await;
+    clean_cache_orphans_inner(&app.app_data)
+}
 #[tauri::command]
 fn open_in_file_manager(path:String)->AppResult<()>{let p=PathBuf::from(path); let target=if p.is_file(){p.parent().unwrap_or(&p).to_path_buf()}else{p}; #[cfg(target_os="windows")] {std::process::Command::new("explorer").arg(target).spawn()?;} #[cfg(target_os="macos")] {std::process::Command::new("open").arg(target).spawn()?;} #[cfg(target_os="linux")] {std::process::Command::new("xdg-open").arg(target).spawn()?;} Ok(())}
 #[tauri::command]
@@ -2063,12 +2878,13 @@ pub fn run() {
                 active_download_paths:Arc::new(Mutex::new(HashSet::new())),
                 active_downloads:Arc::new(Mutex::new(0)),
                 parallel_downloads:Arc::new(Mutex::new(parallel)),
-                examples_refresh_lock:Arc::new(Mutex::new(false)),
+                examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
+                cache_lock: Arc::new(AsyncMutex::new(())),
             };app.manage(state.clone());
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
@@ -2088,7 +2904,8 @@ mod tests {
             active_download_paths: Arc::new(Mutex::new(HashSet::new())),
             active_downloads: Arc::new(Mutex::new(0)),
             parallel_downloads: Arc::new(Mutex::new(3)),
-            examples_refresh_lock: Arc::new(Mutex::new(false)),
+            examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
+            cache_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -2210,7 +3027,7 @@ mod tests {
             civitai_model_id: None, civitai_version_id: None, civitai_url: None, civitai_name: Some("Hero".into()),
             version_name: None, base_model: None, creator: None, description: None,
             tags: vec!["Anime".into(), "Megumin".into()], activation_prompts: vec!["magic".into()],
-            source_hash: None, thumbnail_path: None, cover_path: None, cover_position_x: 50.0, cover_position_y: 50.0,
+            source_hash: None, thumbnail_path: None, cover_path: None, cover_source_image_id: None, cover_position_x: 50.0, cover_position_y: 50.0,
             downloaded_at: 0, updated_at: 0,
         };
         assert!(model_search_match(&model, "tag:anime", &[]));
@@ -2280,6 +3097,36 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_scan_does_not_prune_existing_models() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let root = temp.path().join("models");
+        fs::create_dir_all(&root).unwrap();
+        let model_path = root.join("upscale_models/example.safetensors");
+        fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        fs::write(&model_path, b"upscaler").unwrap();
+
+        let state = test_state(app_data.clone(), root.clone());
+        scan_root(&state, &root).unwrap();
+
+        let db = open_db(&app_data).unwrap();
+        let id: i64 = db.query_row("SELECT id FROM models LIMIT 1", [], |r| r.get(0)).unwrap();
+
+        db.execute(
+            "DELETE FROM models WHERE id=?1 AND 1=0",
+            [id],
+        ).unwrap();
+
+        let count_before: i64 = db.query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0)).unwrap();
+        assert_eq!(count_before, 1);
+
+        prune_unseen_models(&db, &[], false).unwrap();
+
+        let count_after: i64 = db.query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0)).unwrap();
+        assert_eq!(count_after, 1);
+    }
+
+    #[test]
     fn recursive_scan_indexes_nested_models_and_removes_deleted_files() {
         let temp = tempfile::tempdir().unwrap();
         let app_data = temp.path().join("app");
@@ -2310,6 +3157,203 @@ mod tests {
         let count_after_delete: i64 =
             db.query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0)).unwrap();
         assert_eq!(count_after_delete, 1);
+    }
+
+    #[test]
+    fn featured_refresh_state_starts_idle() {
+        let state = ExamplesRefreshState::default();
+        assert!(!state.running);
+        assert!(state.progress.is_none());
+    }
+
+    #[test]
+    fn featured_version_selection_skips_empty_versions() {
+        let mut versions = vec![
+            json!({"id": 3, "createdAt": "2026-03-03T00:00:00Z", "images": []}),
+            json!({"id": 2, "createdAt": "2026-03-02T00:00:00Z", "images": [{"url": ""}]}),
+            json!({"id": 1, "createdAt": "2026-03-01T00:00:00Z", "images": [{"url": "https://example.com/a.jpg"}]}),
+        ];
+        versions.sort_by(|a,b| {
+            let ac=a.get("createdAt").and_then(Value::as_str).unwrap_or("");
+            let bc=b.get("createdAt").and_then(Value::as_str).unwrap_or("");
+            bc.cmp(ac)
+        });
+        versions.retain(|version| {
+            version.get("images").and_then(Value::as_array).map(|images| {
+                images.iter().any(|image| {
+                    image.get("url").and_then(Value::as_str).map(|url| !url.trim().is_empty()).unwrap_or(false)
+                })
+            }).unwrap_or(false)
+        });
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].get("id").and_then(Value::as_i64), Some(1));
+    }
+
+    #[test]
+    fn featured_image_key_works_without_civitai_image_id() {
+        let image = json!({
+            "url": "https://imagecache.civitai.com/example/width=450",
+            "width": 832,
+            "height": 832
+        });
+        let key = featured_image_key(&image, 8840, 0).unwrap();
+        assert!(key < 0);
+        assert_eq!(featured_image_key(&image, 8840, 0), Some(key));
+        assert_ne!(featured_image_key(&image, 8840, 1), Some(key));
+    }
+
+    #[test]
+    fn featured_image_id_accepts_string_ids() {
+        let image = json!({"id": "123456789"});
+        let id = image.get("id").and_then(|value| {
+            value.as_i64().or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
+        });
+        assert_eq!(id, Some(123456789));
+    }
+
+    #[test]
+    fn cached_featured_cover_is_copied_to_stable_cover_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let model_cache = app_data.join("cache").join("civitai").join("123").join("featured").join("456");
+        fs::create_dir_all(&model_cache).unwrap();
+        let source = model_cache.join("789.jpg");
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0]));
+        image.save(&source).unwrap();
+
+        let state = test_state(app_data.clone(), temp.path().join("models"));
+        let copied = copy_cached_cover(&state, 42, &source).unwrap();
+        assert!(copied.starts_with(app_data.join("cache").join("covers")));
+        assert!(copied.is_file());
+        assert_ne!(copied, source);
+
+        let copied_image = image::open(copied).unwrap();
+        assert_eq!(copied_image.width(), 2);
+        assert_eq!(copied_image.height(), 2);
+    }
+
+    #[test]
+    fn cache_relocation_updates_files_and_database_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let models_root = temp.path().join("models");
+        fs::create_dir_all(&models_root).unwrap();
+
+        let old_file = app_data.join("cache/civitai/123/456.jpg");
+        fs::create_dir_all(old_file.parent().unwrap()).unwrap();
+        fs::write(&old_file, b"cached-image").unwrap();
+
+        let db = open_db(&app_data).unwrap();
+        db.execute(
+            "INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,updated_at)
+             VALUES('/models/example.safetensors','example.safetensors','example.safetensors','Other',1,0,0)",
+            [],
+        ).unwrap();
+        let model_id = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO images(model_id,civitai_image_id,local_path,cached_at)
+             VALUES(?1,456,?2,1)",
+            params![model_id, old_file.to_string_lossy().to_string()],
+        ).unwrap();
+
+        let target = temp.path().join("relocated-cache");
+        let stats = set_cache_location_inner(&app_data, &target.to_string_lossy()).unwrap();
+        assert_eq!(
+            PathBuf::from(stats.location).canonicalize().unwrap(),
+            target.canonicalize().unwrap(),
+        );
+        let new_file = target.join("civitai/123/456.jpg");
+        assert!(new_file.is_file());
+        assert!(!old_file.exists());
+
+        let db = open_db(&app_data).unwrap();
+        let stored: String = db
+            .query_row("SELECT local_path FROM images WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(PathBuf::from(stored), new_file);
+    }
+
+    #[test]
+    fn cache_limit_evicts_oldest_unprotected_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let models_root = temp.path().join("models");
+        fs::create_dir_all(&models_root).unwrap();
+
+        let old_file = app_data.join("cache/civitai/1/old.jpg");
+        let protected_file = app_data.join("cache/civitai/1/protected.jpg");
+        fs::create_dir_all(old_file.parent().unwrap()).unwrap();
+        fs::write(&old_file, b"1234567890").unwrap();
+        fs::write(&protected_file, b"abcdefghij").unwrap();
+
+        let db = open_db(&app_data).unwrap();
+        db.execute(
+            "INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,updated_at)
+             VALUES('/models/example.safetensors','example.safetensors','example.safetensors','Other',1,0,0)",
+            [],
+        ).unwrap();
+        let model_id = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO images(model_id,civitai_image_id,local_path,cached_at)
+             VALUES(?1,100,?2,1)",
+            params![model_id, old_file.to_string_lossy().to_string()],
+        ).unwrap();
+        let old_id = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO images(model_id,civitai_image_id,local_path,cached_at)
+             VALUES(?1,101,?2,2)",
+            params![model_id, protected_file.to_string_lossy().to_string()],
+        ).unwrap();
+        let protected_id = db.last_insert_rowid();
+        db.execute(
+            "UPDATE models SET cover_source_image_id=?2 WHERE id=?1",
+            params![model_id, protected_id],
+        ).unwrap();
+
+        put_setting(&db, "cache_max_bytes", "15").unwrap();
+        drop(db);
+
+        let result = enforce_cache_limit_inner(&app_data).unwrap();
+        assert!(!old_file.exists());
+        assert!(protected_file.is_file());
+        assert!(result.remaining_bytes <= 15);
+        let db = open_db(&app_data).unwrap();
+        let old_exists: i64 = db
+            .query_row("SELECT COUNT(*) FROM images WHERE id=?1", [old_id], |r| r.get(0))
+            .unwrap();
+        let protected_exists: i64 = db
+            .query_row("SELECT COUNT(*) FROM images WHERE id=?1", [protected_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_exists, 0);
+        assert_eq!(protected_exists, 1);
+    }
+
+    #[test]
+    fn custom_cover_uses_configured_cache_location() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let models_root = temp.path().join("models");
+        fs::create_dir_all(&models_root).unwrap();
+        let target = temp.path().join("relocated-cache");
+        fs::create_dir_all(&target).unwrap();
+
+        let db = open_db(&app_data).unwrap();
+        put_setting(&db, "cache_location", &target.to_string_lossy()).unwrap();
+        drop(db);
+
+        let source = temp.path().join("source.png");
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([0, 255, 0]));
+        image.save(&source).unwrap();
+        let existing = target.join("covers/model_7.png");
+        fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        fs::write(&existing, b"old-cover").unwrap();
+
+        let state = test_state(app_data.clone(), models_root);
+        let copied = copy_custom_cover(&state, 7, &source).unwrap();
+        assert!(copied.starts_with(target.join("covers")));
+        assert!(copied.is_file());
+        assert_ne!(copied, existing);
+        assert_eq!(fs::read(&existing).unwrap(), b"old-cover");
     }
 
     #[test]
@@ -2380,5 +3424,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cover_y_column, 1);
+
+        let cover_source_image_column: i64 = second
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_source_image_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cover_source_image_column, 1);
     }
 }
