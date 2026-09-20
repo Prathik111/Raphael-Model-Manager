@@ -104,6 +104,8 @@ struct CategoryStats { r#type: String, count: i64, bytes: i64 }
 struct StorageStats { total_model_bytes: i64, cached_bytes: i64, categories: Vec<CategoryStats> }
 #[derive(Debug, Serialize, Deserialize)]
 struct LibraryCounts { all: i64, by_type: std::collections::BTreeMap<String, i64> }
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct TagRecord { name: String, count: i64 }
 #[derive(Debug, Serialize, Deserialize)]
 struct AppStateResponse { models_root: Option<String>, storage: StorageStats }
 
@@ -148,6 +150,7 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
         creator TEXT,
         description TEXT,
         tags_json TEXT NOT NULL DEFAULT '[]',
+        tags_user_modified INTEGER NOT NULL DEFAULT 0,
         activation_json TEXT NOT NULL DEFAULT '[]',
         source_hash TEXT,
         updated_at INTEGER NOT NULL
@@ -174,6 +177,8 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
     "#)?;
     let has_thumbnail:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='thumbnail_path'",[],|r|r.get(0))?;
     if has_thumbnail==0 { c.execute("ALTER TABLE models ADD COLUMN thumbnail_path TEXT",[])?; }
+    let has_tag_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='tags_user_modified'",[],|r|r.get(0))?;
+    if has_tag_lock==0 { c.execute("ALTER TABLE models ADD COLUMN tags_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     Ok(c)
 }
 
@@ -411,15 +416,140 @@ fn set_models_root(app: State<AppStateInner>, handle: AppHandle, path:String)->A
     watcher.watch(&root,RecursiveMode::Recursive).map_err(|e|AppError::Io(io::Error::other(e.to_string())))?; *app.watcher.lock().unwrap()=Some(watcher);
     scan_root(&app,&root)?; let _=handle.emit("models-changed",()); spawn_hash_enrichment(app.inner().clone(),handle.clone()); Ok(AppStateResponse{models_root:Some(path),storage:storage_stats_inner(&app.app_data)?})
 }
-#[tauri::command]
-fn list_models(app:State<AppStateInner>, r#type:Option<String>, query:Option<String>)->AppResult<Vec<ModelRecord>>{
-    let c=open_db(&app.app_data)?; let mut sql=format!("{MODEL_SELECT} WHERE 1=1"); let mut args:Vec<String>=vec![];
-    if let Some(t)=r#type {sql.push_str(" AND model_type=?");args.push(t)}
-    if let Some(q)=query {sql.push_str(" AND (filename LIKE ? OR relative_path LIKE ? OR civitai_name LIKE ?)"); let x=format!("%{q}%");args.extend([x.clone(),x.clone(),x]);}
-    sql.push_str(" ORDER BY COALESCE(civitai_name,filename) COLLATE NOCASE"); let mut stmt=c.prepare(&sql)?; let rows=stmt.query_map(rusqlite::params_from_iter(args.iter()),model_from_row)?; Ok(rows.filter_map(Result::ok).collect())
+fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    for raw in tags {
+        let tag = raw.trim();
+        if tag.is_empty() { continue; }
+        if !result.iter().any(|existing| existing.eq_ignore_ascii_case(tag)) {
+            result.push(tag.to_string());
+        }
+    }
+    result.sort_by_key(|tag| tag.to_ascii_lowercase());
+    result
 }
+
+fn tokenize_search(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in query.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !current.is_empty() { out.push(std::mem::take(&mut current)); }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() { out.push(current); }
+    out
+}
+
+fn value_contains(haystack: &str, needle: &str) -> bool {
+    haystack.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+}
+
+fn model_search_match(model: &ModelRecord, query: &str, active_tags: &[String]) -> bool {
+    if !active_tags.iter().all(|tag| model.tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag))) {
+        return false;
+    }
+    let searchable = [
+        model.filename.as_str(),
+        model.relative_path.as_str(),
+        model.civitai_name.as_deref().unwrap_or(""),
+        model.version_name.as_deref().unwrap_or(""),
+        model.base_model.as_deref().unwrap_or(""),
+        model.creator.as_deref().unwrap_or(""),
+        model.description.as_deref().unwrap_or(""),
+    ];
+    for raw in tokenize_search(query) {
+        if raw.is_empty() { continue; }
+        let lower = raw.to_ascii_lowercase();
+        let mut exclude = false;
+        let mut tag_only = false;
+        let value = if let Some(rest) = lower.strip_prefix("-tag:").or_else(|| lower.strip_prefix("-tags:")) {
+            exclude = true; tag_only = true; rest
+        } else if let Some(rest) = lower.strip_prefix("tag:").or_else(|| lower.strip_prefix("tags:")) {
+            tag_only = true; rest
+        } else if let Some(rest) = lower.strip_prefix("#") {
+            tag_only = true; rest
+        } else if let Some(rest) = lower.strip_prefix("-") {
+            exclude = true; rest
+        } else {
+            lower.as_str()
+        };
+        if value.is_empty() { continue; }
+        let matched = if tag_only {
+            model.tags.iter().any(|tag| value_contains(tag, value))
+        } else {
+            searchable.iter().any(|field| value_contains(field, value))
+                || model.tags.iter().any(|tag| value_contains(tag, value))
+                || model.activation_prompts.iter().any(|prompt| value_contains(prompt, value))
+        };
+        if exclude {
+            if matched { return false; }
+        } else if !matched {
+            return false;
+        }
+    }
+    true
+}
+
 #[tauri::command]
-fn get_library_counts(app:State<AppStateInner>)->AppResult<LibraryCounts>{
+fn list_models(app:State<AppStateInner>, r#type:Option<String>, query:Option<String>, tags:Option<Vec<String>>)->AppResult<Vec<ModelRecord>>{
+    let c=open_db(&app.app_data)?;
+    let mut sql=format!("{MODEL_SELECT} WHERE 1=1");
+    let mut args:Vec<String>=vec![];
+    if let Some(t)=r#type { sql.push_str(" AND model_type=?"); args.push(t); }
+    sql.push_str(" ORDER BY COALESCE(civitai_name,filename) COLLATE NOCASE");
+    let mut stmt=c.prepare(&sql)?;
+    let rows=stmt.query_map(rusqlite::params_from_iter(args.iter()),model_from_row)?;
+    let query=query.unwrap_or_default();
+    let active_tags=tags.unwrap_or_default();
+    let mut result:Vec<ModelRecord>=Vec::new();
+    for row in rows {
+        let model=row?;
+        if model_search_match(&model,&query,&active_tags) { result.push(model); }
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn get_tags(app:State<AppStateInner>)->AppResult<Vec<TagRecord>>{
+    let c=open_db(&app.app_data)?;
+    let mut stmt=c.prepare("SELECT tags_json FROM models")?;
+    let rows=stmt.query_map([],|r|r.get::<_,String>(0))?;
+    let mut counts:std::collections::BTreeMap<String,(String,i64)>=std::collections::BTreeMap::new();
+    for row in rows {
+        let raw=row?;
+        let tags:Vec<String>=serde_json::from_str(&raw).unwrap_or_default();
+        for tag in normalize_tags(tags) {
+            let key=tag.to_ascii_lowercase();
+            let entry=counts.entry(key).or_insert_with(||(tag.clone(),0));
+            entry.1+=1;
+        }
+    }
+    let mut result:Vec<TagRecord>=counts.into_iter().map(|(_, (name,count))|TagRecord{name,count}).collect();
+    result.sort_by(|a,b| b.count.cmp(&a.count).then_with(||a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())));
+    Ok(result)
+}
+
+#[tauri::command]
+fn set_model_tags(app:State<AppStateInner>, handle:AppHandle, id:i64, tags:Vec<String>)->AppResult<ModelRecord>{
+    let normalized=normalize_tags(tags);
+    let c=open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET tags_json=?2,tags_user_modified=1,updated_at=?3 WHERE id=?1",
+        params![id,serde_json::to_string(&normalized).unwrap_or_else(|_|"[]".into()),now()],
+    )?;
+    let rec=model_by_id(&c,id)?;
+    let _=handle.emit("models-changed",());
+    Ok(rec)
+}
+
+#[tauri::command]
+fn get_library_countsget_library_counts(app:State<AppStateInner>)->AppResult<LibraryCounts>{
     let c=open_db(&app.app_data)?;
     let all:i64=c.query_row("SELECT COUNT(*) FROM models",[],|r|r.get(0))?;
     let mut stmt=c.prepare("SELECT model_type,COUNT(*) FROM models GROUP BY model_type")?;
@@ -668,6 +798,7 @@ async fn install_civitai_model(
                 tags_json=excluded.tags_json,
                 activation_json=excluded.activation_json,
                 source_hash=excluded.source_hash,
+                tags_json=CASE WHEN models.tags_user_modified=0 THEN excluded.tags_json ELSE models.tags_json END,
                 thumbnail_path=excluded.thumbnail_path,
                 updated_at=excluded.updated_at",
             params![
@@ -931,7 +1062,7 @@ async fn link_model_civitai(
                  base_model=?7,
                  creator=?8,
                  description=?9,
-                 tags_json=?10,
+                 tags_json=CASE WHEN tags_user_modified=0 THEN ?10 ELSE tags_json END,
                  activation_json=?11,
                  thumbnail_path=?12,
                  updated_at=?13
@@ -1000,7 +1131,7 @@ async fn refresh_model_civitai(
                  base_model=?6,
                  creator=?7,
                  description=?8,
-                 tags_json=?9,
+                 tags_json=CASE WHEN tags_user_modified=0 THEN ?9 ELSE tags_json END,
                  activation_json=?10,
                  thumbnail_path=?11,
                  updated_at=?12
@@ -1146,7 +1277,7 @@ fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
                          civitai_name=?5,
                          version_name=?6,
                          base_model=?7,
-                         tags_json=?8,
+                         tags_json=CASE WHEN tags_user_modified=0 THEN ?8 ELSE tags_json END,
                          activation_json=?9,
                          updated_at=?10
                      WHERE id=?1",
@@ -1179,7 +1310,7 @@ pub fn run() {
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,set_model_tags,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
@@ -1263,6 +1394,31 @@ mod tests {
     }
 
     #[test]
+    fn tag_normalization_is_case_insensitive_and_deduplicated() {
+        assert_eq!(
+            normalize_tags(vec!["Anime".into(), " anime ".into(), "".into(), "character".into()]),
+            vec!["Anime".to_string(), "character".to_string()]
+        );
+    }
+
+    #[test]
+    fn tag_search_supports_positive_negative_and_hash_syntax() {
+        let model = ModelRecord {
+            id: 1, path: "C:/models/a.safetensors".into(), relative_path: "loras/a.safetensors".into(),
+            filename: "a.safetensors".into(), model_type: "LoRA".into(), size_bytes: 1, modified_at: 0,
+            civitai_model_id: None, civitai_version_id: None, civitai_url: None, civitai_name: Some("Hero".into()),
+            version_name: None, base_model: None, creator: None, description: None,
+            tags: vec!["Anime".into(), "Megumin".into()], activation_prompts: vec!["magic".into()],
+            source_hash: None, thumbnail_path: None, updated_at: 0,
+        };
+        assert!(model_search_match(&model, "tag:anime", &[]));
+        assert!(model_search_match(&model, "#megumin", &[]));
+        assert!(model_search_match(&model, "-tag:realistic", &[]));
+        assert!(!model_search_match(&model, "-tag:anime", &[]));
+        assert!(model_search_match(&model, "magic", &[]));
+    }
+
+    #[test]
     fn html_description_is_stripped_without_panicking() {
         assert_eq!(
             strip_html("<p>Hello &amp; world</p><strong>Raphael</strong>"),
@@ -1326,5 +1482,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(thumbnail_column, 1);
+
+        let tag_lock_column: i64 = second
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='tags_user_modified'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag_lock_column, 1);
     }
 }
