@@ -19,6 +19,7 @@ use tower_http::{cors::CorsLayer, services::ServeDir};
 use crate::{
     add_subfolder_tags, clear_download_progress, delete_model, get_app_state, get_download_progress, get_library_counts, get_model_images, get_storage_stats,
     get_parallel_downloads, set_parallel_downloads,
+    get_cache_stats, set_cache_max_bytes, set_cache_location, clear_cache_images, clear_complete_cache, prune_cache_images, clean_cache_orphans,
     get_tags, install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
     refresh_all_examples, get_examples_refresh_status, refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
     set_model_tags, set_model_type, sync_model_gallery,
@@ -100,6 +101,23 @@ struct SyncGalleryArgs {
 #[derive(Debug, Deserialize)]
 struct ParallelDownloadsArgs {
     value: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheMaxBytesArgs {
+    #[serde(rename = "maxBytes")]
+    max_bytes: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheLocationArgs {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeepImagesArgs {
+    #[serde(rename = "keepPerModel")]
+    keep_per_model: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,9 +233,11 @@ fn web_url() -> String {
 
 fn validate_cached_file(path: &Path, app_data: &Path) -> AppResult<PathBuf> {
     let app_data = app_data.canonicalize().map_err(AppError::Io)?;
+    let cache = crate::cache_root(app_data);
+    let cache = cache.canonicalize().unwrap_or(cache);
     let path = path.canonicalize().map_err(AppError::Io)?;
-    if !path.starts_with(&app_data) || !path.is_file() {
-        return Err(AppError::Invalid("Requested file is outside Raphael's cache".into()));
+    if (!path.starts_with(&app_data) && !path.starts_with(&cache)) || !path.is_file() {
+        return Err(AppError::Invalid("Requested file is outside Raphael's allowed cache locations".into()));
     }
     Ok(path)
 }
@@ -345,6 +365,22 @@ async fn command_handler(
             let args: ParallelDownloadsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             set_parallel_downloads(handle.state(), args.value).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         },
+        "get_cache_stats" => get_cache_stats(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "set_cache_max_bytes" => {
+            let args: CacheMaxBytesArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            set_cache_max_bytes(handle.state(), args.max_bytes).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        },
+        "set_cache_location" => {
+            let args: CacheLocationArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            set_cache_location(handle.state(), args.path).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        },
+        "clear_cache_images" => clear_cache_images(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "clear_complete_cache" => clear_complete_cache(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "prune_cache_images" => {
+            let args: KeepImagesArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            prune_cache_images(handle.state(), args.keep_per_model).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        },
+        "clean_cache_orphans" => clean_cache_orphans(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "clear_download_progress" => {
             let args: DownloadProgressArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             clear_download_progress(handle.state(), args.task_id).map(|_| Value::Null)
