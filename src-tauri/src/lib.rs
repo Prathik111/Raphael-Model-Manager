@@ -1300,8 +1300,10 @@ async fn sync_featured_examples_inner(
         return Ok(0);
     }
 
-    let c = open_db(&app.app_data)?;
     let mut preserved_featured_cover_key: Option<i64> = None;
+    let mut preserved_featured_cover_path: Option<PathBuf> = None;
+    let mut clear_stale_featured_cover = false;
+    let c = open_db(&app.app_data)?;
     let old_cover: Option<String> = c.query_row(
         "SELECT cover_path FROM models WHERE id=?1",
         [model_id],
@@ -1311,7 +1313,7 @@ async fn sync_featured_examples_inner(
         let old_path = PathBuf::from(old_cover);
         if old_path.starts_with(&active) {
             if old_path.is_file() {
-                let new_cover = copy_cached_cover(&app, model_id, &old_path)?;
+                preserved_featured_cover_path = Some(copy_cached_cover(&app, model_id, &old_path)?);
                 preserved_featured_cover_key = c
                     .query_row(
                         "SELECT civitai_image_id FROM images WHERE model_id=?1 AND (local_path=?2 OR thumbnail_path=?2) AND meta_json LIKE '%\"featured\":true%' LIMIT 1",
@@ -1319,12 +1321,8 @@ async fn sync_featured_examples_inner(
                         |r| r.get(0),
                     )
                     .optional()?;
-                c.execute(
-                    "UPDATE models SET cover_path=?2,cover_source_image_id=NULL,updated_at=?3 WHERE id=?1",
-                    params![model_id, new_cover.to_string_lossy().to_string(), now()],
-                )?;
             } else {
-                c.execute("UPDATE models SET cover_path=NULL,cover_source_image_id=NULL,updated_at=?2 WHERE id=?1", params![model_id, now()])?;
+                clear_stale_featured_cover = true;
             }
         }
     }
@@ -1358,17 +1356,26 @@ async fn sync_featured_examples_inner(
                 params![model_id,record.0,record.1,record.2,record.3,record.4,record.5,record.6,record.7,record.8,record.9,record.10,record.11],
             )?;
         }
-        if let Some(cover_key) = preserved_featured_cover_key {
-            let new_source_id: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM images WHERE model_id=?1 AND civitai_image_id=?2 AND meta_json LIKE '%\"featured\":true%' LIMIT 1",
-                    params![model_id, cover_key],
-                    |r| r.get(0),
-                )
-                .optional()?;
+        if let Some(new_cover) = preserved_featured_cover_path.as_ref() {
+            let new_source_id = if let Some(cover_key) = preserved_featured_cover_key {
+                tx
+                    .query_row(
+                        "SELECT id FROM images WHERE model_id=?1 AND civitai_image_id=?2 AND meta_json LIKE '%\"featured\":true%' LIMIT 1",
+                        params![model_id, cover_key],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+            } else {
+                None
+            };
             tx.execute(
-                "UPDATE models SET cover_source_image_id=?2,updated_at=?3 WHERE id=?1",
-                params![model_id, new_source_id, now()],
+                "UPDATE models SET cover_path=?2,cover_source_image_id=?3,updated_at=?4 WHERE id=?1",
+                params![model_id, new_cover.to_string_lossy().to_string(), new_source_id, now()],
+            )?;
+        } else if clear_stale_featured_cover {
+            tx.execute(
+                "UPDATE models SET cover_path=NULL,cover_source_image_id=NULL,updated_at=?2 WHERE id=?1",
+                params![model_id, now()],
             )?;
         }
         tx.commit()?;
@@ -1707,7 +1714,7 @@ fn copy_custom_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
         .ok_or_else(|| AppError::Invalid("Custom covers must be PNG, JPG, JPEG, or WebP images".into()))?;
     image::open(source)
         .map_err(|e| AppError::Invalid(format!("Could not read the custom cover image: {e}")))?;
-    let dir = app.app_data.join("cache").join("covers");
+    let dir = cache_root(&app.app_data).join("covers");
     fs::create_dir_all(&dir)?;
     let target = dir.join(format!("model_{id}.{ext}"));
 
@@ -1737,7 +1744,7 @@ fn copy_cached_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
         .map_err(|e| AppError::Invalid(format!("Could not read the example image: {e}")))?;
     let ext = custom_cover_extension(&canonical_source)
         .ok_or_else(|| AppError::Invalid("The cached example image has an unsupported format".into()))?;
-    let dir = app.app_data.join("cache").join("covers");
+    let dir = cache_root(&app.app_data).join("covers");
     fs::create_dir_all(&dir)?;
     let target = dir.join(format!("model_{id}.{ext}"));
     for candidate in ["png", "jpg", "webp"] {
@@ -1786,6 +1793,7 @@ async fn set_model_custom_cover(
         params![id, target.to_string_lossy().to_string(), now()],
     )?;
     let rec = model_by_id(&c, id)?;
+    let _ = enforce_cache_limit_inner(&app.app_data);
     let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
@@ -1869,6 +1877,7 @@ async fn set_model_cover_from_image(
         params![id, new_cover.to_string_lossy().to_string(), image_id, now()],
     )?;
     let rec = model_by_id(&c, id)?;
+    let _ = enforce_cache_limit_inner(&app.app_data);
     let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
