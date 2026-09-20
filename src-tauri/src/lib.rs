@@ -326,11 +326,13 @@ pub(crate) fn cache_root(app_data: &Path) -> PathBuf {
         Ok(value) => value,
         Err(_) => return fallback,
     };
+    let _ = connection.busy_timeout(Duration::from_secs(5));
     setting(&connection, "cache_location")
         .ok()
         .flatten()
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
         .unwrap_or(fallback)
 }
 fn open_db(app_data: &Path) -> AppResult<Connection> {
