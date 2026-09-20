@@ -1158,6 +1158,34 @@ fn copy_custom_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
     Ok(target)
 }
 
+
+fn copy_cached_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<PathBuf> {
+    let cache_root = cache_root(&app.app_data)
+        .canonicalize()
+        .map_err(|_| AppError::Invalid("Raphael's Civitai cache is unavailable".into()))?;
+    let canonical_source = source
+        .canonicalize()
+        .map_err(|_| AppError::Invalid("That example image is no longer available in Raphael's cache".into()))?;
+    if !canonical_source.starts_with(&cache_root) || !canonical_source.is_file() {
+        return Err(AppError::Invalid("That example image is outside Raphael's Civitai cache".into()));
+    }
+    image::open(&canonical_source)
+        .map_err(|e| AppError::Invalid(format!("Could not read the example image: {e}")))?;
+    let ext = custom_cover_extension(&canonical_source)
+        .ok_or_else(|| AppError::Invalid("The cached example image has an unsupported format".into()))?;
+    let dir = app.app_data.join("cache").join("covers");
+    fs::create_dir_all(&dir)?;
+    let target = dir.join(format!("model_{id}.{ext}"));
+    for candidate in ["png", "jpg", "webp"] {
+        let path = dir.join(format!("model_{id}.{candidate}"));
+        if path != target && path.is_file() {
+            let _ = fs::remove_file(path);
+        }
+    }
+    fs::copy(&canonical_source, &target)?;
+    Ok(target)
+}
+
 #[tauri::command]
 fn set_model_cover_position(
     app: State<AppStateInner>,
@@ -1255,19 +1283,10 @@ fn set_model_cover_from_image(
         )
         .map_err(|_| AppError::Invalid("That example image is not cached for this model".into()))?
     };
-
     let source = source
         .map(PathBuf::from)
         .ok_or_else(|| AppError::Invalid("That example image has not finished caching yet".into()))?;
-    let cache_root = cache_root(&app.app_data)
-        .canonicalize()
-        .map_err(|_| AppError::Invalid("Raphael's Civitai cache is unavailable".into()))?;
-    let canonical_source = source
-        .canonicalize()
-        .map_err(|_| AppError::Invalid("That example image is no longer available in Raphael's cache".into()))?;
-    if !canonical_source.starts_with(&cache_root) || !canonical_source.is_file() {
-        return Err(AppError::Invalid("That example image is outside Raphael's Civitai cache".into()));
-    }
+    let new_cover = copy_cached_cover(&app, id, &source)?;
 
     if let Some(old) = old_cover {
         let old_path = PathBuf::from(old);
@@ -1280,7 +1299,7 @@ fn set_model_cover_from_image(
     let c = open_db(&app.app_data)?;
     c.execute(
         "UPDATE models SET cover_path=?2,cover_position_x=50,cover_position_y=50,updated_at=?3 WHERE id=?1",
-        params![id, source.to_string_lossy().to_string(), now()],
+        params![id, new_cover.to_string_lossy().to_string(), now()],
     )?;
     let rec = model_by_id(&c, id)?;
     let _ = handle.emit("models-changed", ());
@@ -1288,12 +1307,33 @@ fn set_model_cover_from_image(
 }
 
 #[tauri::command]
-fn get_model_images(app:State<AppStateInner>, id:i64, limit:Option<i64>)->AppResult<Vec<ModelImage>>{
-    let c=open_db(&app.app_data)?;
-    let limit=limit.unwrap_or(20).clamp(1,200);
-    let mut stmt=c.prepare("SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json FROM images WHERE model_id=?1 AND meta_json LIKE '%\"featured\":true%' ORDER BY id LIMIT ?2")?;
-    let rows=stmt.query_map(params![id,limit],|r|Ok(ModelImage{id:r.get(0)?,civitai_image_id:r.get(1)?,local_path:r.get(2)?,thumbnail_path:r.get(3)?,width:r.get(4)?,height:r.get(5)?,prompt:r.get(6)?,negative_prompt:r.get(7)?,steps:r.get(8)?,cfg:r.get(9)?,sampler:r.get(10)?,seed:r.get(11)?,meta_json:r.get(12)?}))?;
-    Ok(rows.filter_map(Result::ok).collect())
+fn get_model_images(app: State<AppStateInner>, id: i64, limit: Option<i64>) -> AppResult<ModelImagesResponse> {
+    let c = open_db(&app.app_data)?;
+    let limit = limit.unwrap_or(20).clamp(1, 200);
+    let mut stmt = c.prepare(
+        "SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json
+         FROM images
+         WHERE model_id=?1
+         ORDER BY CASE WHEN meta_json LIKE '%\"featured\":true%' THEN 0 ELSE 1 END, id
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![id, limit], |r| Ok(ModelImage {
+        id: r.get(0)?,
+        civitai_image_id: r.get(1)?,
+        local_path: r.get(2)?,
+        thumbnail_path: r.get(3)?,
+        width: r.get(4)?,
+        height: r.get(5)?,
+        prompt: r.get(6)?,
+        negative_prompt: r.get(7)?,
+        steps: r.get(8)?,
+        cfg: r.get(9)?,
+        sampler: r.get(10)?,
+        seed: r.get(11)?,
+        meta_json: r.get(12)?,
+    }))?;
+    let images: Vec<ModelImage> = rows.filter_map(Result::ok).collect();
+    Ok(ModelImagesResponse { has_more: images.len() as i64 >= limit, images })
 }
 #[tauri::command]
 async fn preview_civitai_import(app:State<'_,AppStateInner>,url:String)->AppResult<CivitaiImportPreview>{
