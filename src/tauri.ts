@@ -290,8 +290,13 @@ export async function subscribeToModelChanges(cb: () => void) {
           const payload = await response.json().catch(() => null) as { revision?: number } | null;
           const nextRevision = Number(payload?.revision ?? revision);
           if (nextRevision !== revision) {
+            const restarted = nextRevision < revision;
             revision = nextRevision;
             if (!disposed) cb();
+            if (restarted) {
+              // The host web server restarted and reset its in-memory revision.
+              // Refresh once immediately so the client does not wait for another change.
+            }
           } else if (!disposed) {
             // The long-poll timed out without a change; immediately wait again.
           }
