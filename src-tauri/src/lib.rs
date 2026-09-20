@@ -677,12 +677,14 @@ async fn sync_featured_examples_inner(
 
     let mut records:Vec<FeaturedImageRecord>=Vec::new();
     let mut saved_count=0usize;
+    let mut had_errors=false;
 
     for (version_index,summary) in versions.iter().enumerate(){
         let version_id=summary.get("id").and_then(Value::as_i64).ok_or_else(||AppError::Api("Civitai returned a model version without an ID".into()))?;
         let version=match api_get(&app,&format!("{API_BASE}/model-versions/{version_id}")).await {
             Ok(value)=>value,
             Err(error)=>{
+                had_errors=true;
                 emit_examples_progress(&handle,ExamplesRefreshProgress{
                     current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                     version_current:version_index,version_total:total_versions,images_saved:saved_count,
@@ -710,6 +712,7 @@ async fn sync_featured_examples_inner(
                 let response=match request.send().await {
                     Ok(value)=>value,
                     Err(error)=>{
+                had_errors=true;
                         emit_examples_progress(&handle,ExamplesRefreshProgress{
                             current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                             version_current:version_index,version_total:total_versions,images_saved:saved_count,
@@ -719,6 +722,7 @@ async fn sync_featured_examples_inner(
                     }
                 };
                 if !response.status().is_success(){
+                    had_errors=true;
                     emit_examples_progress(&handle,ExamplesRefreshProgress{
                         current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                         version_current:version_index,version_total:total_versions,images_saved:saved_count,
@@ -729,6 +733,7 @@ async fn sync_featured_examples_inner(
                 let bytes=match response.bytes().await {
                     Ok(value)=>value,
                     Err(error)=>{
+                had_errors=true;
                         emit_examples_progress(&handle,ExamplesRefreshProgress{
                             current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                             version_current:version_index,version_total:total_versions,images_saved:saved_count,
@@ -744,6 +749,7 @@ async fn sync_featured_examples_inner(
                 let img=match image::open(&local) {
                     Ok(value)=>value,
                     Err(error)=>{
+                had_errors=true;
                         emit_examples_progress(&handle,ExamplesRefreshProgress{
                             current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                             version_current:version_index,version_total:total_versions,images_saved:saved_count,
@@ -784,9 +790,35 @@ async fn sync_featured_examples_inner(
         emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index+1,version_total:total_versions,images_saved:saved_count,status:format!("Saved featured examples from {version_name}"),done:false,error:None});
     }
 
+    if had_errors {
+        let _=fs::remove_dir_all(&staging);
+        return Err(AppError::Api("Featured example refresh encountered fetch or image errors; the previous cache was preserved".into()));
+    }
+
     if records.is_empty(){
         let _=fs::remove_dir_all(&staging);
         return Err(AppError::Api("Civitai returned no featured images for the newest five versions".into()));
+    }
+
+    let old_cover = {
+        let c = open_db(&app.app_data)?;
+        c.query_row("SELECT cover_path FROM models WHERE id=?1", [model_id], |r| r.get::<_, Option<String>>(0))?
+    };
+    if let Some(old_cover) = old_cover {
+        let old_path = PathBuf::from(old_cover);
+        if old_path.starts_with(&active) {
+            if old_path.is_file() {
+                let new_cover = copy_cached_cover(&app, model_id, &old_path)?;
+                let c = open_db(&app.app_data)?;
+                c.execute(
+                    "UPDATE models SET cover_path=?2,updated_at=?3 WHERE id=?1",
+                    params![model_id, new_cover.to_string_lossy().to_string(), now()],
+                )?;
+            } else {
+                let c = open_db(&app.app_data)?;
+                c.execute("UPDATE models SET cover_path=NULL,updated_at=?2 WHERE id=?1", params![model_id, now()])?;
+            }
+        }
     }
 
     let backup=cache.join("featured.__backup");
@@ -822,8 +854,15 @@ async fn sync_featured_examples_inner(
     })();
 
     match db_result{
-        Ok(())=>{if backup.exists(){let _=fs::remove_dir_all(&backup);} let _=handle.emit("models-changed",()); Ok(saved_count)}
-        Err(error)=>{let _=fs::remove_dir_all(&active);if backup.exists(){let _=fs::rename(&backup,&active);}Err(error)}
+        Ok(())=>{
+            if backup.exists(){let _=fs::remove_dir_all(&backup);}
+            let bytes=dir_size(&cache_root(&app.app_data));
+            if let Ok(c)=open_db(&app.app_data){let _=put_setting(&c,"cache_bytes",&bytes.to_string());}
+            let _=handle.emit("models-changed",());
+            Ok(saved_count)
+        }
+        Err(error)=>{
+                had_errors=true;let _=fs::remove_dir_all(&active);if backup.exists(){let _=fs::rename(&backup,&active);}Err(error)}
     }
 }
 
