@@ -71,6 +71,8 @@ export const api = {
     command<ModelRecord>('set_model_type', { id, modelType }),
   setModelCoverPosition: (id: number, x: number, y: number) =>
     command<ModelRecord>('set_model_cover_position', { id, x, y }),
+  setModelCoverFromImage: (id: number, imageId: number) =>
+    command<ModelRecord>('set_model_cover_from_image', { id, imageId }),
   setModelCustomCover: (id: number, sourcePath: string) =>
     command<ModelRecord>('set_model_custom_cover', { id, sourcePath }),
   resetModelCover: (id: number) =>
