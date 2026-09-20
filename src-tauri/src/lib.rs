@@ -80,6 +80,9 @@ struct ModelRecord {
     activation_prompts: Vec<String>,
     source_hash: Option<String>,
     thumbnail_path: Option<String>,
+    cover_path: Option<String>,
+    cover_position_x: f64,
+    cover_position_y: f64,
     updated_at: i64,
 }
 
@@ -718,10 +721,15 @@ fn set_model_type(app:State<AppStateInner>, handle:AppHandle, id:i64, model_type
 fn cover_position(value: f64) -> f64 { value.clamp(0.0, 100.0) }
 
 fn custom_cover_extension(path: &Path) -> Option<&'static str> {
-    match path.extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase())?.as_str() {
-        "png" => Some("png"),
-        "jpg" | "jpeg" => Some("jpg"),
-        "webp" => Some("webp"),
+    match path
+        .extension()
+        .and_then(|x| x.to_str())
+        .map(|x| x.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("png"),
+        Some("jpg") | Some("jpeg") => Some("jpg"),
+        Some("webp") => Some("webp"),
         _ => None,
     }
 }
@@ -1716,7 +1724,7 @@ mod tests {
             civitai_model_id: None, civitai_version_id: None, civitai_url: None, civitai_name: Some("Hero".into()),
             version_name: None, base_model: None, creator: None, description: None,
             tags: vec!["Anime".into(), "Megumin".into()], activation_prompts: vec!["magic".into()],
-            source_hash: None, thumbnail_path: None, updated_at: 0,
+            source_hash: None, thumbnail_path: None, cover_path: None, cover_position_x: 50.0, cover_position_y: 50.0, updated_at: 0,
         };
         assert!(model_search_match(&model, "tag:anime", &[]));
         assert!(model_search_match(&model, "#megumin", &[]));
