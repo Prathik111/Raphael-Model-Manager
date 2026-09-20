@@ -80,10 +80,10 @@ export const api = {
     command<ModelRecord>('reset_model_cover', { id }),
   deleteModel: (id: number) =>
     command<void>('delete_model', { id }),
-  getImages: (id: number) =>
-    command<ModelImage[]>('get_model_images', { id }),
-  syncModelGallery: (id: number) =>
-    command<void>('sync_model_gallery', { id }),
+  getImages: (id: number, limit = 20) =>
+    command<ModelImage[]>('get_model_images', { id, limit }),
+  syncModelGallery: (id: number, targetCount = 20) =>
+    command<boolean>('sync_model_gallery', { id, targetCount }),
   importCivitai: (url: string) =>
     command<CivitaiImportPreview>('preview_civitai_import', { url }),
   installCivitai: (
@@ -98,6 +98,10 @@ export const api = {
     }),
   getDownloadProgress: () =>
     command<DownloadProgress[]>('get_download_progress'),
+  getParallelDownloads: () =>
+    command<number>('get_parallel_downloads'),
+  setParallelDownloads: (value: number) =>
+    command<number>('set_parallel_downloads', { value }),
   clearDownloadProgress: (taskId: string) =>
     command<void>('clear_download_progress', { taskId }),
   refreshModel: (id: number) =>
