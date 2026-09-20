@@ -2051,13 +2051,7 @@ async fn install_civitai_model(
             };
             push_download_progress(&app.downloads, progress.clone())?;
             let _ = handle.emit("download-progress", progress.clone());
-            let clear_progress = app.downloads.clone();
-            let clear_task_id = task_id.clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                let _ = remove_download_progress(&clear_progress, &clear_task_id);
-            });
-                return Ok(progress);
+            return Ok(progress);
             }
         }
     }
