@@ -642,8 +642,12 @@ fn clean_cache_orphans_inner(app_data: &Path) -> AppResult<CacheOperationResult>
             }
         }
     }
-    let _ = fs::remove_dir_all(root.join("civitai").join("featured.__staging"));
-    let _ = fs::remove_dir_all(root.join("civitai").join("featured.__backup"));
+    for stale in [root.join("civitai").join("featured.__staging"),root.join("civitai").join("featured.__backup")] {
+        if let Ok((files,bytes))=remove_path_with_stats(&stale) {
+            deleted_files+=files;
+            freed_bytes+=bytes;
+        }
+    }
     let stats = cache_stats_inner(app_data)?;
     Ok(CacheOperationResult { deleted_files, freed_bytes, remaining_bytes: stats.used_bytes, over_limit: stats.over_limit })
 }
@@ -699,8 +703,7 @@ fn clear_cache_images_inner(app_data: &Path) -> AppResult<CacheOperationResult> 
     fs::create_dir_all(&image_root)?;
     let c = open_db(app_data)?;
     c.execute_batch("DELETE FROM images;")?;
-    let root_string = root.to_string_lossy().to_string();
-    c.execute("UPDATE models SET thumbnail_path=NULL WHERE thumbnail_path IS NOT NULL AND substr(thumbnail_path,1,length(?1))=?1", [&root_string])?;
+    c.execute("UPDATE models SET thumbnail_path=NULL,cover_source_image_id=NULL")?;
     let stats = cache_stats_inner(app_data)?;
     Ok(CacheOperationResult { deleted_files, freed_bytes, remaining_bytes: stats.used_bytes, over_limit: stats.over_limit })
 }
@@ -714,7 +717,7 @@ fn clear_complete_cache_inner(app_data: &Path) -> AppResult<CacheOperationResult
     let root_string = root.to_string_lossy().to_string();
     c.execute_batch("DELETE FROM images;")?;
     c.execute(
-        "UPDATE models SET thumbnail_path=NULL, cover_path=CASE WHEN cover_path IS NOT NULL AND substr(cover_path,1,length(?1))=?1 THEN NULL ELSE cover_path END, cover_source_image_id=CASE WHEN cover_path IS NOT NULL AND substr(cover_path,1,length(?1))=?1 THEN NULL ELSE cover_source_image_id END",
+        "UPDATE models SET thumbnail_path=NULL, cover_path=CASE WHEN cover_path IS NOT NULL AND substr(cover_path,1,length(?1))=?1 THEN NULL ELSE cover_path END, cover_source_image_id=NULL",
         [&root_string],
     )?;
     let _ = put_setting(&c, "cache_bytes", "0");
@@ -746,7 +749,9 @@ fn prune_cache_images_inner(app_data: &Path, keep_per_model: i64) -> AppResult<C
         freed_bytes += bytes;
     }
 
-    let _ = clean_cache_orphans_inner(app_data)?;
+    let orphan_result=clean_cache_orphans_inner(app_data)?;
+    deleted_files+=orphan_result.deleted_files;
+    freed_bytes+=orphan_result.freed_bytes;
     let stats = cache_stats_inner(app_data)?;
     Ok(CacheOperationResult { deleted_files, freed_bytes, remaining_bytes: stats.used_bytes, over_limit: stats.over_limit })
 }
@@ -758,6 +763,7 @@ fn set_cache_location_inner(app_data: &Path, path: &str) -> AppResult<CacheStats
     }
     fs::create_dir_all(&target)?;
     let old = cache_root(app_data);
+    if !old.exists() { fs::create_dir_all(&old)?; }
     let old_canonical = old.canonicalize().unwrap_or_else(|_| old.clone());
     let target_canonical = target.canonicalize().unwrap_or_else(|_| target.clone());
 
@@ -1566,7 +1572,7 @@ fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<(
     for (local_path, thumb_path) in image_paths {
         for cached in [local_path, thumb_path].into_iter().flatten() {
             let cached_path = PathBuf::from(cached);
-            if cached_path.starts_with(&app.app_data) && cached_path.is_file() {
+            if path_is_in_cache(&app.app_data,&cached_path) && cached_path.is_file() {
                 let _ = fs::remove_file(cached_path);
             }
         }
@@ -1574,14 +1580,14 @@ fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<(
 
     if let Some(thumbnail) = thumbnail_path {
         let thumbnail_path = PathBuf::from(thumbnail);
-        if thumbnail_path.starts_with(&app.app_data) && thumbnail_path.is_file() {
+        if path_is_in_cache(&app.app_data,&thumbnail_path) && thumbnail_path.is_file() {
             let _ = fs::remove_file(thumbnail_path);
         }
     }
 
     if let Some(cover) = cover_path {
         let cover_path = PathBuf::from(cover);
-        if cover_path.starts_with(&app.app_data) && cover_path.is_file() {
+        if path_is_in_cache(&app.app_data,&cover_path) && cover_path.is_file() {
             let _ = fs::remove_file(cover_path);
         }
     }
@@ -1737,7 +1743,7 @@ fn reset_model_cover(
 
     if let Some(path) = old_cover {
         let cover = PathBuf::from(path);
-        if cover.starts_with(&app.app_data) && cover.is_file() {
+        if path_is_in_cache(&app.app_data,&cover) && cover.is_file() {
             let _ = fs::remove_file(cover);
         }
     }
@@ -2531,6 +2537,11 @@ fn clear_download_progress(app: State<AppStateInner>, task_id: String) -> AppRes
 
 fn storage_stats_inner(app_data:&Path)->AppResult<StorageStats>{let c=open_db(app_data)?;let total:i64=c.query_row("SELECT COALESCE(SUM(size_bytes),0) FROM models",[],|r|r.get(0))?;let cached=dir_size(&cache_root(app_data));let _=put_setting(&c,"cache_bytes",&cached.to_string());let mut stmt=c.prepare("SELECT model_type,COUNT(*),COALESCE(SUM(size_bytes),0) FROM models GROUP BY model_type ORDER BY model_type")?;let categories=stmt.query_map([],|r|Ok(CategoryStats{r#type:r.get(0)?,count:r.get(1)?,bytes:r.get(2)?}))?.filter_map(Result::ok).collect();Ok(StorageStats{total_model_bytes:total,cached_bytes:cached,categories})}
 fn dir_size(path:&Path)->i64{if !path.exists(){return 0} WalkDir::new(path).into_iter().filter_map(Result::ok).filter_map(|e|e.metadata().ok()).filter(|m|m.is_file()).map(|m|m.len() as i64).sum()}
+fn path_is_in_cache(app_data:&Path,path:&Path)->bool{
+    let root=cache_root(app_data).canonicalize().unwrap_or_else(|_|cache_root(app_data));
+    let candidate=path.canonicalize().unwrap_or_else(|_|path.to_path_buf());
+    candidate.starts_with(root)
+}
 #[tauri::command]
 fn get_storage_stats(app:State<AppStateInner>)->AppResult<StorageStats>{storage_stats_inner(&app.app_data)}
 #[tauri::command]
