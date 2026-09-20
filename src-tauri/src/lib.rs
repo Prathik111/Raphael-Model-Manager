@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -57,7 +58,8 @@ struct AppStateInner {
     models_root: Arc<RwLock<Option<PathBuf>>>,
     watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
     scan_lock: Arc<Mutex<()>>,
-    download: Arc<Mutex<Option<DownloadProgress>>>,
+    downloads: Arc<Mutex<Vec<DownloadProgress>>>,
+    active_download_paths: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -136,20 +138,6 @@ struct DownloadProgress {
     error: Option<String>,
 }
 
-impl DownloadProgress {
-    fn idle() -> Self {
-        Self {
-            visible: false,
-            task_id: None,
-            filename: String::new(),
-            phase: "IDLE".into(),
-            downloaded_bytes: 0,
-            total_bytes: None,
-            percent: None,
-            error: None,
-        }
-    }
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CivitaiEnvelope { metadata: Option<Value>, items: Vec<Value> }
@@ -164,16 +152,76 @@ fn new_download_id() -> String {
 }
 
 fn set_download_progress(
-    state: &Arc<Mutex<Option<DownloadProgress>>>,
+    state: &Arc<Mutex<Vec<DownloadProgress>>>,
     task_id: &str,
     update: impl FnOnce(&mut DownloadProgress),
 ) {
     if let Ok(mut guard) = state.lock() {
-        if let Some(progress) = guard.as_mut() {
-            if progress.task_id.as_deref() == Some(task_id) {
-                update(progress);
-            }
+        if let Some(progress) = guard.iter_mut().find(|item| item.task_id.as_deref() == Some(task_id)) {
+            update(progress);
         }
+    }
+}
+
+fn push_download_progress(
+    state: &Arc<Mutex<Vec<DownloadProgress>>>,
+    progress: DownloadProgress,
+) -> AppResult<()> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| AppError::Invalid("Download state is unavailable".into()))?;
+    guard.push(progress);
+    Ok(())
+}
+
+fn remove_download_progress(
+    state: &Arc<Mutex<Vec<DownloadProgress>>>,
+    task_id: &str,
+) -> AppResult<()> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| AppError::Invalid("Download state is unavailable".into()))?;
+    guard.retain(|item| item.task_id.as_deref() != Some(task_id));
+    Ok(())
+}
+
+fn reserve_download_path(
+    active_paths: &Arc<Mutex<HashSet<PathBuf>>>,
+    target_dir: &Path,
+    filename: &str,
+) -> AppResult<PathBuf> {
+    let mut guard = active_paths
+        .lock()
+        .map_err(|_| AppError::Invalid("Download path state is unavailable".into()))?;
+
+    let raw_name = Path::new(filename);
+    let stem = raw_name.file_stem().and_then(|x| x.to_str()).unwrap_or("model");
+    let extension = raw_name.extension().and_then(|x| x.to_str()).unwrap_or("");
+
+    let mut index = 0u32;
+    loop {
+        let candidate_name = if index == 0 {
+            if extension.is_empty() { stem.to_string() } else { format!("{stem}.{extension}") }
+        } else if extension.is_empty() {
+            format!("{stem} ({index})")
+        } else {
+            format!("{stem} ({index}).{extension}")
+        };
+        let candidate = target_dir.join(candidate_name);
+        if !candidate.exists() && !guard.contains(&candidate) {
+            guard.insert(candidate.clone());
+            return Ok(candidate);
+        }
+        index += 1;
+    }
+}
+
+fn release_download_path(
+    active_paths: &Arc<Mutex<HashSet<PathBuf>>>,
+    path: &Path,
+) {
+    if let Ok(mut guard) = active_paths.lock() {
+        guard.remove(path);
     }
 }
 
@@ -958,8 +1006,9 @@ async fn download_file(
     target_dir: &Path,
     preferred_name: &str,
     expected_sha256: Option<&str>,
-    progress: Arc<Mutex<Option<DownloadProgress>>>,
+    progress: Arc<Mutex<Vec<DownloadProgress>>>,
     task_id: &str,
+    path: PathBuf,
 ) -> AppResult<(PathBuf, i64, String)> {
     fs::create_dir_all(target_dir)?;
     let client = civitai_client(app)?;
@@ -1010,42 +1059,7 @@ async fn download_file(
         .unwrap_or("model.safetensors")
         .to_string();
 
-    let mut path = target_dir.join(&safe_name);
-    if path.exists() {
-        if let Some(expected) = expected_sha256 {
-            if let Ok(existing_hash) = sha256_file(&path) {
-                if existing_hash.eq_ignore_ascii_case(expected) {
-                    let existing_size = fs::metadata(&path)?.len() as i64;
-                    set_download_progress(&progress, task_id, |p| {
-                        p.downloaded_bytes = existing_size;
-                        p.total_bytes = Some(existing_size);
-                        p.percent = Some(100.0);
-                        p.phase = "ALREADY INSTALLED".into();
-                    });
-                    return Ok((path, existing_size, existing_hash));
-                }
-            }
-        }
-
-        let source_name = Path::new(&safe_name);
-        let stem = source_name.file_stem().and_then(|x| x.to_str()).unwrap_or("model");
-        let extension = source_name.extension().and_then(|x| x.to_str()).unwrap_or("");
-        let mut index = 1u32;
-        loop {
-            let candidate_name = if extension.is_empty() {
-                format!("{stem} ({index})")
-            } else {
-                format!("{stem} ({index}).{extension}")
-            };
-            let candidate = target_dir.join(candidate_name);
-            if !candidate.exists() {
-                path = candidate;
-                break;
-            }
-            index += 1;
-        }
-    }
-
+    let mut path = path;
     let partial = path.with_extension(format!(
         "{}.part",
         path.extension().and_then(|x| x.to_str()).unwrap_or("bin")
@@ -1086,7 +1100,10 @@ async fn download_file(
         }
     }
 
-    fs::rename(&partial, &path)?;
+    if let Err(error) = fs::rename(&partial, &path) {
+        let _ = fs::remove_file(&partial);
+        return Err(AppError::Io(error));
+    }
     Ok((path, total, actual_sha256))
 }
 
@@ -1099,15 +1116,10 @@ async fn install_civitai_model(
     target_directory: Option<String>,
     selected_type: Option<String>,
 ) -> AppResult<DownloadProgress> {
-    {
-        let guard = app.download.lock().map_err(|_| AppError::Invalid("Download state is unavailable".into()))?;
-        if guard.as_ref().map(|p| p.visible && p.phase != "COMPLETED" && p.phase != "FAILED").unwrap_or(false) {
-            return Err(AppError::Invalid("Raphael is already installing another model".into()));
-        }
-    }
-
     let (model, version) = fetch_model_and_version(&app, &url).await?;
     let version_id = version.get("id").and_then(Value::as_i64);
+    let task_id = new_download_id();
+
     if let Some(vid) = version_id {
         let c0 = open_db(&app.app_data)?;
         if let Ok(existing_id) = c0.query_row(
@@ -1118,7 +1130,7 @@ async fn install_civitai_model(
             let existing = model_by_id(&c0, existing_id)?;
             let progress = DownloadProgress {
                 visible: true,
-                task_id: None,
+                task_id: Some(task_id.clone()),
                 filename: existing.filename.clone(),
                 phase: "ALREADY INSTALLED".into(),
                 downloaded_bytes: existing.size_bytes,
@@ -1126,7 +1138,7 @@ async fn install_civitai_model(
                 percent: Some(100.0),
                 error: None,
             };
-            *app.download.lock().map_err(|_| AppError::Invalid("Download state is unavailable".into()))? = Some(progress.clone());
+            push_download_progress(&app.downloads, progress.clone())?;
             let _ = handle.emit("download-progress", progress.clone());
             return Ok(progress);
         }
@@ -1140,11 +1152,13 @@ async fn install_civitai_model(
     } else {
         civitai_type_to_model_type(civitai_typ).to_string()
     };
+
     let (dl, file_size, filename, sha256) = selected_file(&version)
         .ok_or_else(|| AppError::Api("No downloadable public file found for this version".into()))?;
 
     let root = app.models_root.read().unwrap().clone()
         .ok_or_else(|| AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
+
     let target = if let Some(custom) = target_directory {
         let candidate = PathBuf::from(custom);
         fs::create_dir_all(&candidate)?;
@@ -1158,25 +1172,33 @@ async fn install_civitai_model(
         root.join(civitai_type_to_folder(&typ))
     };
 
-    let task_id = new_download_id();
+    let safe_name = Path::new(&filename)
+        .file_name()
+        .and_then(|x| x.to_str())
+        .filter(|x| !x.is_empty())
+        .unwrap_or("model.safetensors")
+        .to_string();
+    let reserved_path = reserve_download_path(&app.active_download_paths, &target, &safe_name)?;
+
     let initial = DownloadProgress {
         visible: true,
         task_id: Some(task_id.clone()),
-        filename: if filename.is_empty() { "model".into() } else { filename.clone() },
+        filename: reserved_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
         phase: "STARTING".into(),
         downloaded_bytes: 0,
         total_bytes: file_size,
         percent: file_size.filter(|x| *x > 0).map(|_| 0.0),
         error: None,
     };
-    {
-        let mut guard = app.download.lock().map_err(|_| AppError::Invalid("Download state is unavailable".into()))?;
-        *guard = Some(initial.clone());
+    if let Err(error) = push_download_progress(&app.downloads, initial.clone()) {
+        release_download_path(&app.active_download_paths, &reserved_path);
+        return Err(error);
     }
     let _ = handle.emit("download-progress", initial.clone());
 
     let state = app.inner().clone();
-    let task_progress = state.download.clone();
+    let task_progress = state.downloads.clone();
+    let task_active_paths = state.active_download_paths.clone();
     let task_handle = handle.clone();
     tauri::async_runtime::spawn(async move {
         let result = async {
@@ -1188,6 +1210,7 @@ async fn install_civitai_model(
                 sha256.as_deref(),
                 task_progress.clone(),
                 &task_id,
+                reserved_path.clone(),
             ).await?;
 
             set_download_progress(&task_progress, &task_id, |p| {
@@ -1278,9 +1301,9 @@ async fn install_civitai_model(
                 Ok(value) => value,
                 Err(_) => return,
             };
-            let progress = match guard.as_mut() {
-                Some(value) if value.task_id.as_deref() == Some(task_id.as_str()) => value,
-                _ => return,
+            let progress = match guard.iter_mut().find(|value| value.task_id.as_deref() == Some(task_id.as_str())) {
+                Some(value) => value,
+                None => return,
             };
             match result {
                 Ok(()) => {
@@ -1296,6 +1319,7 @@ async fn install_civitai_model(
             }
             progress.clone()
         };
+        release_download_path(&task_active_paths, &reserved_path);
         let _ = task_handle.emit("download-progress", final_progress);
         let _ = task_handle.emit("models-changed", ());
     });
@@ -1624,17 +1648,13 @@ async fn refresh_model_civitai(
     Ok(rec)
 }
 #[tauri::command]
-fn get_download_progress(app: State<AppStateInner>) -> DownloadProgress {
-    app.download.lock().ok().and_then(|g| g.clone()).unwrap_or_else(DownloadProgress::idle)
+fn get_download_progress(app: State<AppStateInner>) -> Vec<DownloadProgress> {
+    app.downloads.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 #[tauri::command]
-fn clear_download_progress(app: State<AppStateInner>) -> AppResult<()> {
-    let mut guard = app.download.lock().map_err(|_| AppError::Invalid("Download state is unavailable".into()))?;
-    if guard.as_ref().map(|p| p.phase == "COMPLETED" || p.phase == "FAILED" || p.phase == "ALREADY INSTALLED").unwrap_or(false) {
-        *guard = None;
-    }
-    Ok(())
+fn clear_download_progress(app: State<AppStateInner>, task_id: String) -> AppResult<()> {
+    remove_download_progress(&app.downloads, &task_id)
 }
 
 fn storage_stats_inner(app_data:&Path)->AppResult<StorageStats>{let c=open_db(app_data)?;let total:i64=c.query_row("SELECT COALESCE(SUM(size_bytes),0) FROM models",[],|r|r.get(0))?;let cached=match setting(&c,"cache_bytes")?{Some(v)=>v.parse::<i64>().unwrap_or(0),None=>{let v=dir_size(&cache_root(app_data));let _=put_setting(&c,"cache_bytes",&v.to_string());v}};let mut stmt=c.prepare("SELECT model_type,COUNT(*),COALESCE(SUM(size_bytes),0) FROM models GROUP BY model_type ORDER BY model_type")?;let categories=stmt.query_map([],|r|Ok(CategoryStats{r#type:r.get(0)?,count:r.get(1)?,bytes:r.get(2)?}))?.filter_map(Result::ok).collect();Ok(StorageStats{total_model_bytes:total,cached_bytes:cached,categories})}
@@ -1787,7 +1807,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_data=app.path().app_data_dir()?;fs::create_dir_all(&app_data)?;let c=open_db(&app_data)?;let saved=setting(&c,"models_root")?;let state=AppStateInner{app_data:app_data.clone(),models_root:Arc::new(RwLock::new(saved.map(PathBuf::from))),watcher:Arc::new(Mutex::new(None)),scan_lock:Arc::new(Mutex::new(())),
-                download:Arc::new(Mutex::new(None)),
+                downloads:Arc::new(Mutex::new(Vec::new())),
+                active_download_paths:Arc::new(Mutex::new(HashSet::new())),
             };app.manage(state.clone());
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
@@ -1808,7 +1829,8 @@ mod tests {
             models_root: Arc::new(RwLock::new(Some(models_root))),
             watcher: Arc::new(Mutex::new(None)),
             scan_lock: Arc::new(Mutex::new(())),
-            download: Arc::new(Mutex::new(None)),
+            downloads: Arc::new(Mutex::new(Vec::new())),
+            active_download_paths: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
