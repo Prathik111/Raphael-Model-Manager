@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.raphael.modelmanager",
   "build": {
-    "beforeDevCommand": "npm run prepare:reference && npm run dev",
+    "beforeDevCommand": "npm run prepare:reference && npm run dev:supervised",
     "beforeBuildCommand": "npm run prepare:reference && npm run build",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"
