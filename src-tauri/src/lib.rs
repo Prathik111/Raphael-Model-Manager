@@ -553,6 +553,66 @@ fn set_model_tags(app:State<AppStateInner>, handle:AppHandle, id:i64, tags:Vec<S
     Ok(rec)
 }
 
+fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
+    let c = open_db(&app.app_data)?;
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = c.prepare("SELECT id,relative_path,tags_json FROM models")?;
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut updated = 0_i64;
+    for (id, relative_path, raw_tags) in rows {
+        let parts: Vec<&str> = relative_path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        let existing: Vec<String> = serde_json::from_str(&raw_tags).unwrap_or_default();
+        let mut merged = existing.clone();
+        for part in &parts[1..parts.len() - 1] {
+            let tag = part.trim();
+            if !tag.is_empty() && !merged.iter().any(|current| current.eq_ignore_ascii_case(tag)) {
+                merged.push(tag.to_string());
+            }
+        }
+
+        let current_normalized = normalize_tags(existing);
+        let next_normalized = normalize_tags(merged);
+        if next_normalized == current_normalized {
+            continue;
+        }
+
+        c.execute(
+            "UPDATE models SET tags_json=?2,tags_user_modified=1,updated_at=?3 WHERE id=?1",
+            params![
+                id,
+                serde_json::to_string(&next_normalized).unwrap_or_else(|_| "[]".into()),
+                now()
+            ],
+        )?;
+        updated += 1;
+    }
+
+    Ok(updated)
+}
+
+#[tauri::command]
+fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult<i64> {
+    let updated = add_subfolder_tags_inner(&app)?;
+    let _ = handle.emit("models-changed", ());
+    Ok(updated)
+}
+
 #[tauri::command]
 fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<()> {
     let root = app.models_root.read().unwrap().clone()
@@ -1392,7 +1452,7 @@ pub fn run() {
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,set_model_tags,set_model_type,delete_model,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,delete_model,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
@@ -1418,6 +1478,44 @@ mod tests {
         assert!(is_model_file(Path::new("model.onnx")));
         assert!(!is_model_file(Path::new("preview.png")));
         assert!(!is_model_file(Path::new("README.txt")));
+    }
+
+    #[test]
+    fn subfolder_tags_are_derived_and_appended() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let root = temp.path().join("models");
+        fs::create_dir_all(root.join("checkpoints/Illustrus")).unwrap();
+        fs::create_dir_all(root.join("loras/Illustrus/Character")).unwrap();
+        fs::write(root.join("checkpoints/Illustrus/model.safetensors"), b"checkpoint").unwrap();
+        fs::write(root.join("loras/Illustrus/Character/model.safetensors"), b"lora").unwrap();
+
+        let state = test_state(app_data.clone(), root.clone());
+        scan_root(&state, &root).unwrap();
+
+        let updated = add_subfolder_tags_inner(&state).unwrap();
+        assert_eq!(updated, 2);
+
+        let db = open_db(&app_data).unwrap();
+        let checkpoints_tags: String = db
+            .query_row(
+                "SELECT tags_json FROM models WHERE relative_path='checkpoints/Illustrus/model.safetensors'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let lora_tags: String = db
+            .query_row(
+                "SELECT tags_json FROM models WHERE relative_path='loras/Illustrus/Character/model.safetensors'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let checkpoints: Vec<String> = serde_json::from_str(&checkpoints_tags).unwrap();
+        let lora: Vec<String> = serde_json::from_str(&lora_tags).unwrap();
+        assert_eq!(checkpoints, vec!["Illustrus"]);
+        assert_eq!(lora, vec!["Character", "Illustrus"]);
     }
 
     #[test]
