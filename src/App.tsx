@@ -998,14 +998,13 @@ function CoverEditorOverlay({
   </div>;
 }
 
-function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, onRefresh, onLinkCivitai, onSaveTags, onSaveType, onDelete, onFilterTag, onChangeCover, onChooseThumbnail, onFetchMore, onOpenImage }: { model: ModelRecord; images: ModelImage[]; allTags: TagRecord[]; galleryHasMore: boolean; galleryFetchBusy: boolean; onRefresh: ()=>Promise<void>; onLinkCivitai: (url: string)=>Promise<void>; onSaveTags: (tags: string[])=>Promise<void>; onSaveType: (type: string)=>Promise<void>; onDelete: ()=>Promise<void>; onFilterTag: (tag: string)=>void; onChangeCover: ()=>void; onChooseThumbnail: (imageId: number)=>Promise<void>; onFetchMore: ()=>Promise<void>; onOpenImage: (imageId: number)=>void }) {
+function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, refreshBusy, refreshError, onRefresh, onLinkCivitai, onSaveTags, onSaveType, onDelete, onFilterTag, onChangeCover, onChooseThumbnail, onFetchMore, onOpenImage }: { model: ModelRecord; images: ModelImage[]; allTags: TagRecord[]; galleryHasMore: boolean; galleryFetchBusy: boolean; refreshBusy: boolean; refreshError: string | null; onRefresh: ()=>Promise<void>; onLinkCivitai: (url: string)=>Promise<void>; onSaveTags: (tags: string[])=>Promise<void>; onSaveType: (type: string)=>Promise<void>; onDelete: ()=>Promise<void>; onFilterTag: (tag: string)=>void; onChangeCover: ()=>void; onChooseThumbnail: (imageId: number)=>Promise<void>; onFetchMore: ()=>Promise<void>; onOpenImage: (imageId: number)=>void }) {
   const [tab, setTab] = useState<'overview'|'examples'|'files'>('overview');
   const [civitaiUrl, setCivitaiUrl] = useState(model.civitai_url || '');
   const [editingSource, setEditingSource] = useState(false);
   const [linkBusy, setLinkBusy] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
-  const [refreshBusy, setRefreshBusy] = useState(false);
-  const [refreshError, setRefreshError] = useState<string | null>(null);
+
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -1019,14 +1018,10 @@ function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, o
 
   const refreshSource = async () => {
     if (refreshBusy || linkBusy) return;
-    setRefreshBusy(true);
-    setRefreshError(null);
     try {
       await onRefresh();
-    } catch (error) {
-      setRefreshError(String(error));
-    } finally {
-      setRefreshBusy(false);
+    } catch {
+      // App-level refresh state owns the persistent error/status.
     }
   };
 
@@ -1092,6 +1087,7 @@ function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, o
                 }}>{linkBusy ? 'FETCHING…' : model.civitai_url ? 'SAVE LINK' : 'FETCH DETAILS'}</button>
                 {model.civitai_url ? <button className="text-btn" onClick={()=>{setCivitaiUrl(model.civitai_url || '');setLinkError(null);setEditingSource(false);}} disabled={linkBusy}>CANCEL</button> : null}
               </div>
+              {refreshError ? <div className="error-box">{refreshError}</div> : null}
               {linkError ? <div className="error-box">{linkError}</div> : null}
             </div>}
       </section>
@@ -1133,6 +1129,8 @@ function App() {
   const [parallelDownloads,setParallelDownloads]=useState(3);
   const [examplesRefreshProgress,setExamplesRefreshProgress]=useState<ExamplesRefreshProgress|null>(null);
   const [examplesRefreshRunning,setExamplesRefreshRunning]=useState(false);
+  const [refreshingModels,setRefreshingModels]=useState<Record<number, boolean>>({});
+  const [refreshErrors,setRefreshErrors]=useState<Record<number, string | null>>({});
   const [importClosing,setImportClosing]=useState(false);
   useEffect(()=>{window.localStorage.setItem(THUMBNAIL_FIT_KEY,thumbnailFit);},[thumbnailFit]);
 
@@ -1335,6 +1333,38 @@ function App() {
       }));
     }
   };
+  const refreshSelectedModel = async (modelId: number) => {
+    if (refreshingModels[modelId]) return;
+    setRefreshingModels(current => ({ ...current, [modelId]: true }));
+    setRefreshErrors(current => ({ ...current, [modelId]: null }));
+    try {
+      const updated = await api.refreshModel(modelId);
+      setModels(current => current.map(item => item.id === updated.id ? updated : item));
+      void api.getTags().then(setAllTags).catch(() => {});
+      // Gallery synchronization is intentionally detached from the source-data
+      // operation so changing models never interrupts the refresh state.
+      void (async () => {
+        try {
+          const more = await api.syncModelGallery(modelId, 20);
+          const result = await api.getImages(modelId, 1000);
+          if (selectedIdRef.current === modelId) {
+            setImages(result.images);
+            setGalleryHasMore(more);
+          }
+        } catch {
+          // Source-data refresh already succeeded; gallery can be retried from
+          // the Examples tab / LOAD MORE EXAMPLES.
+        }
+      })();
+    } catch (error) {
+      const message = String(error);
+      setRefreshErrors(current => ({ ...current, [modelId]: message }));
+      throw error;
+    } finally {
+      setRefreshingModels(current => ({ ...current, [modelId]: false }));
+    }
+  };
+
   const onFetchMore = async()=>{
     if(!selected || galleryFetchBusy) return;
     const modelId=selected.id;
@@ -1448,7 +1478,7 @@ function App() {
         </div>
       </aside>
       <main className="library"><div className="library-head"><div><div className="eyebrow">{type.toUpperCase()}</div><h1>{type==='All'?'MODEL LIBRARY':type.toUpperCase()}</h1></div><div className="library-tools"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search models, tags, tag:…"/><button className={`tag-filter-button ${activeTags.length?'active':''}`} onClick={()=>setTagPanelOpen(v=>!v)}>TAGS{activeTags.length ? ` · ${activeTags.length}` : ''}</button><button className="import-btn" onClick={()=>{setImportClosing(false);setImportError(null);setImportUrl('');setImportType('Other');setCustomDownloadPath(false);setDownloadPath('');setPreview({model:{},version:{id:0,name:'',base_model:null,download_url:'',filename:null,size_bytes:null,activation_prompts:[]},target_directory:'',thumbnail_path:null});}}>IMPORT CIVITAI</button><select value={sort} onChange={e=>setSort(e.target.value)}><option value="name">NAME</option><option value="size">SIZE</option><option value="path">PATH</option></select></div>{tagPanelOpen && <TagFilterPanel tags={allTags} activeTags={activeTags} onToggle={tag=>setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current.filter(x=>x.toLowerCase()!==tag.toLowerCase()):[...current,tag])} onClear={()=>setActiveTags([])}/>}</div>{activeTags.length ? <div className="active-tag-bar">{activeTags.map(tag=><button key={tag} onClick={()=>setActiveTags(current=>current.filter(x=>x.toLowerCase()!==tag.toLowerCase()))}>{tag}<span>×</span></button>)}<span className="active-tag-help">TAG FILTERS</span></div> : null}<div className="grid">{models.map(m=><ModelCard key={m.id} model={m} selected={m.id===selectedId} onClick={()=>setSelectedId(m.id)}/>)}{!models.length&&<div className="empty-state">No models match the current view.</div>}</div></main>
-      {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} galleryHasMore={galleryHasMore} galleryFetchBusy={galleryFetchBusy} onFetchMore={onFetchMore} onOpenImage={openImageViewer} onRefresh={async()=>{const updated=await api.refreshModel(selected.id); setModels(current=>current.map(item=>item.id===updated.id?updated:item)); void api.getTags().then(setAllTags).catch(()=>{}); void (async()=>{try{const more=await api.syncModelGallery(selected.id,20); const result=await api.getImages(selected.id,1000); if(selectedIdRef.current===selected.id){setImages(result.images);setGalleryHasMore(more);}}catch{}})();}} onLinkCivitai={async(url)=>{const updated=await api.linkModelCivitai(selected.id,url); setModels(current=>current.map(item=>item.id===updated.id?updated:item)); void api.getTags().then(setAllTags).catch(()=>{});}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)} onChooseThumbnail={async imageId=>{const updated=await api.setModelCoverFromImage(selected.id,imageId); setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
+      {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} galleryHasMore={galleryHasMore} galleryFetchBusy={galleryFetchBusy} refreshBusy={Boolean(refreshingModels[selected.id])} refreshError={refreshErrors[selected.id] || null} onFetchMore={onFetchMore} onOpenImage={openImageViewer} onRefresh={()=>refreshSelectedModel(selected.id)} onLinkCivitai={async(url)=>{const updated=await api.linkModelCivitai(selected.id,url); setModels(current=>current.map(item=>item.id===updated.id?updated:item)); void api.getTags().then(setAllTags).catch(()=>{});}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)} onChooseThumbnail={async imageId=>{const updated=await api.setModelCoverFromImage(selected.id,imageId); setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
       {selected && coverEditorOpen && <CoverEditorOverlay model={selected} onClose={()=>setCoverEditorOpen(false)} onUpdated={updated=>{setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
       {imageViewerId !== null && images.some(image => image.id === imageViewerId) && <ImageViewerOverlay images={images} imageId={imageViewerId} onClose={()=>setImageViewerId(null)} onNavigate={navigateImageViewer}/>}
 
