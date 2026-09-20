@@ -53,6 +53,9 @@
       "nsis": {
         "installMode": "currentUser"
       }
+    },
+    "resources": {
+      "../dist": "web"
     }
   }
 }
