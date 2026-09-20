@@ -18,6 +18,7 @@ use tower_http::{cors::CorsLayer, services::ServeDir};
 
 use crate::{
     add_subfolder_tags, clear_download_progress, delete_model, get_app_state, get_download_progress, get_library_counts, get_model_images, get_storage_stats,
+    get_parallel_downloads, set_parallel_downloads,
     get_tags, install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
     refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
     set_model_tags, set_model_type, sync_model_gallery,
@@ -81,6 +82,24 @@ struct ListModelsArgs {
 #[derive(Debug, Deserialize)]
 struct IdArgs {
     id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelImagesArgs {
+    id: i64,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncGalleryArgs {
+    id: i64,
+    #[serde(rename = "targetCount")]
+    target_count: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ParallelDownloadsArgs {
+    value: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,14 +306,14 @@ async fn command_handler(
             delete_model(handle.state(), handle.clone(), args.id).map(|_| json!(null))
         }
         "get_model_images" => {
-            let args: IdArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            get_model_images(handle.state(), args.id).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+            let args: ModelImagesArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            get_model_images(handle.state(), args.id, args.limit).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "sync_model_gallery" => {
-            let args: IdArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            sync_model_gallery(handle.state(), handle.clone(), args.id)
+            let args: SyncGalleryArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            sync_model_gallery(handle.state(), handle.clone(), args.id, args.target_count)
                 .await
-                .map(|_| json!(null))
+                .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "preview_civitai_import" => {
             let args: UrlArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
@@ -315,6 +334,11 @@ async fn command_handler(
             .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "get_download_progress" => serde_json::to_value(get_download_progress(handle.state())).map_err(|e| AppError::Invalid(e.to_string())),
+        "get_parallel_downloads" => get_parallel_downloads(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "set_parallel_downloads" => {
+            let args: ParallelDownloadsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            set_parallel_downloads(handle.state(), args.value).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        },
         "clear_download_progress" => {
             let args: DownloadProgressArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             clear_download_progress(handle.state(), args.task_id).and_then(|_| Ok(Value::Null))
