@@ -1121,7 +1121,7 @@ function DownloadProgressWidget({ progress, onClear }: { progress: DownloadProgr
 function App() {
   const [state,setState]=useState<AppState|null>(null); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
   const refreshGeneration = useRef(0);
-  const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [galleryHasMore,setGalleryHasMore]=useState(true); const [galleryFetchBusy,setGalleryFetchBusy]=useState(false); const [imageViewerId,setImageViewerId]=useState<number|null>(null); const bulkFileInputRef=useRef<HTMLInputElement>(null); const [bulkBusy,setBulkBusy]=useState(false); const [bulkMessage,setBulkMessage]=useState<string|null>(null); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
+  const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [galleryHasMore,setGalleryHasMore]=useState(true); const [galleryFetchBusy,setGalleryFetchBusy]=useState(false); const [imageViewerId,setImageViewerId]=useState<number|null>(null); const bulkFileInputRef=useRef<HTMLInputElement>(null); const [bulkBusy,setBulkBusy]=useState(false); const [bulkMessage,setBulkMessage]=useState<string|null>(null); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webConnected,setWebConnected]=useState(!api.isWebApp); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
   const [settingsOpen,setSettingsOpen]=useState(false);
   const [coverEditorOpen,setCoverEditorOpen]=useState(false);
   const [thumbnailFit,setThumbnailFit]=useState<ThumbnailFit>(initialThumbnailFit);
@@ -1251,7 +1251,46 @@ function App() {
       if(generation===refreshGeneration.current) console.error('Raphael refresh failed',error);
     }
   }
-  useEffect(()=>{refresh(); api.getWebAppStatus().then(setWebStatus).catch(()=>{});},[]);
+  useEffect(()=>{
+    void refresh();
+    if (!api.isWebApp) {
+      api.getWebAppStatus().then(setWebStatus).catch(() => {});
+      return;
+    }
+
+    let disposed = false;
+    let consecutiveFailures = 0;
+    const checkConnection = async () => {
+      try {
+        const status = await api.getWebAppStatus();
+        if (disposed) return;
+        consecutiveFailures = 0;
+        setWebStatus(status);
+        setWebConnected(true);
+        setWebError(null);
+      } catch (error) {
+        if (disposed) return;
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= 2) {
+          setWebConnected(false);
+          setWebError(String(error));
+        }
+      }
+    };
+
+    void checkConnection();
+    const timer = window.setInterval(() => void checkConnection(), 2500);
+    const onReconnect = () => void checkConnection();
+    window.addEventListener('online', onReconnect);
+    window.addEventListener('focus', onReconnect);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      window.removeEventListener('online', onReconnect);
+      window.removeEventListener('focus', onReconnect);
+    };
+  },[]);
   const toggleWebApp = async () => { if (api.isWebApp || webBusy) return; setWebBusy(true); setWebError(null); try { const next=await api.setWebAppEnabled(!webStatus.enabled); setWebStatus(next); } catch (e) { setWebError(String(e)); } finally { setWebBusy(false); } };
   useEffect(()=>{
     let disposed=false;
@@ -1456,7 +1495,7 @@ function App() {
     }
   };
   return <div className={`app-shell thumb-fit-${thumbnailFit}`}><Background/><div className="noise"/>
-    <header className="topbar"><div className="brand"><PulseMark/><span>RAPHAEL MODEL MANAGER</span></div><div className="top-stats"><span>CACHED <b>{fmtBytes(state.storage.cached_bytes)}</b></span><span>TOTAL <b>{fmtBytes(state.storage.total_model_bytes)}</b></span></div><div className="top-actions"><button className={`web-app-btn ${webStatus.enabled ? 'active' : ''}`} disabled={api.isWebApp || webBusy} title={api.isWebApp ? 'LAN web app is controlled from the host desktop' : 'Expose Raphael to other devices on your private LAN'} onClick={toggleWebApp}>{webBusy ? 'STARTING…' : api.isWebApp ? 'WEB APP · CONNECTED' : webStatus.enabled ? 'WEB APP · ON' : 'ENABLE WEB APP'}</button>{webStatus.enabled && webStatus.url ? <a className="web-app-url" href={webStatus.url} target="_blank" rel="noreferrer">{webStatus.url}</a> : null}{webError ? <span className="web-app-error" title={webError}>WEB ERROR</span> : null}<div className="root-path" title={state.models_root}>{state.models_root}</div></div></header>
+    <header className="topbar"><div className="brand"><PulseMark/><span>RAPHAEL MODEL MANAGER</span></div><div className="top-stats"><span>CACHED <b>{fmtBytes(state.storage.cached_bytes)}</b></span><span>TOTAL <b>{fmtBytes(state.storage.total_model_bytes)}</b></span></div><div className="top-actions"><button className={`web-app-btn ${webStatus.enabled && webConnected ? 'active' : ''}`} disabled={api.isWebApp || webBusy} title={api.isWebApp ? (webConnected ? 'LAN web app connection is healthy' : 'LAN web app connection is offline; retrying automatically') : 'Expose Raphael to other devices on your private LAN'} onClick={toggleWebApp}>{webBusy ? 'STARTING…' : api.isWebApp ? (webConnected ? 'WEB APP · CONNECTED' : 'WEB APP · RECONNECTING…') : webStatus.enabled ? 'WEB APP · ON' : 'ENABLE WEB APP'}</button>{webStatus.enabled && webStatus.url ? <a className="web-app-url" href={webStatus.url} target="_blank" rel="noreferrer">{webStatus.url}</a> : null}{webError ? <span className="web-app-error" title={webError}>WEB ERROR</span> : null}<div className="root-path" title={state.models_root}>{state.models_root}</div></div></header>
     <div className="workspace">
       <aside className="sidebar hud-panel">
         <div className="side-title">LIBRARY</div>
