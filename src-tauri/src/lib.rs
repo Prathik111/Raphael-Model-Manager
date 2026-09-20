@@ -1364,7 +1364,7 @@ async fn sync_featured_examples_inner(
                     .query_row(
                         "SELECT id FROM images WHERE model_id=?1 AND civitai_image_id=?2 AND meta_json LIKE '%\"featured\":true%' LIMIT 1",
                         params![model_id, cover_key],
-                        |r| r.get(0),
+                        |r| r.get::<_, i64>(0),
                     )
                     .optional()?
             } else {
