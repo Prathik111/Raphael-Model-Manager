@@ -858,11 +858,13 @@ fn set_model_cover_from_image(
     let source = source
         .map(PathBuf::from)
         .ok_or_else(|| AppError::Invalid("That example image has not finished caching yet".into()))?;
-    let cache_root = cache_root(&app.app_data);
-    let source = source
+    let cache_root = cache_root(&app.app_data)
+        .canonicalize()
+        .map_err(|_| AppError::Invalid("Raphael's Civitai cache is unavailable".into()))?;
+    let canonical_source = source
         .canonicalize()
         .map_err(|_| AppError::Invalid("That example image is no longer available in Raphael's cache".into()))?;
-    if !source.starts_with(&cache_root) || !source.is_file() {
+    if !canonical_source.starts_with(&cache_root) || !canonical_source.is_file() {
         return Err(AppError::Invalid("That example image is outside Raphael's Civitai cache".into()));
     }
 
