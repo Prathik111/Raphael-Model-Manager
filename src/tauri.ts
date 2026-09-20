@@ -92,6 +92,12 @@ export const api = {
     command<ModelImagesResponse>('get_model_images', { id, limit }),
   syncModelGallery: (id: number, targetCount = 20) =>
     command<boolean>('sync_model_gallery', { id, targetCount }),
+  loadMoreModelExamples: (id: number, amount?: number) =>
+    command<boolean>('load_more_model_examples', { id, targetCount: amount }),
+  getExampleLoadAmount: () =>
+    command<number>('get_example_load_amount'),
+  setExampleLoadAmount: (amount: number) =>
+    command<number>('set_example_load_amount', { amount }),
   refreshAllExamples: () =>
     command<ExamplesRefreshProgress>('refresh_all_examples'),
   getExamplesRefreshStatus: () =>
