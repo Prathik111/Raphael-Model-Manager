@@ -1904,17 +1904,26 @@ fn copy_custom_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
     if !source.is_file() {
         return Err(AppError::Invalid("Selected cover image is not a file".into()));
     }
-    let format = detect_image_format_from_bytes(&fs::read(source)?)?;
+
+    // Validate the image header/format without fully decoding the image. The
+    // actual cover file is then hard-linked when possible, which avoids a
+    // potentially expensive full-file copy.
+    let reader = ImageReader::open(source)
+        .map_err(|e| AppError::Invalid(format!("Could not read the custom cover image: {e}")))?
+        .with_guessed_format()
+        .map_err(|e| AppError::Invalid(format!("Could not inspect the custom cover image: {e}")))?;
+    let format = reader
+        .format()
+        .ok_or_else(|| AppError::Invalid("Could not determine the custom cover image format".into()))?;
     let ext = image_format_extension(format)
         .or_else(|| custom_cover_extension(source))
         .ok_or_else(|| AppError::Invalid("Custom covers must be PNG, JPG, JPEG, WebP, or AVIF images".into()))?;
-    decode_image_file(source)
-        .map_err(|e| AppError::Invalid(format!("Could not read the custom cover image: {e}")))?;
+
     let dir = cache_root(&app.app_data).join("covers");
     fs::create_dir_all(&dir)?;
     let sequence = DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
     let target = dir.join(format!("model_{id}_{sequence}.{ext}"));
-    fs::copy(source, &target)?;
+    copy_or_hard_link(source, &target)?;
     Ok(target)
 }
 
@@ -1948,6 +1957,11 @@ fn set_model_cover_position(
     id: i64,
     x: f64,
     y: f64,
+) -> AppResult<ModelRecord> fn set_model_cover_position(
+    app: State<AppStateInner>,
+    id: i64,
+    x: f64,
+    y: f64,
 ) -> AppResult<ModelRecord> {
     let x = cover_position(x);
     let y = cover_position(y);
@@ -1957,7 +1971,6 @@ fn set_model_cover_position(
         params![id, x, y, now()],
     )?;
     let rec = model_by_id(&c, id)?;
-    let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
 
@@ -1965,6 +1978,10 @@ fn set_model_cover_position(
 async fn set_model_custom_cover(
     app: State<'_, AppStateInner>,
     handle: AppHandle,
+    id: i64,
+    source_path: String,
+) -> AppResult<ModelRecord> fn set_model_custom_cover(
+    app: State<'_, AppStateInner>,
     id: i64,
     source_path: String,
 ) -> AppResult<ModelRecord> {
@@ -1988,8 +2005,6 @@ async fn set_model_custom_cover(
             let _ = fs::remove_file(old_path);
         }
     }
-    let _ = enforce_cache_limit_inner(&app.app_data);
-    let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
 
@@ -1997,6 +2012,9 @@ async fn set_model_custom_cover(
 async fn reset_model_cover(
     app: State<'_, AppStateInner>,
     handle: AppHandle,
+    id: i64,
+) -> AppResult<ModelRecord> fn reset_model_cover(
+    app: State<'_, AppStateInner>,
     id: i64,
 ) -> AppResult<ModelRecord> {
     let _guard=app.cache_lock.lock().await;
@@ -2037,6 +2055,10 @@ fn get_library_counts(app:State<AppStateInner>)->AppResult<LibraryCounts>{
 async fn set_model_cover_from_image(
     app: State<'_, AppStateInner>,
     handle: AppHandle,
+    id: i64,
+    image_id: i64,
+) -> AppResult<ModelRecord> fn set_model_cover_from_image(
+    app: State<'_, AppStateInner>,
     id: i64,
     image_id: i64,
 ) -> AppResult<ModelRecord> {
@@ -2090,7 +2112,6 @@ async fn set_model_cover_from_image(
         }
     }
 
-    let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
 
