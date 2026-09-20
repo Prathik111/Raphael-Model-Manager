@@ -29,12 +29,12 @@ use tokio::{
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
 use crate::{
-    add_subfolder_tags, clear_download_progress, delete_model, get_app_state, get_download_progress, get_library_counts, get_model_images, get_storage_stats,
+    add_subfolder_tags, add_subfolder_tags_inner, clear_download_progress, delete_model, delete_model_inner, get_app_state, get_download_progress, get_library_counts, get_model_images, get_storage_stats,
     get_parallel_downloads, set_parallel_downloads,
     get_cache_stats, set_cache_max_bytes, set_cache_location, clear_cache_images, clear_complete_cache, prune_cache_images, clean_cache_orphans,
-    get_tags, install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
-    refresh_all_examples, get_examples_refresh_status, load_more_model_examples, get_example_load_amount, set_example_load_amount, refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
-    set_model_tags, set_model_type, sync_model_gallery,
+    get_tags, install_civitai_model, link_model_civitai, link_model_civitai_inner, list_models, preview_civitai_import, preview_civitai_import_inner,
+    refresh_all_examples, get_examples_refresh_status, load_more_model_examples, get_example_load_amount, set_example_load_amount, refresh_model_civitai, refresh_model_civitai_inner, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
+    set_model_tags, set_model_type, sync_model_gallery, sync_gallery_inner,
     is_civitai_token_set, AppError, AppResult, CivitaiImportPreview, ModelRecord,
 };
 
