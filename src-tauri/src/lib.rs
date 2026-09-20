@@ -2379,7 +2379,7 @@ mod tests {
             civitai_model_id: None, civitai_version_id: None, civitai_url: None, civitai_name: Some("Hero".into()),
             version_name: None, base_model: None, creator: None, description: None,
             tags: vec!["Anime".into(), "Megumin".into()], activation_prompts: vec!["magic".into()],
-            source_hash: None, thumbnail_path: None, cover_path: None, cover_position_x: 50.0, cover_position_y: 50.0,
+            source_hash: None, thumbnail_path: None, cover_path: None, cover_source_image_id: None, cover_position_x: 50.0, cover_position_y: 50.0,
             downloaded_at: 0, updated_at: 0,
         };
         assert!(model_search_match(&model, "tag:anime", &[]));
