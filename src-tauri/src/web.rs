@@ -8,7 +8,6 @@ use axum::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    fs,
     net::{IpAddr, SocketAddr, UdpSocket},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
@@ -19,10 +18,9 @@ use tower_http::{cors::CorsLayer, services::ServeDir};
 
 use crate::{
     delete_model, get_app_state, get_library_counts, get_model_images, get_storage_stats, get_tags,
-    install_civitai_model, link_model_civitai, list_models, open_in_file_manager,
-    preview_civitai_import, refresh_model_civitai, set_civitai_token, set_model_tags,
-    set_model_type, sync_model_gallery, is_civitai_token_set, AppError, AppResult, CivitaiImportPreview,
-    AppStateInner, LibraryCounts, ModelImage, ModelRecord, StorageStats, TagRecord,
+    install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
+    refresh_model_civitai, set_civitai_token, set_model_tags, set_model_type, sync_model_gallery,
+    is_civitai_token_set, AppError, AppResult, CivitaiImportPreview, ModelRecord,
 };
 
 pub const WEB_PORT: u16 = 1421;
@@ -127,10 +125,6 @@ struct FileQuery {
     path: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct WebEnabledArgs {
-    enabled: bool,
-}
 
 fn arg<T: DeserializeOwned>(value: Value) -> Result<T, AppError> {
     serde_json::from_value(value).map_err(|e| AppError::Invalid(format!("Invalid web request: {e}")))
