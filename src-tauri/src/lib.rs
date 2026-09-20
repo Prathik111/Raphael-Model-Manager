@@ -3261,7 +3261,10 @@ mod tests {
 
         let target = temp.path().join("relocated-cache");
         let stats = set_cache_location_inner(&app_data, &target.to_string_lossy()).unwrap();
-        assert_eq!(PathBuf::from(stats.location), target);
+        assert_eq!(
+            PathBuf::from(stats.location).canonicalize().unwrap(),
+            target.canonicalize().unwrap(),
+        );
         let new_file = target.join("civitai/123/456.jpg");
         assert!(new_file.is_file());
         assert!(!old_file.exists());
