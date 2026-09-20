@@ -339,3 +339,12 @@ color:rgba(240,248,252,.58);border:1px solid rgba(255,255,255,.05)}
 .bulk-link-input{display:none}
 .bulk-link-status{font-size:7px;letter-spacing:.08em;color:rgba(215,245,230,.58);margin-top:8px}
 .settings-download-copy{max-width:560px;color:rgba(230,241,248,.42);font-size:8px;line-height:1.6;margin:7px 0 12px}
+
+/* Civitai featured examples refresh */
+.examples-refresh-progress{margin-top:12px;padding:12px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.025)}
+.examples-refresh-head{display:flex;justify-content:space-between;gap:12px;font-size:10px;letter-spacing:.12em;color:rgba(255,255,255,.72)}
+.examples-refresh-track{height:6px;margin:10px 0 8px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.28);overflow:hidden}
+.examples-refresh-fill{height:100%;background:rgba(165,215,255,.8);transition:width .2s ease}
+.examples-refresh-meta{display:flex;justify-content:space-between;gap:12px;font-size:9px;color:rgba(255,255,255,.45)}
+.examples-refresh-status{margin-top:7px;font-size:9px;line-height:1.4;color:rgba(255,255,255,.58)}
+.examples-refresh-error{margin-top:7px;color:#ff9f9f;font-size:9px;line-height:1.4}
