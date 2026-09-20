@@ -1795,7 +1795,10 @@ async fn sync_gallery_inner(
                     cfg=excluded.cfg,
                     sampler=excluded.sampler,
                     seed=excluded.seed,
-                    meta_json=excluded.meta_json",
+                    meta_json=CASE
+                        WHEN images.meta_json LIKE '%\"featured\":true%' THEN images.meta_json
+                        ELSE excluded.meta_json
+                    END",
                 params![
                     model_id,iid,local_path,
                     if thumb.exists(){Some(thumb.to_string_lossy().to_string())}else{None::<String>},
@@ -1961,19 +1964,21 @@ async fn refresh_model_civitai(
 }
 #[tauri::command]
 fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResult<ExamplesRefreshProgress> {
-    {
-        let guard = app.examples_refresh_state.lock()
-            .map_err(|_| AppError::Invalid("Featured example refresh state is unavailable".into()))?;
-        if guard.running {
-            return Err(AppError::Invalid("Featured example refresh is already running".into()));
-        }
-    }
     let initial = ExamplesRefreshProgress {
         current: 0, total: 0, model_id: None, model_name: None,
         version_current: 0, version_total: 5, images_saved: 0,
         status: "Starting featured example refresh".into(), done: false, error: None,
     };
-    store_examples_refresh_state(&app.examples_refresh_state, &handle, initial.clone());
+    {
+        let mut guard = app.examples_refresh_state.lock()
+            .map_err(|_| AppError::Invalid("Featured example refresh state is unavailable".into()))?;
+        if guard.running {
+            return Err(AppError::Invalid("Featured example refresh is already running".into()));
+        }
+        guard.running = true;
+        guard.progress = Some(initial.clone());
+    }
+    emit_examples_progress(&handle, initial.clone());
 
     let state = app.inner().clone();
     let refresh_state = state.examples_refresh_state.clone();
