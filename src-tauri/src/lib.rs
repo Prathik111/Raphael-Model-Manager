@@ -552,6 +552,61 @@ fn set_model_tags(app:State<AppStateInner>, handle:AppHandle, id:i64, tags:Vec<S
 }
 
 #[tauri::command]
+fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<()> {
+    let root = app.models_root.read().unwrap().clone()
+        .ok_or_else(|| AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
+
+    let (path, thumbnail_path, image_paths) = {
+        let c = open_db(&app.app_data)?;
+        let model = model_by_id(&c, id)?;
+        let mut stmt = c.prepare("SELECT local_path,thumbnail_path FROM images WHERE model_id=?1")?;
+        let rows = stmt.query_map([id], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let image_paths: Vec<(Option<String>,Option<String>)> = rows.filter_map(Result::ok).collect();
+        (PathBuf::from(model.path), model.thumbnail_path, image_paths)
+    };
+
+    if !path.starts_with(&root) {
+        return Err(AppError::Invalid("Refusing to delete a model outside the configured models folder".into()));
+    }
+
+    if path.exists() {
+        let meta = fs::metadata(&path)?;
+        if !meta.is_file() {
+            return Err(AppError::Invalid("The model path is not a regular file".into()));
+        }
+        fs::remove_file(&path)?;
+    }
+
+    for (local_path, thumb_path) in image_paths {
+        for cached in [local_path, thumb_path] {
+            if let Some(cached) = cached {
+                let cached_path = PathBuf::from(cached);
+                if cached_path.starts_with(&app.app_data) && cached_path.is_file() {
+                    let _ = fs::remove_file(cached_path);
+                }
+            }
+        }
+    }
+
+    if let Some(thumbnail) = thumbnail_path {
+        let thumbnail_path = PathBuf::from(thumbnail);
+        if thumbnail_path.starts_with(&app.app_data) && thumbnail_path.is_file() {
+            let _ = fs::remove_file(thumbnail_path);
+        }
+    }
+
+    let c = open_db(&app.app_data)?;
+    let deleted = c.execute("DELETE FROM models WHERE id=?1", [id])?;
+    if deleted == 0 {
+        return Err(AppError::Invalid("Model no longer exists".into()));
+    }
+    let _ = handle.emit("models-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
 fn set_model_type(app:State<AppStateInner>, handle:AppHandle, id:i64, model_type:String)->AppResult<ModelRecord>{
     let requested=model_type.trim();
     let c=open_db(&app.app_data)?;
@@ -1334,7 +1389,7 @@ pub fn run() {
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,set_model_tags,set_model_type,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,set_model_tags,set_model_type,delete_model,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
@@ -1440,6 +1495,22 @@ mod tests {
         assert!(model_search_match(&model, "-tag:realistic", &[]));
         assert!(!model_search_match(&model, "-tag:anime", &[]));
         assert!(model_search_match(&model, "magic", &[]));
+    }
+
+    #[test]
+    fn delete_model_requires_path_inside_models_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let root = temp.path().join("models");
+        fs::create_dir_all(&root).unwrap();
+        let db = open_db(&app_data).unwrap();
+        db.execute(
+            "INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,updated_at)
+             VALUES(?1,'evil/model.safetensors','model.safetensors','Other',1,0,0)",
+            [temp.path().join("outside.safetensors").to_string_lossy().to_string()],
+        ).unwrap();
+        let stored: String = db.query_row("SELECT path FROM models LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert!(!Path::new(&stored).starts_with(&root));
     }
 
     #[test]
