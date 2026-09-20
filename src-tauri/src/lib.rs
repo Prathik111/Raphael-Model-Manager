@@ -77,6 +77,7 @@ struct ModelRecord {
     tags: Vec<String>,
     activation_prompts: Vec<String>,
     source_hash: Option<String>,
+    thumbnail_path: Option<String>,
     updated_at: i64,
 }
 
@@ -111,6 +112,7 @@ struct CivitaiImportPreview {
     model: Value,
     version: Value,
     target_directory: String,
+    thumbnail_path: Option<String>,
     images_count_hint: Option<i64>,
 }
 
@@ -256,10 +258,11 @@ fn recursive_scan_and_emit(app: AppStateInner, handle: AppHandle) {
 
 fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
     let tags: String = r.get(15)?; let activ: String = r.get(16)?;
-    Ok(ModelRecord { id:r.get(0)?, path:r.get(1)?, relative_path:r.get(2)?, filename:r.get(3)?, model_type:r.get(4)?, size_bytes:r.get(5)?, modified_at:r.get(6)?, civitai_model_id:r.get(7)?, civitai_version_id:r.get(8)?, civitai_url:r.get(9)?, civitai_name:r.get(10)?, version_name:r.get(11)?, base_model:r.get(12)?, creator:r.get(13)?, description:r.get(14)?, tags:serde_json::from_str(&tags).unwrap_or_default(), activation_prompts:serde_json::from_str(&activ).unwrap_or_default(), source_hash:r.get(17)?, updated_at:r.get(18)? })
+    Ok(ModelRecord { id:r.get(0)?, path:r.get(1)?, relative_path:r.get(2)?, filename:r.get(3)?, model_type:r.get(4)?, size_bytes:r.get(5)?, modified_at:r.get(6)?, civitai_model_id:r.get(7)?, civitai_version_id:r.get(8)?, civitai_url:r.get(9)?, civitai_name:r.get(10)?, version_name:r.get(11)?, base_model:r.get(12)?, creator:r.get(13)?, description:r.get(14)?, tags:serde_json::from_str(&tags).unwrap_or_default(), activation_prompts:serde_json::from_str(&activ).unwrap_or_default(), source_hash:r.get(17)?, thumbnail_path:r.get(18)?, updated_at:r.get(19)? })
 }
+const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,(SELECT local_path FROM images WHERE images.model_id=models.id AND local_path IS NOT NULL ORDER BY id LIMIT 1) AS thumbnail_path,updated_at FROM models";
 fn model_by_id(c: &Connection, id: i64) -> AppResult<ModelRecord> {
-    Ok(c.query_row("SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,updated_at FROM models WHERE id=?1", [id], model_from_row)?)
+    Ok(c.query_row(&format!("{MODEL_SELECT} WHERE id=?1"), [id], model_from_row)?)
 }
 
 fn civitai_client(_app: &AppStateInner) -> AppResult<Client> {
@@ -291,7 +294,8 @@ async fn api_get(app: &AppStateInner, url: &str) -> AppResult<Value> {
 
 fn model_id_and_version(url: &str) -> AppResult<(i64,Option<i64>)> {
     let u=Url::parse(url)?;
-    if !(u.host_str().unwrap_or("") == "civitai.com" || u.host_str().unwrap_or("").ends_with(".civitai.com")){ return Err(AppError::Invalid("Expected a civitai.com model URL".into())); }
+    let host=u.host_str().unwrap_or("").to_ascii_lowercase();
+    if !(host=="civitai.com" || host=="www.civitai.com" || host=="civitai.red" || host=="www.civitai.red"){ return Err(AppError::Invalid("Expected a civitai.com or civitai.red model URL".into())); }
     let parts: Vec<&str>=u.path_segments().map(|s|s.collect()).unwrap_or_default();
     let model_id=parts.iter().position(|x|*x=="models").and_then(|i|parts.get(i+1)).and_then(|x|x.parse().ok()).ok_or_else(||AppError::Invalid("Could not find Civitai model ID".into()))?;
     let version_id=u.query_pairs().find(|(k,_)|k=="modelVersionId").and_then(|(_,v)|v.parse().ok());
@@ -338,8 +342,56 @@ async fn fetch_model_and_version(app:&AppStateInner, source:&str) -> AppResult<(
 }
 
 fn civitai_type_to_folder(t:&str)->&'static str { match t.to_lowercase().as_str(){"checkpoint"=>"checkpoints","lora"|"locon"|"lycoris"=>"loras","vae"=>"vae","controlnet"=>"controlnet","textualinversion"=>"embeddings","upscaler"=>"upscale_models","ipadapter"=>"ipadapter","clip"=>"text_encoders",_=>"other"} }
+fn civitai_host(url:&str)->AppResult<String>{Ok(Url::parse(url)?.host_str().unwrap_or("civitai.com").to_ascii_lowercase().replace("www.",""))}
+fn canonical_civitai_url(source:&str,model_id:Option<i64>,version_id:Option<i64>)->AppResult<String>{let host=civitai_host(source)?;Ok(match (model_id,version_id){(Some(mid),Some(vid))=>format!("https://{host}/models/{mid}?modelVersionId={vid}"),(Some(mid),None)=>format!("https://{host}/models/{mid}"),_=>source.to_string()})}
 fn json_strings(v:Option<&Value>)->Vec<String>{v.and_then(Value::as_array).map(|a|a.iter().filter_map(|x|x.as_str().map(str::to_string)).collect()).unwrap_or_default()}
 fn strip_html(s:&str)->String{let mut out=String::with_capacity(s.len());let mut in_tag=false;for ch in s.chars(){match ch{ '<'=>in_tag=true,'>'=>in_tag=false,_ if !in_tag=>out.push(ch),_=>{}}}out.replace("&nbsp;"," ").replace("&amp;","&").replace("&lt;","<").replace("&gt;",">")}
+
+async fn download_cached_thumbnail(app:&AppStateInner, cache: &Path, url:&str)->AppResult<Option<String>>{
+    if cache.exists(){return Ok(Some(cache.to_string_lossy().to_string()));}
+    let client=civitai_client(app)?;
+    let mut req=client.get(url);
+    if let Some(t)=token(){req=req.bearer_auth(t);}
+    let res=req.send().await?;
+    if !res.status().is_success(){return Ok(None);}
+    let bytes=res.bytes().await?;
+    if bytes.is_empty(){return Ok(None);}
+    if let Some(parent)=cache.parent(){fs::create_dir_all(parent)?;}
+    fs::write(cache,&bytes)?;
+    Ok(Some(cache.to_string_lossy().to_string()))
+}
+
+async fn ensure_model_thumbnail(app:&AppStateInner, model_id:i64, model:&Value, version:&Value, source_url:&str)->AppResult<Option<String>>{
+    let root=cache_root(&app.app_data).join(model_id.to_string());
+    fs::create_dir_all(&root)?;
+    let mut remote:Option<String>=model.get("images").and_then(Value::as_array).and_then(|a|a.iter().find_map(|x|x.get("url").and_then(Value::as_str).map(str::to_string)));
+    if remote.is_none(){remote=version.get("images").and_then(Value::as_array).and_then(|a|a.iter().find_map(|x|x.get("url").and_then(Value::as_str).map(str::to_string)));}
+
+    if let Some(url)=remote {
+        let ext=Url::parse(&url).ok().and_then(|u|Path::new(u.path()).extension().and_then(|x|x.to_str()).map(str::to_string)).unwrap_or_else(||"jpg".into());
+        return download_cached_thumbnail(app,&root.join(format!("thumbnail.{ext}")),&url).await;
+    }
+
+    let client=civitai_client(app)?;
+    let mut req=client.get(source_url);
+    if let Some(t)=token(){req=req.bearer_auth(t);}
+    let res=req.send().await?;
+    if !res.status().is_success(){return Ok(None);}
+    let html=res.text().await?;
+    let lower=html.to_ascii_lowercase();
+    let marker="property=\"og:image\"";
+    if let Some(pos)=lower.find(marker){
+        let tail=&html[pos+marker.len()..];
+        if let Some(content_pos)=tail.to_ascii_lowercase().find("content=\""){
+            let value=&tail[content_pos+9..];
+            if let Some(end)=value.find('"'){
+                let image_url=&value[..end];
+                return download_cached_thumbnail(app,&root.join("thumbnail.jpg"),image_url).await;
+            }
+        }
+    }
+    Ok(None)
+}
 
 #[tauri::command]
 fn get_app_state(app: State<AppStateInner>) -> AppResult<AppStateResponse> {
@@ -357,7 +409,7 @@ fn set_models_root(app: State<AppStateInner>, handle: AppHandle, path:String)->A
 }
 #[tauri::command]
 fn list_models(app:State<AppStateInner>, r#type:Option<String>, query:Option<String>)->AppResult<Vec<ModelRecord>>{
-    let c=open_db(&app.app_data)?; let mut sql="SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,updated_at FROM models WHERE 1=1".to_string(); let mut args:Vec<String>=vec![];
+    let c=open_db(&app.app_data)?; let mut sql=format!("{MODEL_SELECT} WHERE 1=1"); let mut args:Vec<String>=vec![];
     if let Some(t)=r#type {sql.push_str(" AND model_type=?");args.push(t)}
     if let Some(q)=query {sql.push_str(" AND (filename LIKE ? OR relative_path LIKE ? OR civitai_name LIKE ?)"); let x=format!("%{q}%");args.extend([x.clone(),x.clone(),x]);}
     sql.push_str(" ORDER BY COALESCE(civitai_name,filename) COLLATE NOCASE"); let mut stmt=c.prepare(&sql)?; let rows=stmt.query_map(rusqlite::params_from_iter(args.iter()),model_from_row)?; Ok(rows.filter_map(Result::ok).collect())
@@ -381,7 +433,10 @@ fn get_model_images(app:State<AppStateInner>, id:i64)->AppResult<Vec<ModelImage>
 async fn preview_civitai_import(app:State<'_,AppStateInner>,url:String)->AppResult<CivitaiImportPreview>{
     let (model,version)=fetch_model_and_version(&app,&url).await?; let (dl,size,filename,sha256)=selected_file(&version).ok_or_else(||AppError::Api("No downloadable public file found for this version".into()))?;
     let root=app.models_root.read().unwrap().clone().ok_or_else(||AppError::Invalid("Choose your ComfyUI models folder first".into()))?; let typ=model.get("type").and_then(Value::as_str).unwrap_or("Other"); let target=root.join(civitai_type_to_folder(typ));
-    let activation=json_strings(version.get("trainedWords")); Ok(CivitaiImportPreview{model:json!({"id":model.get("id"),"name":model.get("name"),"type":typ,"description":model.get("description"),"tags":model.get("tags"),"creator":model.get("creator").and_then(|v|v.get("username"))}),version:json!({"id":version.get("id"),"name":version.get("name"),"base_model":version.get("baseModel"),"download_url":dl,"filename":filename,"size_bytes":size,"sha256":sha256,"activation_prompts":activation}),target_directory:target.to_string_lossy().to_string(),images_count_hint:version.get("images").and_then(Value::as_array).map(|x|x.len() as i64)})
+    let activation=json_strings(version.get("trainedWords"));
+    let mid=model.get("id").and_then(Value::as_i64);
+    let thumb=match mid { Some(model_id)=>ensure_model_thumbnail(&app,model_id,&model,&version,&url).await?, None=>None };
+    Ok(CivitaiImportPreview{model:json!({"id":model.get("id"),"name":model.get("name"),"type":typ,"description":model.get("description"),"tags":model.get("tags"),"creator":model.get("creator").and_then(|v|v.get("username")),"thumbnail_path":thumb}),version:json!({"id":version.get("id"),"name":version.get("name"),"base_model":version.get("baseModel"),"download_url":dl,"filename":filename,"size_bytes":size,"sha256":sha256,"activation_prompts":activation}),target_directory:target.to_string_lossy().to_string(),thumbnail_path:thumb,images_count_hint:version.get("images").and_then(Value::as_array).map(|x|x.len() as i64)})
 }
 
 async fn download_file(
@@ -508,6 +563,7 @@ async fn install_civitai_model(
     app: State<'_, AppStateInner>,
     handle: AppHandle,
     url: String,
+    target_directory: Option<String>,
 ) -> AppResult<ModelRecord> {
     let (model, version) = fetch_model_and_version(&app, &url).await?;
     let version_id = version.get("id").and_then(Value::as_i64);
@@ -538,7 +594,14 @@ async fn install_civitai_model(
         .clone()
         .ok_or_else(|| AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
 
-    let target = root.join(civitai_type_to_folder(&typ));
+    let target = if let Some(custom) = target_directory {
+        let candidate=PathBuf::from(custom);
+        fs::create_dir_all(&candidate)?;
+        let root_canonical=root.canonicalize()?;
+        let target_canonical=candidate.canonicalize()?;
+        if !target_canonical.starts_with(&root_canonical){return Err(AppError::Invalid("Download folder must be inside the configured ComfyUI models folder".into()));}
+        target_canonical
+    } else { root.join(civitai_type_to_folder(&typ)) };
     let (path, size, hash) =
         download_file(&app, &dl, &target, &filename, sha256.as_deref()).await?;
 
@@ -566,6 +629,9 @@ async fn install_civitai_model(
         .and_then(Value::as_str)
         .map(str::to_string);
 
+    let mid=model.get("id").and_then(Value::as_i64);
+    let vid=version.get("id").and_then(Value::as_i64);
+    let civitai_url=canonical_civitai_url(&url,mid,vid)?;
     let rec = {
         let c = open_db(&app.app_data)?;
         c.execute(
@@ -604,7 +670,7 @@ async fn install_civitai_model(
                 mtime(&path),
                 mid,
                 vid,
-                url,
+                civitai_url,
                 model.get("name").and_then(Value::as_str),
                 vname,
                 base,
@@ -625,9 +691,10 @@ async fn install_civitai_model(
         model_by_id(&c, id)?
     };
 
+    let _ = ensure_model_thumbnail(&app, rec.civitai_model_id.unwrap_or_default(), &model, &version, &url).await;
     let _ = handle.emit("models-changed", ());
     let _ = sync_gallery_inner(app.inner().clone(), rec.id, handle.clone(), true).await;
-    Ok(rec)
+    Ok(model_by_id(&open_db(&app.app_data)?, rec.id)?)
 }
 fn parse_meta(meta:&Value,key:&str)->Option<String>{meta.get(key).and_then(Value::as_str).map(str::to_string)}
 async fn sync_gallery_inner(
@@ -839,11 +906,7 @@ async fn link_model_civitai(
     let creator=model.get("creator").and_then(|v|v.get("username")).and_then(Value::as_str).map(str::to_string);
     let mid=model.get("id").and_then(Value::as_i64);
     let vid=version.get("id").and_then(Value::as_i64);
-    let canonical=match (mid,vid) {
-        (Some(m),Some(v))=>format!("https://civitai.com/models/{m}?modelVersionId={v}"),
-        (Some(m),None)=>format!("https://civitai.com/models/{m}"),
-        _=>trimmed.to_string(),
-    };
+    let canonical=canonical_civitai_url(trimmed,mid,vid)?;
     let rec={
         let c=open_db(&app.app_data)?;
         c.execute(
@@ -877,9 +940,10 @@ async fn link_model_civitai(
         )?;
         model_by_id(&c,id)?
     };
+    if let Some(mid)=mid { let _=ensure_model_thumbnail(&app,mid,&model,&version,trimmed).await; }
     sync_gallery_inner(app.inner().clone(),id,handle.clone(),true).await?;
     let _=handle.emit("models-changed",());
-    Ok(rec)
+    Ok(model_by_id(&open_db(&app.app_data)?, id)?)
 }
 
 #[tauri::command]
@@ -1157,6 +1221,10 @@ mod tests {
         assert_eq!(
             model_id_and_version("https://civitai.com/models/12345").unwrap(),
             (12345, None)
+        );
+        assert_eq!(
+            model_id_and_version("https://civitai.red/models/12345?modelVersionId=67890").unwrap(),
+            (12345, Some(67890))
         );
         assert!(model_id_and_version("https://example.com/models/12345").is_err());
         assert!(model_id_and_version("https://civitai.com/images/12345").is_err());
