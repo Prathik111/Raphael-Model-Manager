@@ -3236,6 +3236,122 @@ mod tests {
     }
 
     #[test]
+    fn cache_relocation_updates_files_and_database_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let models_root = temp.path().join("models");
+        fs::create_dir_all(&models_root).unwrap();
+
+        let old_file = app_data.join("cache/civitai/123/456.jpg");
+        fs::create_dir_all(old_file.parent().unwrap()).unwrap();
+        fs::write(&old_file, b"cached-image").unwrap();
+
+        let db = open_db(&app_data).unwrap();
+        db.execute(
+            "INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,updated_at)
+             VALUES('/models/example.safetensors','example.safetensors','example.safetensors','Other',1,0,0)",
+            [],
+        ).unwrap();
+        let model_id = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO images(model_id,civitai_image_id,local_path,cached_at)
+             VALUES(?1,456,?2,1)",
+            params![model_id, old_file.to_string_lossy().to_string()],
+        ).unwrap();
+
+        let target = temp.path().join("relocated-cache");
+        let stats = set_cache_location_inner(&app_data, &target.to_string_lossy()).unwrap();
+        assert_eq!(PathBuf::from(stats.location), target);
+        let new_file = target.join("civitai/123/456.jpg");
+        assert!(new_file.is_file());
+        assert!(!old_file.exists());
+
+        let db = open_db(&app_data).unwrap();
+        let stored: String = db
+            .query_row("SELECT local_path FROM images WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(PathBuf::from(stored), new_file);
+    }
+
+    #[test]
+    fn cache_limit_evicts_oldest_unprotected_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let models_root = temp.path().join("models");
+        fs::create_dir_all(&models_root).unwrap();
+
+        let old_file = app_data.join("cache/civitai/1/old.jpg");
+        let protected_file = app_data.join("cache/civitai/1/protected.jpg");
+        fs::create_dir_all(old_file.parent().unwrap()).unwrap();
+        fs::write(&old_file, b"1234567890").unwrap();
+        fs::write(&protected_file, b"abcdefghij").unwrap();
+
+        let db = open_db(&app_data).unwrap();
+        db.execute(
+            "INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,updated_at)
+             VALUES('/models/example.safetensors','example.safetensors','example.safetensors','Other',1,0,0)",
+            [],
+        ).unwrap();
+        let model_id = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO images(model_id,civitai_image_id,local_path,cached_at)
+             VALUES(?1,100,?2,1)",
+            params![model_id, old_file.to_string_lossy().to_string()],
+        ).unwrap();
+        let old_id = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO images(model_id,civitai_image_id,local_path,cached_at)
+             VALUES(?1,101,?2,2)",
+            params![model_id, protected_file.to_string_lossy().to_string()],
+        ).unwrap();
+        let protected_id = db.last_insert_rowid();
+        db.execute(
+            "UPDATE models SET cover_source_image_id=?2 WHERE id=?1",
+            params![model_id, protected_id],
+        ).unwrap();
+
+        put_setting(&db, "cache_max_bytes", "15").unwrap();
+        drop(db);
+
+        let result = enforce_cache_limit_inner(&app_data).unwrap();
+        assert!(!old_file.exists());
+        assert!(protected_file.is_file());
+        assert!(result.remaining_bytes <= 15);
+        let db = open_db(&app_data).unwrap();
+        let old_exists: i64 = db
+            .query_row("SELECT COUNT(*) FROM images WHERE id=?1", [old_id], |r| r.get(0))
+            .unwrap();
+        let protected_exists: i64 = db
+            .query_row("SELECT COUNT(*) FROM images WHERE id=?1", [protected_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_exists, 0);
+        assert_eq!(protected_exists, 1);
+    }
+
+    #[test]
+    fn custom_cover_uses_configured_cache_location() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let models_root = temp.path().join("models");
+        fs::create_dir_all(&models_root).unwrap();
+        let target = temp.path().join("relocated-cache");
+        fs::create_dir_all(&target).unwrap();
+
+        let db = open_db(&app_data).unwrap();
+        put_setting(&db, "cache_location", &target.to_string_lossy()).unwrap();
+        drop(db);
+
+        let source = temp.path().join("source.png");
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([0, 255, 0]));
+        image.save(&source).unwrap();
+
+        let state = test_state(app_data.clone(), models_root);
+        let copied = copy_custom_cover(&state, 7, &source).unwrap();
+        assert!(copied.starts_with(target.join("covers")));
+        assert!(copied.is_file());
+    }
+
+    #[test]
     fn database_schema_is_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let first = open_db(temp.path()).unwrap();
