@@ -9,10 +9,15 @@ use axum::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
+    future::Future,
     net::{IpAddr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
+    time::{Duration, Instant},
 };
 use tauri::{path::BaseDirectory, AppHandle, Manager, State};
 use tokio::{
@@ -34,6 +39,102 @@ use crate::{
 };
 
 pub const WEB_PORT: u16 = 1421;
+const WEB_TASK_TTL: Duration = Duration::from_secs(15 * 60);
+static WEB_TASK_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Serialize, Clone)]
+struct WebTaskStatus {
+    task_id: String,
+    state: String,
+    result: Option<Value>,
+    error: Option<String>,
+}
+
+struct WebTaskRecord {
+    status: WebTaskStatus,
+    updated_at: Instant,
+}
+
+#[derive(Clone, Default)]
+struct WebTaskStore {
+    inner: Arc<Mutex<HashMap<String, WebTaskRecord>>>,
+}
+
+impl WebTaskStore {
+    fn prune(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.retain(|_, record| {
+                !matches!(record.status.state.as_str(), "completed" | "failed")
+                    || record.updated_at.elapsed() < WEB_TASK_TTL
+            });
+        }
+    }
+
+    fn start<F, Fut>(&self, operation: F) -> String
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = AppResult<Value>> + Send + 'static,
+    {
+        self.prune();
+        let task_id = format!("web-{}", WEB_TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
+        let status = WebTaskStatus {
+            task_id: task_id.clone(),
+            state: "queued".into(),
+            result: None,
+            error: None,
+        };
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.insert(
+                task_id.clone(),
+                WebTaskRecord {
+                    status,
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+
+        let store = self.clone();
+        let id = task_id.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Ok(mut guard) = store.inner.lock() {
+                if let Some(record) = guard.get_mut(&id) {
+                    record.status.state = "running".into();
+                    record.updated_at = Instant::now();
+                }
+            }
+
+            let result = operation().await;
+
+            if let Ok(mut guard) = store.inner.lock() {
+                if let Some(record) = guard.get_mut(&id) {
+                    record.updated_at = Instant::now();
+                    match result {
+                        Ok(value) => {
+                            record.status.state = "completed".into();
+                            record.status.result = Some(value);
+                            record.status.error = None;
+                        }
+                        Err(error) => {
+                            record.status.state = "failed".into();
+                            record.status.result = None;
+                            record.status.error = Some(error.to_string());
+                        }
+                    }
+                }
+            }
+        });
+
+        task_id
+    }
+
+    fn get(&self, task_id: &str) -> Option<WebTaskStatus> {
+        self.prune();
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(task_id).map(|record| record.status.clone()))
+    }
+}
 
 #[derive(Debug, Serialize, Clone)]
 pub struct WebAppStatus {
@@ -51,6 +152,8 @@ struct WebServerControllerInner {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     enabled: RwLock<bool>,
     url: RwLock<Option<String>>,
+    generation: AtomicU64,
+    tasks: WebTaskStore,
 }
 
 impl Default for WebServerControllerInner {
@@ -59,6 +162,8 @@ impl Default for WebServerControllerInner {
             shutdown: Mutex::new(None),
             enabled: RwLock::new(false),
             url: RwLock::new(None),
+            generation: AtomicU64::new(0),
+            tasks: WebTaskStore::default(),
         }
     }
 }
