@@ -2584,8 +2584,16 @@ async fn sync_gallery_inner(
 
     let mut cursor: Option<String> = None;
     let mut has_more = false;
+    let mut first_page = true;
 
-    while cached_count < target_count {
+    loop {
+        // Always fetch at least one page so an already-cached model can still
+        // determine whether Civitai has additional community examples.
+        if !first_page && cached_count >= target_count {
+            break;
+        }
+        first_page = false;
+
         let mut url = format!("{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true");
         if let Some(c) = &cursor {
             url.push_str("&cursor=");
@@ -2746,7 +2754,7 @@ async fn sync_gallery_inner(
             .as_ref()
             .and_then(|m| m.get("nextCursor").and_then(Value::as_str).map(str::to_string));
 
-        has_more = next_cursor.is_some() || page_len >= 200;
+        has_more = next_cursor.is_some();
 
         if cached_count >= target_count {
             break;
