@@ -415,6 +415,7 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
     }
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('parallel_downloads','3')",[])?;
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('cache_max_bytes','0')",[])?;
+    c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('example_load_amount','20')",[])?;
     Ok(c)
 }
 
@@ -431,6 +432,13 @@ fn read_parallel_downloads(c: &Connection) -> AppResult<usize> {
     Ok(setting(c, "parallel_downloads")?.and_then(|value| value.parse::<i64>().ok()).map(clamp_parallel_downloads).unwrap_or(3) as usize)
 }
 
+
+fn read_example_load_amount(c: &Connection) -> AppResult<i64> {
+    Ok(setting(c, "example_load_amount")?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100))
+}
 
 fn read_cache_max_bytes(c: &Connection) -> AppResult<i64> {
     Ok(setting(c, "cache_max_bytes")?
@@ -2316,6 +2324,44 @@ async fn sync_model_gallery(
     let target_count = target_count.unwrap_or(20).clamp(1, 200);
     sync_gallery_inner(app.inner().clone(), id, handle, target_count).await
 }
+#[tauri::command]
+async fn load_more_model_examples(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    amount: Option<i64>,
+) -> AppResult<bool> {
+    let requested = amount.unwrap_or_else(|| {
+        open_db(&app.app_data)
+            .ok()
+            .and_then(|c| read_example_load_amount(&c).ok())
+            .unwrap_or(20)
+    }).clamp(1, 100);
+    let current_count = {
+        let c = open_db(&app.app_data)?;
+        c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1", [id], |r| r.get::<_, i64>(0))?
+    };
+    sync_gallery_inner(
+        app.inner().clone(),
+        id,
+        handle,
+        current_count.saturating_add(requested).clamp(1, 300),
+    ).await
+}
+
+#[tauri::command]
+fn get_example_load_amount(app: State<AppStateInner>) -> AppResult<i64> {
+    let c = open_db(&app.app_data)?;
+    read_example_load_amount(&c)
+}
+
+#[tauri::command]
+fn set_example_load_amount(app: State<AppStateInner>, amount: i64) -> AppResult<i64> {
+    let value = amount.clamp(1, 100);
+    let c = open_db(&app.app_data)?;
+    put_setting(&c, "example_load_amount", &value.to_string())?;
+    Ok(value)
+}
 
 #[tauri::command]
 async fn link_model_civitai(
@@ -2779,7 +2825,7 @@ pub fn run() {
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
