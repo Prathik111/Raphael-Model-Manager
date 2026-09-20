@@ -836,7 +836,7 @@ fn set_cache_location_inner(app_data: &Path, path: &str) -> AppResult<CacheStats
     let db_update = (|| {
         let mut c = open_db(app_data)?;
         let bytes = dir_size(&target_canonical);
-        rewrite_cache_paths(&mut c, &old, &target_canonical, bytes)?;
+        rewrite_cache_paths(&mut c, &old_canonical, &target_canonical, bytes)?;
         Ok::<(), AppError>(())
     })();
 
