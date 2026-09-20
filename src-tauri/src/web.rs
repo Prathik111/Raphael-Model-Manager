@@ -19,7 +19,8 @@ use tower_http::{cors::CorsLayer, services::ServeDir};
 use crate::{
     add_subfolder_tags, delete_model, get_app_state, get_library_counts, get_model_images, get_storage_stats,
     get_tags, install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
-    refresh_model_civitai, set_civitai_token, set_model_tags, set_model_type, sync_model_gallery,
+    refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position,
+    set_model_tags, set_model_type, sync_model_gallery,
     is_civitai_token_set, AppError, AppResult, CivitaiImportPreview, ModelRecord,
 };
 
@@ -93,6 +94,13 @@ struct TypeArgs {
     id: i64,
     #[serde(rename = "modelType")]
     model_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoverPositionArgs {
+    id: i64,
+    x: f64,
+    y: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +250,19 @@ async fn command_handler(
         "set_model_type" => {
             let args: TypeArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             set_model_type(handle.state(), handle.clone(), args.id, args.model_type).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        }
+        "set_model_cover_position" => {
+            let args: CoverPositionArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            set_model_cover_position(handle.state(), handle.clone(), args.id, args.x, args.y)
+                .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        }
+        "reset_model_cover" => {
+            let args: IdArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            reset_model_cover(handle.state(), handle.clone(), args.id)
+                .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        }
+        "set_model_custom_cover" => {
+            Err(AppError::Invalid("Custom cover file selection is only available in the desktop app.".into()))
         }
         "delete_model" => {
             let args: IdArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
