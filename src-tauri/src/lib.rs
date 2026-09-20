@@ -805,29 +805,26 @@ async fn sync_featured_examples_inner(
                 }
                 fs::write(&local,&bytes)?;
             }
-            if !thumb.exists(){
-                let img=match image::open(&local) {
-                    Ok(value)=>value,
-                    Err(error)=>{
-                        had_errors=true;
+            if !thumb.exists() {
+                match image::open(&local) {
+                    Ok(img) => {
+                        let thumb_image = img.thumbnail(420, 420);
+                        if let Err(error) = thumb_image.save_with_format(&thumb, image::ImageFormat::WebP) {
+                            emit_examples_progress(&handle, ExamplesRefreshProgress{
+                                current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                                version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                                status:format!("Thumbnail generation skipped for featured image {image_id}"),done:false,error:Some(error.to_string())
+                            });
+                        }
+                    }
+                    Err(error) => {
                         decode_failures += 1;
-                        emit_examples_progress(&handle,ExamplesRefreshProgress{
+                        emit_examples_progress(&handle, ExamplesRefreshProgress{
                             current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                             version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                            status:format!("Could not decode featured image {image_id}"),done:false,error:Some(error.to_string())
+                            status:format!("Thumbnail decode skipped for featured image {image_id}; original saved"),done:false,error:Some(error.to_string())
                         });
-                        continue;
                     }
-                };
-                let thumb_image=img.thumbnail(420,420);
-                if let Err(error)=thumb_image.save_with_format(&thumb,image::ImageFormat::WebP){
-                    had_errors=true;
-                    emit_examples_progress(&handle,ExamplesRefreshProgress{
-                        current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
-                        version_current:version_index,version_total:total_versions,images_saved:saved_count,
-                        status:format!("Could not create thumbnail {image_id}"),done:false,error:Some(error.to_string())
-                    });
-                    continue;
                 }
             }
             let mut meta=image.clone();
@@ -845,8 +842,12 @@ async fn sync_featured_examples_inner(
             let width=image.get("width").and_then(Value::as_i64);
             let height=image.get("height").and_then(Value::as_i64);
             let final_local=active.join(version_id.to_string()).join(format!("{image_id}.{ext}")).to_string_lossy().to_string();
-            let final_thumb=active.join(version_id.to_string()).join(format!("{image_id}_thumb.webp")).to_string_lossy().to_string();
-            records.push((image_id,Some(final_local),Some(final_thumb),width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into())));
+            let final_thumb=if thumb.exists() {
+                Some(active.join(version_id.to_string()).join(format!("{image_id}_thumb.webp")).to_string_lossy().to_string())
+            } else {
+                None
+            };
+            records.push((image_id,Some(final_local),final_thumb,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into())));
             saved_count+=1;
         }
         emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index+1,version_total:total_versions,images_saved:saved_count,status:format!("Saved featured examples from {version_name}"),done:false,error:None});
@@ -855,8 +856,8 @@ async fn sync_featured_examples_inner(
     if had_errors {
         let _=fs::remove_dir_all(&staging);
         return Err(AppError::Api(format!(
-            "Featured example refresh encountered image errors; previous cache preserved ({} versions, {} image entries, {} usable URLs, {} download failures, {} read failures, {} decode failures)",
-            total_versions, image_entries, image_urls, download_failures, read_failures, decode_failures
+            "Featured example refresh encountered image download/read errors; previous cache preserved ({} versions, {} image entries, {} usable URLs, {} download failures, {} read failures)",
+            total_versions, image_entries, image_urls, download_failures, read_failures
         )));
     }
 
