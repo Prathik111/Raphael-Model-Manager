@@ -272,6 +272,7 @@ async fn file_handler(
         "png" => "image/png",
         "webp" => "image/webp",
         "gif" => "image/gif",
+        "avif" => "image/avif",
         _ => "application/octet-stream",
     };
 
