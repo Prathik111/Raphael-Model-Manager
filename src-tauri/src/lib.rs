@@ -3033,8 +3033,8 @@ fn set_example_load_amount(app: State<AppStateInner>, amount: i64) -> AppResult<
 }
 
 #[tauri::command]
-async fn link_model_civitai(
-    app:State<'_,AppStateInner>,
+async fn link_model_civitai_inner(
+    app: &AppStateInner,
     handle:AppHandle,
     id:i64,
     url:String,
@@ -3042,7 +3042,7 @@ async fn link_model_civitai(
     let _guard=app.cache_lock.lock().await;
     let trimmed=url.trim();
     let (_mid,_vid)=model_id_and_version(trimmed)?;
-    let (model,version)=fetch_model_and_version(&app,trimmed).await?;
+    let (model,version)=fetch_model_and_version(app,trimmed).await?;
     let tags=json_strings(model.get("tags"));
     let activation=json_strings(version.get("trainedWords"));
     let desc=model.get("description").and_then(Value::as_str).map(strip_html);
@@ -3052,7 +3052,7 @@ async fn link_model_civitai(
     let canonical=canonical_civitai_url(trimmed,mid,vid)?;
     let thumbnail_path=match mid {
         Some(model_id)=>{
-            let result=ensure_model_thumbnail(&app,model_id,&model,&version,trimmed).await?;
+            let result=ensure_model_thumbnail(app,model_id,&model,&version,trimmed).await?;
             let _=enforce_cache_limit_inner(&app.app_data);
             result
         },
@@ -3099,8 +3099,17 @@ async fn link_model_civitai(
 }
 
 #[tauri::command]
-async fn refresh_model_civitai(
+async fn link_model_civitai(
     app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    url: String,
+) -> AppResult<ModelRecord> {
+    link_model_civitai_inner(app.inner(), handle, id, url).await
+}
+#[tauri::command]
+async fn refresh_model_civitai_inner(
+    app: &AppStateInner,
     handle: AppHandle,
     id: i64,
 ) -> AppResult<ModelRecord> {
@@ -3115,7 +3124,7 @@ async fn refresh_model_civitai(
         .clone()
         .ok_or_else(|| AppError::Invalid("This model is not linked to Civitai".into()))?;
 
-    let (model, version) = fetch_model_and_version(&app, &url).await?;
+    let (model, version) = fetch_model_and_version(app, &url).await?;
     let tags = json_strings(model.get("tags"));
     let activation = json_strings(version.get("trainedWords"));
     let desc = model
@@ -3129,7 +3138,7 @@ async fn refresh_model_civitai(
         .map(str::to_string);
     let thumbnail_path=match model.get("id").and_then(Value::as_i64) {
         Some(mid)=>{
-            let result=ensure_model_thumbnail(&app,mid,&model,&version,&url).await?;
+            let result=ensure_model_thumbnail(app,mid,&model,&version,&url).await?;
             let _=enforce_cache_limit_inner(&app.app_data);
             result
         },
@@ -3173,6 +3182,14 @@ async fn refresh_model_civitai(
     emit_models_changed(&handle);
     drop(_guard);
     Ok(rec)
+}
+#[tauri::command]
+async fn refresh_model_civitai(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+) -> AppResult<ModelRecord> {
+    refresh_model_civitai_inner(app.inner(), handle, id).await
 }
 #[tauri::command]
 fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResult<ExamplesRefreshProgress> {
