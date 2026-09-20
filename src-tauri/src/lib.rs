@@ -2484,140 +2484,294 @@ async fn install_civitai_model(
 }
 
 fn parse_meta(meta:&Value,key:&str)->Option<String>{meta.get(key).and_then(Value::as_str).map(str::to_string)}
+async fn download_gallery_image(
+    client: Client,
+    remote: String,
+    image_id: i64,
+    cache: PathBuf,
+) -> (i64, Option<PathBuf>) {
+    if remote.is_empty() {
+        return (image_id, None);
+    }
+
+    let response = match client.get(&remote).send().await {
+        Ok(value) => value,
+        Err(_) => return (image_id, None),
+    };
+    let response = match response.error_for_status() {
+        Ok(value) => value,
+        Err(_) => return (image_id, None),
+    };
+    let bytes = match response.bytes().await {
+        Ok(value) if !value.is_empty() => value,
+        _ => return (image_id, None),
+    };
+
+    let guessed_ext = remote
+        .split('?')
+        .next()
+        .and_then(|x| Path::new(x).extension())
+        .and_then(|x| x.to_str())
+        .unwrap_or("jpg");
+
+    let ext = detect_image_format_from_bytes(&bytes)
+        .ok()
+        .and_then(image_format_extension)
+        .unwrap_or(guessed_ext);
+
+    let local = cache.join(format!("{image_id}.{ext}"));
+    if fs::write(&local, &bytes).is_err() {
+        return (image_id, None);
+    }
+
+    let thumb = cache.join(format!("{image_id}_thumb.webp"));
+    if !thumb.exists() {
+        if let Ok(im) = decode_image_file(&local) {
+            let t = im.resize(420, 420, FilterType::Triangle);
+            let _ = t.save_with_format(&thumb, ImageFormat::WebP);
+        }
+    }
+
+    (image_id, Some(local))
+}
+
 async fn sync_gallery_inner(
     app: AppStateInner,
     model_id: i64,
     handle: AppHandle,
     target_count: i64,
 ) -> AppResult<bool> {
-    let _guard=app.cache_lock.lock().await;
+    let _guard = app.cache_lock.lock().await;
     let target_count = target_count.clamp(1, 1000);
-    let model = { let c = open_db(&app.app_data)?; model_by_id(&c, model_id)? };
-    let civitai_id = match model.civitai_model_id { Some(x) => x, None => return Ok(false) };
+    let model = {
+        let c = open_db(&app.app_data)?;
+        model_by_id(&c, model_id)?
+    };
+    let civitai_id = match model.civitai_model_id {
+        Some(x) => x,
+        None => return Ok(false),
+    };
+
     let cache = cache_root(&app.app_data).join(civitai_id.to_string());
     fs::create_dir_all(&cache)?;
-    let mut cursor: Option<String> = None;
     let client = civitai_client(&app)?;
-    let mut cached_count: i64 = {
+
+    // Read all locally known community examples once. The old implementation
+    // performed a separate SQLite query for every Civitai image.
+    let existing: HashMap<i64, Option<PathBuf>> = {
         let c = open_db(&app.app_data)?;
-        c.query_row(
-            "SELECT COUNT(*) FROM images WHERE model_id=?1 AND meta_json NOT LIKE '%\"featured\":true%'",
-            [model_id],
-            |r| r.get(0),
-        )?
+        let mut stmt = c.prepare(
+            "SELECT civitai_image_id,local_path
+             FROM images
+             WHERE model_id=?1
+             AND meta_json NOT LIKE '%\"featured\":true%'",
+        )?;
+        let rows = stmt.query_map([model_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
+        })?;
+        rows.filter_map(Result::ok)
+            .map(|(id,path)| (id, path.map(PathBuf::from)))
+            .collect()
     };
-    let has_more = loop {
+
+    let mut cached_count = existing
+        .values()
+        .filter(|path| path.as_ref().is_some_and(|p| p.is_file()))
+        .count() as i64;
+
+    let mut cursor: Option<String> = None;
+    let mut has_more = false;
+
+    while cached_count < target_count {
         let mut url = format!("{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true");
-        if let Some(c) = &cursor { url.push_str("&cursor="); url.push_str(&urlencoding::encode(c)); }
+        if let Some(c) = &cursor {
+            url.push_str("&cursor=");
+            url.push_str(&urlencoding::encode(c));
+        }
+
         let mut req = client.get(&url);
-        if let Some(t) = token() { req = req.bearer_auth(t); }
+        if let Some(t) = token() {
+            req = req.bearer_auth(t);
+        }
+
         let res = req.send().await?;
-        if !res.status().is_success() { return Err(AppError::Api(format!("Image API returned {}", res.status()))); }
+        if !res.status().is_success() {
+            return Err(AppError::Api(format!("Image API returned {}", res.status())));
+        }
+
         let body: CivitaiEnvelope = res.json().await?;
-        for img in body.items {
-            if cached_count >= target_count { break; }
-            let iid = match img.get("id").and_then(Value::as_i64) { Some(x) => x, None => continue };
-            let existed = {
-                let c = open_db(&app.app_data)?;
-                c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1 AND civitai_image_id=?2", params![model_id, iid], |r| r.get::<_, i64>(0))? > 0
-            };
-            let remote = img.get("url").and_then(Value::as_str).unwrap_or("");
-            let guessed_ext = remote.split('?').next().and_then(|x| Path::new(x).extension()).and_then(|x| x.to_str()).unwrap_or("jpg");
-            let thumb = cache.join(format!("{iid}_thumb.webp"));
-            let local_path = if !remote.is_empty() {
-                if cache.join(format!("{iid}.{guessed_ext}")).exists() {
-                    Some(cache.join(format!("{iid}.{guessed_ext}")).to_string_lossy().to_string())
-                } else {
-                    match client.get(remote).send().await {
-                        Ok(resp) => match resp.error_for_status() {
-                            Ok(resp) => match resp.bytes().await {
-                                Ok(bytes) => {
-                                    let ext = detect_image_format_from_bytes(&bytes)
-                                        .ok()
-                                        .and_then(image_format_extension)
-                                        .unwrap_or(guessed_ext);
-                                    let local = cache.join(format!("{iid}.{ext}"));
-                                    if fs::write(&local, &bytes).is_ok() {
-                                        Some(local.to_string_lossy().to_string())
-                                    } else {
-                                        None
-                                    }
-                                },
-                                Err(_) => None,
-                            },
-                            Err(_) => None,
-                        },
-                        Err(_) => None,
-                    }
-                }
-            } else { None };
-            if let Some(lp) = &local_path {
-                if !thumb.exists() {
-                    if let Ok(im) = decode_image_file(Path::new(lp)) {
-                        let t = im.resize(420, 420, FilterType::Triangle);
-                        let _ = t.save_with_format(&thumb, ImageFormat::WebP);
-                    }
-                }
+        let page_len = body.items.len();
+
+        // Collect only entries that actually need a local download.
+        let mut jobs: Vec<(String, i64, Value)> = Vec::new();
+        let mut available_new = 0i64;
+
+        for img in body.items.iter() {
+            if cached_count + available_new >= target_count {
+                break;
             }
-            let meta = img.get("meta").cloned().unwrap_or(Value::Null);
-            let prompt = parse_meta(&meta, "prompt");
-            let neg = parse_meta(&meta, "negativePrompt").or_else(|| parse_meta(&meta, "Negative prompt"));
-            let sampler = parse_meta(&meta, "sampler").or_else(|| parse_meta(&meta, "Sampler"));
-            let steps = meta.get("steps").and_then(Value::as_i64);
-            let cfg = meta.get("cfgScale").or_else(|| meta.get("cfg")).and_then(Value::as_f64);
-            let seed = meta.get("seed").and_then(Value::as_i64);
-            let width = img.get("width").and_then(Value::as_i64);
-            let height = img.get("height").and_then(Value::as_i64);
-            let c = open_db(&app.app_data)?;
-            c.execute(
-                "INSERT INTO images(
-                    model_id,civitai_image_id,local_path,thumbnail_path,width,height,
-                    prompt,negative_prompt,steps,cfg,sampler,seed,meta_json,cached_at
-                 )
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,CAST(strftime('%s','now') AS INTEGER))
-                 ON CONFLICT(model_id,civitai_image_id) DO UPDATE SET
-                    local_path=excluded.local_path,
-                    thumbnail_path=excluded.thumbnail_path,
-                    width=excluded.width,
-                    height=excluded.height,
-                    prompt=excluded.prompt,
-                    negative_prompt=excluded.negative_prompt,
-                    steps=excluded.steps,
-                    cfg=excluded.cfg,
-                    sampler=excluded.sampler,
-                    seed=excluded.seed,
-                    meta_json=CASE
-                        WHEN images.meta_json LIKE '%\"featured\":true%' THEN images.meta_json
-                        ELSE excluded.meta_json
-                    END,
-                    cached_at=excluded.cached_at",
-                params![
-                    model_id,iid,local_path,
-                    if thumb.exists(){Some(thumb.to_string_lossy().to_string())}else{None::<String>},
-                    width,height,prompt,neg,steps,cfg,sampler,seed,
-                    serde_json::to_string(&meta).unwrap_or_else(|_|"null".into())
-                ],
-            )?;
-            if !existed { cached_count += 1; }
+
+            let iid = match img.get("id").and_then(Value::as_i64) {
+                Some(x) => x,
+                None => continue,
+            };
+
+            if existing
+                .get(&iid)
+                .and_then(|p| p.as_ref())
+                .is_some_and(|p| p.is_file())
+            {
+                continue;
+            }
+
+            let remote = match img
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+            {
+                Some(value) => value.to_string(),
+                None => continue,
+            };
+
+            jobs.push((remote, iid, img.clone()));
+            available_new += 1;
         }
-        let next_cursor = body.metadata.and_then(|m| m.get("nextCursor").and_then(Value::as_str).map(str::to_string));
+
+        let results = stream::iter(jobs.into_iter().map(|(remote, iid, img)| {
+            let client = client.clone();
+            let cache = cache.clone();
+            async move {
+                let (image_id, local_path) =
+                    download_gallery_image(client, remote, iid, cache).await;
+                (image_id, local_path, img)
+            }
+        }))
+        .buffer_unordered(FEATURED_IMAGE_DOWNLOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut successful: Vec<(i64, Option<String>, Option<String>, Value)> = Vec::new();
+
+        for (iid, local_path, img) in results {
+            if local_path.is_some() {
+                cached_count += 1;
+            }
+            let thumb_path = local_path.as_ref().map(|path| {
+                path.with_file_name(format!(
+                    "{}_thumb.webp",
+                    path.file_stem().and_then(|s| s.to_str()).unwrap_or("")
+                ))
+            });
+            successful.push((
+                iid,
+                local_path.map(|p| p.to_string_lossy().to_string()),
+                thumb_path
+                    .filter(|p| p.is_file())
+                    .map(|p| p.to_string_lossy().to_string()),
+                img,
+            ));
+        }
+
+        // One transaction for the whole page instead of one DB connection/query
+        // per image.
+        if !successful.is_empty() {
+            let mut c = open_db(&app.app_data)?;
+            let tx = c.transaction()?;
+
+            for (iid, local_path, thumbnail_path, img) in successful {
+                let meta = img.get("meta").cloned().unwrap_or(Value::Null);
+                let prompt = parse_meta(&meta, "prompt");
+                let neg = parse_meta(&meta, "negativePrompt")
+                    .or_else(|| parse_meta(&meta, "Negative prompt"));
+                let sampler =
+                    parse_meta(&meta, "sampler").or_else(|| parse_meta(&meta, "Sampler"));
+                let steps = meta.get("steps").and_then(Value::as_i64);
+                let cfg = meta
+                    .get("cfgScale")
+                    .or_else(|| meta.get("cfg"))
+                    .and_then(Value::as_f64);
+                let seed = meta.get("seed").and_then(Value::as_i64);
+                let width = img.get("width").and_then(Value::as_i64);
+                let height = img.get("height").and_then(Value::as_i64);
+
+                tx.execute(
+                    "INSERT INTO images(
+                        model_id,civitai_image_id,local_path,thumbnail_path,width,height,
+                        prompt,negative_prompt,steps,cfg,sampler,seed,meta_json,cached_at
+                     )
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,CAST(strftime('%s','now') AS INTEGER))
+                     ON CONFLICT(model_id,civitai_image_id) DO UPDATE SET
+                        local_path=excluded.local_path,
+                        thumbnail_path=excluded.thumbnail_path,
+                        width=excluded.width,
+                        height=excluded.height,
+                        prompt=excluded.prompt,
+                        negative_prompt=excluded.negative_prompt,
+                        steps=excluded.steps,
+                        cfg=excluded.cfg,
+                        sampler=excluded.sampler,
+                        seed=excluded.seed,
+                        meta_json=CASE
+                            WHEN images.meta_json LIKE '%\"featured\":true%' THEN images.meta_json
+                            ELSE excluded.meta_json
+                        END,
+                        cached_at=excluded.cached_at",
+                    params![
+                        model_id,
+                        iid,
+                        local_path,
+                        thumbnail_path,
+                        width,
+                        height,
+                        prompt,
+                        neg,
+                        steps,
+                        cfg,
+                        sampler,
+                        seed,
+                        serde_json::to_string(&meta).unwrap_or_else(|_| "null".into()),
+                    ],
+                )?;
+            }
+
+            tx.commit()?;
+        }
+
+        let next_cursor = body
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("nextCursor").and_then(Value::as_str).map(str::to_string));
+
+        has_more = next_cursor.is_some() || page_len >= 200;
+
         if cached_count >= target_count {
-            break next_cursor.is_some();
+            break;
         }
-        if next_cursor.is_none() {
-            break false;
+
+        match next_cursor {
+            Some(next) => cursor = Some(next),
+            None if page_len >= 200 => {
+                // Some API responses expose pagination through page size but
+                // omit nextCursor. Re-fetching with the same request would loop,
+                // so stop conservatively and expose LOAD MORE.
+                break;
+            }
+            None => break,
         }
-        cursor = next_cursor;
-    };
+    }
+
     if let Ok(c) = open_db(&app.app_data) {
         let bytes = dir_size(&cache_root(&app.app_data));
         let _ = put_setting(&c, "cache_bytes", &bytes.to_string());
     }
-    let _=enforce_cache_limit_inner(&app.app_data);
+    let _ = enforce_cache_limit_inner(&app.app_data);
     let _ = handle.emit("models-changed", ());
     Ok(has_more)
 }
-
 #[tauri::command]
 async fn sync_model_gallery(
     app: State<'_, AppStateInner>,
@@ -2734,7 +2888,6 @@ async fn link_model_civitai(
     };
     let _=handle.emit("models-changed",());
     drop(_guard);
-    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None, true, true).await?;
     Ok(rec)
 }
 
@@ -2812,7 +2965,6 @@ async fn refresh_model_civitai(
 
     let _ = handle.emit("models-changed", ());
     drop(_guard);
-    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None, true, true).await?;
     Ok(rec)
 }
 #[tauri::command]
