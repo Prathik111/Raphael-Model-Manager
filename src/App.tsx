@@ -75,6 +75,7 @@ function initialThumbnailFit(): ThumbnailFit {
 }
 
 function fmtBytes(n: number) { if (n < 1024) return `${n} B`; const u=['KB','MB','GB','TB']; let i=-1,v=n; do { v/=1024; i++; } while(v>=1024 && i<u.length-1); return `${v.toFixed(v>=100?0:v>=10?1:2)} ${u[i]}`; }
+function fmtCount(n: number) { return new Intl.NumberFormat().format(Math.max(0, n)); }
 function fmtDateTime(seconds: number) { if (!seconds) return '—'; return new Date(seconds * 1000).toLocaleString(); }
 function initials(s: string) { return s.split(/\s+/).filter(Boolean).slice(0,2).map(x=>x[0]).join('').toUpperCase(); }
 
