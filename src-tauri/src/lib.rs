@@ -13,6 +13,7 @@ use std::{
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, RwLock},
+    tokio::sync::Mutex as AsyncMutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -64,7 +65,7 @@ struct AppStateInner {
     active_downloads: Arc<Mutex<usize>>,
     parallel_downloads: Arc<Mutex<usize>>,
     examples_refresh_state: Arc<Mutex<ExamplesRefreshState>>,
-    cache_lock: Arc<Mutex<()>>,
+    cache_lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -713,7 +714,7 @@ fn clear_cache_images_inner(app_data: &Path) -> AppResult<CacheOperationResult> 
     fs::create_dir_all(&image_root)?;
     let c = open_db(app_data)?;
     c.execute_batch("DELETE FROM images;")?;
-    c.execute("UPDATE models SET thumbnail_path=NULL,cover_source_image_id=NULL")?;
+    c.execute("UPDATE models SET thumbnail_path=NULL,cover_source_image_id=NULL", [])?;
     let stats = cache_stats_inner(app_data)?;
     Ok(CacheOperationResult { deleted_files, freed_bytes, remaining_bytes: stats.used_bytes, over_limit: stats.over_limit })
 }
@@ -741,7 +742,8 @@ fn prune_cache_images_inner(app_data: &Path, keep_per_model: i64) -> AppResult<C
     let root = cache_root(app_data);
     let model_ids: Vec<i64> = {
         let mut stmt = c.prepare("SELECT DISTINCT model_id FROM images ORDER BY model_id")?;
-        stmt.query_map([], |r| r.get(0))?.filter_map(Result::ok).collect()
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.filter_map(Result::ok).collect()
     };
     let mut deleted_files = 0i64;
     let mut freed_bytes = 0i64;
@@ -1124,7 +1126,7 @@ async fn sync_featured_examples_inner(
     handle: AppHandle,
     progress_model: Option<(usize, usize)>,
 ) -> AppResult<usize> {
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+    let _guard=app.cache_lock.lock().await;
     let model_record = { let c = open_db(&app.app_data)?; model_by_id(&c, model_id)? };
     let civitai_id = model_record.civitai_model_id.ok_or_else(|| AppError::Invalid("This model is not linked to Civitai".into()))?;
     let model_name = model_record.civitai_name.clone().unwrap_or_else(|| model_record.filename.clone());
@@ -1554,8 +1556,8 @@ fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult
 }
 
 #[tauri::command]
-fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<()> {
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+async fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<()> {
+    let _guard=app.cache_lock.lock().await;
     let root = app.models_root.read().unwrap().clone()
         .ok_or_else(|| AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
 
@@ -1723,13 +1725,13 @@ fn set_model_cover_position(
 }
 
 #[tauri::command]
-fn set_model_custom_cover(
+async fn set_model_custom_cover(
     app: State<AppStateInner>,
     handle: AppHandle,
     id: i64,
     source_path: String,
 ) -> AppResult<ModelRecord> {
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+    let _guard=app.cache_lock.lock().await;
     let source = PathBuf::from(source_path);
     let target = copy_custom_cover(&app, id, &source)?;
     let c = open_db(&app.app_data)?;
@@ -1743,12 +1745,12 @@ fn set_model_custom_cover(
 }
 
 #[tauri::command]
-fn reset_model_cover(
+async fn reset_model_cover(
     app: State<AppStateInner>,
     handle: AppHandle,
     id: i64,
 ) -> AppResult<ModelRecord> {
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+    let _guard=app.cache_lock.lock().await;
     let old_cover = {
         let c = open_db(&app.app_data)?;
         c.query_row("SELECT cover_path FROM models WHERE id=?1", [id], |r| r.get::<_, Option<String>>(0))?
@@ -1783,13 +1785,13 @@ fn get_library_counts(app:State<AppStateInner>)->AppResult<LibraryCounts>{
 }
 
 #[tauri::command]
-fn set_model_cover_from_image(
+async fn set_model_cover_from_image(
     app: State<AppStateInner>,
     handle: AppHandle,
     id: i64,
     image_id: i64,
 ) -> AppResult<ModelRecord> {
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+    let _guard=app.cache_lock.lock().await;
     let (old_cover, source) = {
         let c = open_db(&app.app_data)?;
         c.query_row(
@@ -1852,9 +1854,6 @@ fn get_model_images(app: State<AppStateInner>, id: i64, limit: Option<i64>) -> A
         meta_json: r.get(12)?,
     }))?;
     let images: Vec<ModelImage> = rows.filter_map(Result::ok).collect();
-    for image in &images {
-        let _ = c.execute("UPDATE images SET cached_at=?2 WHERE id=?1", params![image.id, now()]);
-    }
     Ok(ModelImagesResponse { has_more: images.len() as i64 >= limit, images })
 }
 #[tauri::command]
@@ -1865,7 +1864,7 @@ async fn preview_civitai_import(app:State<'_,AppStateInner>,url:String)->AppResu
     let mid=model.get("id").and_then(Value::as_i64);
     let thumb=match mid {
         Some(model_id)=>{
-            let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+            let _guard=app.cache_lock.lock().await;
             let result=ensure_model_thumbnail(&app,model_id,&model,&version,&url).await?;
             let _=enforce_cache_limit_inner(&app.app_data);
             result
@@ -2088,7 +2087,7 @@ async fn install_civitai_model(
             let civitai_url = canonical_civitai_url(&url, mid, vid)?;
             let thumb = match mid {
                 Some(model_id) => {
-                    let _guard=state.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+                    let _guard=state.cache_lock.lock().await;
                     let result=ensure_model_thumbnail(&state, model_id, &model, &version, &url).await?;
                     let _=enforce_cache_limit_inner(&state.app_data);
                     result
@@ -2202,7 +2201,7 @@ async fn sync_gallery_inner(
     handle: AppHandle,
     target_count: i64,
 ) -> AppResult<bool> {
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+    let _guard=app.cache_lock.lock().await;
     let target_count = target_count.clamp(1, 1000);
     let model = { let c = open_db(&app.app_data)?; model_by_id(&c, model_id)? };
     let civitai_id = match model.civitai_model_id { Some(x) => x, None => return Ok(false) };
@@ -2343,7 +2342,11 @@ async fn load_more_model_examples(
     }).clamp(1, 100);
     let current_count = {
         let c = open_db(&app.app_data)?;
-        c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1", [id], |r| r.get::<_, i64>(0))?
+        c.query_row(
+            "SELECT COUNT(*) FROM images WHERE model_id=?1 AND meta_json NOT LIKE '%\"featured\":true%'",
+            [id],
+            |r| r.get::<_, i64>(0),
+        )?
     };
     sync_gallery_inner(
         app.inner().clone(),
@@ -2374,7 +2377,7 @@ async fn link_model_civitai(
     id:i64,
     url:String,
 )->AppResult<ModelRecord>{
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+    let _guard=app.cache_lock.lock().await;
     let trimmed=url.trim();
     let (_mid,_vid)=model_id_and_version(trimmed)?;
     let (model,version)=fetch_model_and_version(&app,trimmed).await?;
@@ -2440,7 +2443,7 @@ async fn refresh_model_civitai(
     handle: AppHandle,
     id: i64,
 ) -> AppResult<ModelRecord> {
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+    let _guard=app.cache_lock.lock().await;
     let current = {
         let c = open_db(&app.app_data)?;
         model_by_id(&c, id)?
@@ -2627,35 +2630,35 @@ fn path_is_in_cache(app_data:&Path,path:&Path)->bool{
 #[tauri::command]
 fn get_storage_stats(app:State<AppStateInner>)->AppResult<StorageStats>{storage_stats_inner(&app.app_data)}
 #[tauri::command]
-pub(crate) fn get_cache_stats(app:State<AppStateInner>)->AppResult<CacheStats>{cache_stats_inner(&app.app_data)}
+fn get_cache_stats(app:State<AppStateInner>)->AppResult<CacheStats>{cache_stats_inner(&app.app_data)}
 #[tauri::command]
-pub(crate) fn set_cache_max_bytes(app:State<AppStateInner>, max_bytes:i64)->AppResult<CacheStats>{
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+async fn set_cache_max_bytes(app:State<AppStateInner>, max_bytes:i64)->AppResult<CacheStats>{
+    let _guard=app.cache_lock.lock().await;
     set_cache_max_bytes_inner(&app.app_data,max_bytes)
 }
 #[tauri::command]
-pub(crate) fn set_cache_location(app:State<AppStateInner>, path:String)->AppResult<CacheStats>{
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+async fn set_cache_location(app:State<AppStateInner>, path:String)->AppResult<CacheStats>{
+    let _guard=app.cache_lock.lock().await;
     set_cache_location_inner(&app.app_data,&path)
 }
 #[tauri::command]
-pub(crate) fn clear_cache_images(app:State<AppStateInner>)->AppResult<CacheOperationResult>{
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+async fn clear_cache_images(app:State<AppStateInner>)->AppResult<CacheOperationResult>{
+    let _guard=app.cache_lock.lock().await;
     clear_cache_images_inner(&app.app_data)
 }
 #[tauri::command]
-pub(crate) fn clear_complete_cache(app:State<AppStateInner>)->AppResult<CacheOperationResult>{
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+async fn clear_complete_cache(app:State<AppStateInner>)->AppResult<CacheOperationResult>{
+    let _guard=app.cache_lock.lock().await;
     clear_complete_cache_inner(&app.app_data)
 }
 #[tauri::command]
-pub(crate) fn prune_cache_images(app:State<AppStateInner>, keep_per_model:i64)->AppResult<CacheOperationResult>{
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+async fn prune_cache_images(app:State<AppStateInner>, keep_per_model:i64)->AppResult<CacheOperationResult>{
+    let _guard=app.cache_lock.lock().await;
     prune_cache_images_inner(&app.app_data,keep_per_model)
 }
 #[tauri::command]
-pub(crate) fn clean_cache_orphans(app:State<AppStateInner>)->AppResult<CacheOperationResult>{
-    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+async fn clean_cache_orphans(app:State<AppStateInner>)->AppResult<CacheOperationResult>{
+    let _guard=app.cache_lock.lock().await;
     clean_cache_orphans_inner(&app.app_data)
 }
 #[tauri::command]
