@@ -97,9 +97,9 @@ export const api = {
       selectedType,
     }),
   getDownloadProgress: () =>
-    command<DownloadProgress>('get_download_progress'),
-  clearDownloadProgress: () =>
-    command<void>('clear_download_progress'),
+    command<DownloadProgress[]>('get_download_progress'),
+  clearDownloadProgress: (taskId: string) =>
+    command<void>('clear_download_progress', { taskId }),
   refreshModel: (id: number) =>
     command<ModelRecord>('refresh_model_civitai', { id }),
   linkModelCivitai: (id: number, url: string) =>
