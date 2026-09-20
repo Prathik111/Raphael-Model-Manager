@@ -1,6 +1,7 @@
 use axum::{
+    body::Body,
     extract::{Path as AxumPath, Query, State as AxumState},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -14,7 +15,12 @@ use std::{
     time::Duration,
 };
 use tauri::{path::BaseDirectory, AppHandle, Manager, State};
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
+    net::TcpListener,
+    sync::oneshot,
+};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
 use crate::{
@@ -247,8 +253,52 @@ fn validate_cached_file(path: &Path, app_data: &Path) -> AppResult<PathBuf> {
     Ok(path)
 }
 
+fn parse_single_range(value: &str, size: u64) -> Option<Result<(u64, u64), ()>> {
+    let value = value.trim();
+    let range = value.strip_prefix("bytes=")?;
+    if range.contains(',') {
+        return Some(Err(()));
+    }
+
+    let (start, end) = range.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        if suffix == 0 || size == 0 {
+            return Some(Err(()));
+        }
+        let length = suffix.min(size);
+        return Some(Ok((size - length, size - 1)));
+    }
+
+    let start = start.parse::<u64>().ok()?;
+    if start >= size {
+        return Some(Err(()));
+    }
+
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>().ok()?.min(size - 1)
+    };
+
+    if end < start {
+        return Some(Err(()));
+    }
+
+    Some(Ok((start, end)))
+}
+
+async fn health_handler() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store, no-cache, must-revalidate"))],
+    )
+        .into_response()
+}
+
 async fn file_handler(
     AxumState(state): AxumState<WebServerState>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<FileQuery>,
 ) -> Response {
     let app_data = match state.handle.path().app_data_dir() {
@@ -262,9 +312,28 @@ async fn file_handler(
         Err(error) => return response_err(error),
     };
 
-    let content = match tokio::fs::read(&path).await {
-        Ok(content) => content,
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
         Err(error) => return response_err(AppError::Io(error)),
+    };
+    let size = metadata.len();
+
+    let (status, start, end) = match headers.get(header::RANGE).and_then(|value| value.to_str().ok()) {
+        Some(value) => match parse_single_range(value, size) {
+            Some(Ok((start, end))) => (StatusCode::PARTIAL_CONTENT, start, end),
+            Some(Err(())) => {
+                return (
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    [
+                        (header::CONTENT_RANGE, format!("bytes */{size}")),
+                        (header::CACHE_CONTROL, "public, max-age=300".to_string()),
+                    ],
+                )
+                    .into_response();
+            }
+            None => (StatusCode::PARTIAL_CONTENT, 0, size.saturating_sub(1)),
+        },
+        None => (StatusCode::OK, 0, size.saturating_sub(1)),
     };
 
     let content_type = match path.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
@@ -276,12 +345,69 @@ async fn file_handler(
         _ => "application/octet-stream",
     };
 
-    (
-        [(header::CONTENT_TYPE, content_type)],
-        content,
-    )
-        .into_response()
+    let content_length = if size == 0 { 0 } else { end - start + 1 };
+    let mut file = match File::open(&path).await {
+        Ok(file) => file,
+        Err(error) => return response_err(AppError::Io(error)),
+    };
+
+    if start > 0 {
+        if let Err(error) = file.seek(SeekFrom::Start(start)).await {
+            return response_err(AppError::Io(error));
+        }
+    }
+
+    let stream_length = content_length;
+    let stream = futures_util::stream::unfold(
+        (file, 0u64),
+        move |(mut file, mut sent)| async move {
+            if sent >= stream_length {
+                return None;
+            }
+
+            let remaining = stream_length - sent;
+            let chunk_size = remaining.min(64 * 1024) as usize;
+            let mut buffer = vec![0u8; chunk_size];
+            match file.read_exact(&mut buffer).await {
+                Ok(_) => {
+                    sent += buffer.len() as u64;
+                    Some((Ok::<Vec<u8>, std::io::Error>(buffer), (file, sent)))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    None
+                }
+                Err(error) => Some((Err(error), (file, stream_length))),
+            }
+        },
+    );
+
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = status;
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    response_headers.insert(
+        header::ACCEPT_RANGES,
+        HeaderValue::from_static("bytes"),
+    );
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300, stale-while-revalidate=60"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
+        response_headers.insert(header::CONTENT_LENGTH, value);
+    }
+    if status == StatusCode::PARTIAL_CONTENT {
+        if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{size}")) {
+            response_headers.insert(header::CONTENT_RANGE, value);
+        }
+    }
+
+    response
 }
+
 
 async fn command_handler(
     AxumPath(command): AxumPath<String>,
@@ -452,6 +578,7 @@ fn build_router(handle: AppHandle, controller: WebServerController, web_root: Op
     };
 
     let mut router = Router::new()
+        .route("/api/health", get(health_handler))
         .route("/api/status", get(status_handler))
         .route("/api/file", get(file_handler))
         .route("/api/command/{command}", post(command_handler))
@@ -518,9 +645,13 @@ pub async fn set_web_app_enabled(
 
         loop {
             let router = build_router(task_handle.clone(), task_controller.clone(), web_root.clone());
-            let current_shutdown = shutdown_rx
-                .take()
-                .expect("web server shutdown receiver missing");
+            let current_shutdown = match shutdown_rx.take() {
+                Some(receiver) => receiver,
+                None => {
+                    eprintln!("Raphael web server supervisor lost its shutdown channel; stopping safely");
+                    break;
+                }
+            };
 
             let _ = axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
