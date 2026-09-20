@@ -203,8 +203,7 @@ export async function subscribeToModelChanges(cb: () => void) {
         inFlight = false;
       }
     };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 3000);
+    const timer = window.setInterval(() => void poll(), 5000);
     return () => {
       disposed = true;
       window.clearInterval(timer);
@@ -236,7 +235,7 @@ export async function subscribeToExamplesRefresh(cb: (progress: ExamplesRefreshP
       }
     };
     await poll();
-    const timer = window.setInterval(() => void poll(), 750);
+    const timer = window.setInterval(() => void poll(), 1200);
     return () => {
       disposed = true;
       window.clearInterval(timer);
