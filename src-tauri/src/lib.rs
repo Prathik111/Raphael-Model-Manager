@@ -12,7 +12,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -24,6 +24,7 @@ mod web;
 
 const API_BASE: &str = "https://civitai.com/api/v1";
 const USER_AGENT: &str = "RaphaelModelManager/0.1.0";
+static DOWNLOAD_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -60,6 +61,8 @@ struct AppStateInner {
     scan_lock: Arc<Mutex<()>>,
     downloads: Arc<Mutex<Vec<DownloadProgress>>>,
     active_download_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    active_downloads: Arc<Mutex<usize>>,
+    parallel_downloads: Arc<Mutex<usize>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -145,10 +148,9 @@ struct CivitaiEnvelope { metadata: Option<Value>, items: Vec<Value> }
 fn now() -> i64 { Utc::now().timestamp() }
 
 fn new_download_id() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis().to_string())
-        .unwrap_or_else(|_| "download".into())
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let sequence = DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{millis}-{sequence}")
 }
 
 fn set_download_progress(
@@ -225,6 +227,34 @@ fn release_download_path(
     }
 }
 
+struct DownloadSlot {
+    active: Arc<Mutex<usize>>,
+}
+
+impl Drop for DownloadSlot {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.active.lock() {
+            *guard = guard.saturating_sub(1);
+        }
+    }
+}
+
+async fn acquire_download_slot(state: &AppStateInner) -> AppResult<DownloadSlot> {
+    loop {
+        let limit = *state.parallel_downloads.lock()
+            .map_err(|_| AppError::Invalid("Parallel download setting is unavailable".into()))?;
+        {
+            let mut active = state.active_downloads.lock()
+                .map_err(|_| AppError::Invalid("Download worker state is unavailable".into()))?;
+            if *active < limit.clamp(1, 8) {
+                *active += 1;
+                return Ok(DownloadSlot { active: state.active_downloads.clone() });
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 fn db_path(app_data: &Path) -> PathBuf { app_data.join("raphael.db") }
 fn cache_root(app_data: &Path) -> PathBuf { app_data.join("cache").join("civitai") }
 fn open_db(app_data: &Path) -> AppResult<Connection> {
@@ -259,7 +289,8 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
         updated_at INTEGER NOT NULL,
         cover_path TEXT,
         cover_position_x REAL NOT NULL DEFAULT 50,
-        cover_position_y REAL NOT NULL DEFAULT 50
+        cover_position_y REAL NOT NULL DEFAULT 50,
+        downloaded_at INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_models_type ON models(model_type);
       CREATE INDEX IF NOT EXISTS idx_models_civitai ON models(civitai_model_id, civitai_version_id);
@@ -293,6 +324,12 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
     if has_cover_x==0 { c.execute("ALTER TABLE models ADD COLUMN cover_position_x REAL NOT NULL DEFAULT 50",[])?; }
     let has_cover_y:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_position_y'",[],|r|r.get(0))?;
     if has_cover_y==0 { c.execute("ALTER TABLE models ADD COLUMN cover_position_y REAL NOT NULL DEFAULT 50",[])?; }
+    let has_downloaded_at:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='downloaded_at'",[],|r|r.get(0))?;
+    if has_downloaded_at==0 {
+        c.execute("ALTER TABLE models ADD COLUMN downloaded_at INTEGER NOT NULL DEFAULT 0",[])?;
+        c.execute("UPDATE models SET downloaded_at=?1 WHERE downloaded_at=0",[now()])?;
+    }
+    c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('parallel_downloads','3')",[])?;
     Ok(c)
 }
 
@@ -302,6 +339,11 @@ fn setting(c: &Connection, key: &str) -> AppResult<Option<String>> {
 fn put_setting(c: &Connection, key: &str, value: &str) -> AppResult<()> {
     c.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
     Ok(())
+}
+
+fn clamp_parallel_downloads(value: i64) -> i64 { value.clamp(1, 8) }
+fn read_parallel_downloads(c: &Connection) -> AppResult<usize> {
+    Ok(setting(c, "parallel_downloads")?.and_then(|value| value.parse::<i64>().ok()).map(clamp_parallel_downloads).unwrap_or(3) as usize)
 }
 
 fn file_type_from_path(path: &Path, root: &Path) -> String {
@@ -361,7 +403,7 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
         if let Some((id,_,_,_,_type_locked)) = old {
             c.execute("UPDATE models SET relative_path=?2,filename=?3,model_type=CASE WHEN model_type_user_modified=1 THEN model_type ELSE ?4 END,size_bytes=?5,modified_at=?6,source_hash=?7,updated_at=?8 WHERE id=?1", params![id,rel,filename,mtype,size,modified,hash,now()])?;
         } else {
-            c.execute("INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,source_hash,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![path_s,rel,filename,mtype,size,modified,hash,now()])?;
+            c.execute("INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,source_hash,updated_at,downloaded_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![path_s,rel,filename,mtype,size,modified,hash,now(),now()])?;
         }
     }
     let mut stmt = c.prepare("SELECT path FROM models")?;
@@ -386,10 +428,10 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
         creator:r.get(13)?, description:r.get(14)?, tags:serde_json::from_str(&tags).unwrap_or_default(),
         activation_prompts:serde_json::from_str(&activ).unwrap_or_default(), source_hash:r.get(17)?,
         thumbnail_path:r.get(18)?, updated_at:r.get(19)?, cover_path:r.get(20)?,
-        cover_position_x:r.get(21)?, cover_position_y:r.get(22)?
+        cover_position_x:r.get(21)?, cover_position_y:r.get(22)?, downloaded_at:r.get(23)?
     })
 }
-const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,thumbnail_path,updated_at,cover_path,cover_position_x,cover_position_y FROM models";
+const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,thumbnail_path,updated_at,cover_path,cover_position_x,cover_position_y,downloaded_at FROM models";
 fn model_by_id(c: &Connection, id: i64) -> AppResult<ModelRecord> {
     Ok(c.query_row(&format!("{MODEL_SELECT} WHERE id=?1"), [id], model_from_row)?)
 }
@@ -945,7 +987,7 @@ fn set_model_cover_from_image(
     let (old_cover, source) = {
         let c = open_db(&app.app_data)?;
         c.query_row(
-            "SELECT m.cover_path,COALESCE(i.thumbnail_path,i.local_path)
+            "SELECT m.cover_path,COALESCE(i.local_path,i.thumbnail_path)
              FROM models m
              JOIN images i ON i.model_id=m.id
              WHERE m.id=?1 AND i.id=?2",
@@ -987,8 +1029,12 @@ fn set_model_cover_from_image(
 }
 
 #[tauri::command]
-fn get_model_images(app:State<AppStateInner>, id:i64)->AppResult<Vec<ModelImage>>{
-    let c=open_db(&app.app_data)?; let mut stmt=c.prepare("SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json FROM images WHERE model_id=?1 ORDER BY id")?; let rows=stmt.query_map([id],|r|Ok(ModelImage{id:r.get(0)?,civitai_image_id:r.get(1)?,local_path:r.get(2)?,thumbnail_path:r.get(3)?,width:r.get(4)?,height:r.get(5)?,prompt:r.get(6)?,negative_prompt:r.get(7)?,steps:r.get(8)?,cfg:r.get(9)?,sampler:r.get(10)?,seed:r.get(11)?,meta_json:r.get(12)?}))?; Ok(rows.filter_map(Result::ok).collect())
+fn get_model_images(app:State<AppStateInner>, id:i64, limit:Option<i64>)->AppResult<Vec<ModelImage>>{
+    let c=open_db(&app.app_data)?;
+    let limit=limit.unwrap_or(20).clamp(1,200);
+    let mut stmt=c.prepare("SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json FROM images WHERE model_id=?1 ORDER BY id LIMIT ?2")?;
+    let rows=stmt.query_map(params![id,limit],|r|Ok(ModelImage{id:r.get(0)?,civitai_image_id:r.get(1)?,local_path:r.get(2)?,thumbnail_path:r.get(3)?,width:r.get(4)?,height:r.get(5)?,prompt:r.get(6)?,negative_prompt:r.get(7)?,steps:r.get(8)?,cfg:r.get(9)?,sampler:r.get(10)?,seed:r.get(11)?,meta_json:r.get(12)?}))?;
+    Ok(rows.filter_map(Result::ok).collect())
 }
 #[tauri::command]
 async fn preview_civitai_import(app:State<'_,AppStateInner>,url:String)->AppResult<CivitaiImportPreview>{
@@ -1140,6 +1186,12 @@ async fn install_civitai_model(
             };
             push_download_progress(&app.downloads, progress.clone())?;
             let _ = handle.emit("download-progress", progress.clone());
+            let clear_progress = app.downloads.clone();
+            let clear_task_id = task_id.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let _ = remove_download_progress(&clear_progress, &clear_task_id);
+            });
             return Ok(progress);
         }
     }
@@ -1202,7 +1254,11 @@ async fn install_civitai_model(
     let task_handle = handle.clone();
     tauri::async_runtime::spawn(async move {
         let result = async {
-            let (path, size, hash) = download_file(
+            set_download_progress(&task_progress, &task_id, |p| { p.phase = "QUEUED".into(); });
+            let (path, size, hash) = {
+                let _slot = acquire_download_slot(&state).await?;
+                set_download_progress(&task_progress, &task_id, |p| { p.phase = "STARTING".into(); });
+                download_file(
                 &state,
                 &dl,
                 &target,
@@ -1211,7 +1267,8 @@ async fn install_civitai_model(
                 task_progress.clone(),
                 &task_id,
                 reserved_path.clone(),
-            ).await?;
+                ).await?
+            };
 
             set_download_progress(&task_progress, &task_id, |p| {
                 p.phase = "INSTALLING".into();
@@ -1242,9 +1299,9 @@ async fn install_civitai_model(
                         path,relative_path,filename,model_type,size_bytes,modified_at,
                         civitai_model_id,civitai_version_id,civitai_url,civitai_name,
                         version_name,base_model,creator,description,tags_json,
-                        activation_json,source_hash,thumbnail_path,updated_at
+                        activation_json,source_hash,thumbnail_path,updated_at,downloaded_at
                      )
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
                      ON CONFLICT(path) DO UPDATE SET
                         size_bytes=excluded.size_bytes,
                         modified_at=excluded.modified_at,
@@ -1281,6 +1338,7 @@ async fn install_civitai_model(
                         serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
                         hash,
                         thumb,
+                        now(),
                         now()
                     ],
                 )?;
@@ -1292,7 +1350,7 @@ async fn install_civitai_model(
             set_download_progress(&task_progress, &task_id, |p| {
                 p.phase = "SYNCING GALLERY".into();
             });
-            let _ = sync_gallery_inner(state.clone(), rec.id, task_handle.clone(), true).await;
+            let _ = sync_gallery_inner(state.clone(), rec.id, task_handle.clone(), 20).await;
             Ok::<(), AppError>(())
         }.await;
 
@@ -1321,6 +1379,12 @@ async fn install_civitai_model(
         };
         release_download_path(&task_active_paths, &reserved_path);
         let _ = task_handle.emit("download-progress", final_progress);
+        let clear_progress = task_progress.clone();
+        let clear_task_id = task_id.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let _ = remove_download_progress(&clear_progress, &clear_task_id);
+        });
         let _ = task_handle.emit("models-changed", ());
     });
 
@@ -1332,99 +1396,53 @@ async fn sync_gallery_inner(
     app: AppStateInner,
     model_id: i64,
     handle: AppHandle,
-    force: bool,
-) -> AppResult<()> {
-    {
-        let c = open_db(&app.app_data)?;
-        let cached: i64 =
-            c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1", [model_id], |r| {
-                r.get(0)
-            })?;
-        let missing: i64 = c.query_row(
-            "SELECT COUNT(*) FROM images WHERE model_id=?1 AND local_path IS NULL",
-            [model_id],
-            |r| r.get(0),
-        )?;
-        if !force && cached > 0 && missing == 0 {
-            return Ok(());
-        }
-    }
-
-    let model = {
-        let c = open_db(&app.app_data)?;
-        model_by_id(&c, model_id)?
-    };
-
-    let civitai_id = match model.civitai_model_id {
-        Some(x) => x,
-        None => return Ok(()),
-    };
-
+    target_count: i64,
+) -> AppResult<bool> {
+    let target_count = target_count.clamp(1, 200);
+    let model = { let c = open_db(&app.app_data)?; model_by_id(&c, model_id)? };
+    let civitai_id = match model.civitai_model_id { Some(x) => x, None => return Ok(false) };
     let cache = cache_root(&app.app_data).join(civitai_id.to_string());
     fs::create_dir_all(&cache)?;
     let mut cursor: Option<String> = None;
     let client = civitai_client(&app)?;
-
+    let mut cached_count: i64 = {
+        let c = open_db(&app.app_data)?;
+        c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1", [model_id], |r| r.get(0))?
+    };
+    let mut has_more = false;
     loop {
-        let mut url = format!(
-            "{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true"
-        );
-        if let Some(c) = &cursor {
-            url.push_str("&cursor=");
-            url.push_str(&urlencoding::encode(c));
-        }
-
+        let mut url = format!("{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true");
+        if let Some(c) = &cursor { url.push_str("&cursor="); url.push_str(&urlencoding::encode(c)); }
         let mut req = client.get(&url);
-        if let Some(t) = token() {
-            req = req.bearer_auth(t);
-        }
-
+        if let Some(t) = token() { req = req.bearer_auth(t); }
         let res = req.send().await?;
-        if !res.status().is_success() {
-            return Err(AppError::Api(format!(
-                "Image API returned {}",
-                res.status()
-            )));
-        }
-
+        if !res.status().is_success() { return Err(AppError::Api(format!("Image API returned {}", res.status()))); }
         let body: CivitaiEnvelope = res.json().await?;
-
         for img in body.items {
-            let iid = match img.get("id").and_then(Value::as_i64) {
-                Some(x) => x,
-                None => continue,
+            if cached_count >= target_count { break; }
+            let iid = match img.get("id").and_then(Value::as_i64) { Some(x) => x, None => continue };
+            let existed = {
+                let c = open_db(&app.app_data)?;
+                c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1 AND civitai_image_id=?2", params![model_id, iid], |r| r.get::<_, i64>(0))? > 0
             };
-
             let remote = img.get("url").and_then(Value::as_str).unwrap_or("");
-            let ext = remote
-                .split('?')
-                .next()
-                .and_then(|x| Path::new(x).extension())
-                .and_then(|x| x.to_str())
-                .unwrap_or("jpg");
-
+            let ext = remote.split('?').next().and_then(|x| Path::new(x).extension()).and_then(|x| x.to_str()).unwrap_or("jpg");
             let local = cache.join(format!("{iid}.{ext}"));
             let thumb = cache.join(format!("{iid}_thumb.webp"));
-
             let local_path = if local.exists() {
                 Some(local.to_string_lossy().to_string())
             } else if !remote.is_empty() {
                 match client.get(remote).send().await {
                     Ok(resp) => match resp.error_for_status() {
                         Ok(resp) => match resp.bytes().await {
-                            Ok(bytes) if fs::write(&local, &bytes).is_ok() => {
-                                Some(local.to_string_lossy().to_string())
-                            }
+                            Ok(bytes) if fs::write(&local, &bytes).is_ok() => Some(local.to_string_lossy().to_string()),
                             _ => None,
                         },
                         Err(_) => None,
                     },
                     Err(_) => None,
                 }
-            } else {
-                None
-            };
-
+            } else { None };
             if let Some(lp) = &local_path {
                 if !thumb.exists() {
                     if let Ok(im) = image::open(lp) {
@@ -1433,31 +1451,22 @@ async fn sync_gallery_inner(
                     }
                 }
             }
-
             let meta = img.get("meta").cloned().unwrap_or(Value::Null);
             let prompt = parse_meta(&meta, "prompt");
-            let neg = parse_meta(&meta, "negativePrompt")
-                .or_else(|| parse_meta(&meta, "Negative prompt"));
-            let sampler = parse_meta(&meta, "sampler")
-                .or_else(|| parse_meta(&meta, "Sampler"));
+            let neg = parse_meta(&meta, "negativePrompt").or_else(|| parse_meta(&meta, "Negative prompt"));
+            let sampler = parse_meta(&meta, "sampler").or_else(|| parse_meta(&meta, "Sampler"));
             let steps = meta.get("steps").and_then(Value::as_i64);
-            let cfg = meta
-                .get("cfgScale")
-                .or_else(|| meta.get("cfg"))
-                .and_then(Value::as_f64);
+            let cfg = meta.get("cfgScale").or_else(|| meta.get("cfg")).and_then(Value::as_f64);
             let seed = meta.get("seed").and_then(Value::as_i64);
             let width = img.get("width").and_then(Value::as_i64);
             let height = img.get("height").and_then(Value::as_i64);
-
             let c = open_db(&app.app_data)?;
             c.execute(
                 "INSERT INTO images(
                     model_id,civitai_image_id,local_path,thumbnail_path,width,height,
                     prompt,negative_prompt,steps,cfg,sampler,seed,meta_json
                  )
-                 VALUES(
-                    ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13
-                 )
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                  ON CONFLICT(model_id,civitai_image_id) DO UPDATE SET
                     local_path=excluded.local_path,
                     thumbnail_path=excluded.thumbnail_path,
@@ -1471,54 +1480,36 @@ async fn sync_gallery_inner(
                     seed=excluded.seed,
                     meta_json=excluded.meta_json",
                 params![
-                    model_id,
-                    iid,
-                    local_path,
-                    if thumb.exists() {
-                        Some(thumb.to_string_lossy().to_string())
-                    } else {
-                        None::<String>
-                    },
-                    width,
-                    height,
-                    prompt,
-                    neg,
-                    steps,
-                    cfg,
-                    sampler,
-                    seed,
-                    serde_json::to_string(&meta).unwrap_or_else(|_| "null".into()),
+                    model_id,iid,local_path,
+                    if thumb.exists(){Some(thumb.to_string_lossy().to_string())}else{None::<String>},
+                    width,height,prompt,neg,steps,cfg,sampler,seed,
+                    serde_json::to_string(&meta).unwrap_or_else(|_|"null".into())
                 ],
             )?;
+            if !existed { cached_count += 1; }
         }
-
-        cursor = body
-            .metadata
-            .and_then(|m| m.get("nextCursor").and_then(Value::as_str).map(str::to_string));
-        if cursor.is_none() {
-            break;
-        }
+        let next_cursor = body.metadata.and_then(|m| m.get("nextCursor").and_then(Value::as_str).map(str::to_string));
+        has_more = next_cursor.is_some();
+        if cached_count >= target_count || next_cursor.is_none() { break; }
+        cursor = next_cursor;
     }
-
     if let Ok(c) = open_db(&app.app_data) {
         let bytes = dir_size(&cache_root(&app.app_data));
         let _ = put_setting(&c, "cache_bytes", &bytes.to_string());
     }
-
     let _ = handle.emit("models-changed", ());
-    Ok(())
+    Ok(has_more)
 }
+
 #[tauri::command]
 async fn sync_model_gallery(
     app: State<'_, AppStateInner>,
     handle: AppHandle,
     id: i64,
-) -> AppResult<()> {
-    let state = app.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = sync_gallery_inner(state, id, handle, true).await;
-    });
-    Ok(())
+    target_count: Option<i64>,
+) -> AppResult<bool> {
+    let target_count = target_count.unwrap_or(20).clamp(1, 200);
+    sync_gallery_inner(app.inner().clone(), id, handle, target_count).await
 }
 
 #[tauri::command]
@@ -1574,7 +1565,7 @@ async fn link_model_civitai(
         )?;
         model_by_id(&c,id)?
     };
-    sync_gallery_inner(app.inner().clone(),id,handle.clone(),true).await?;
+    sync_gallery_inner(app.inner().clone(),id,handle.clone(),20).await?;
     let _=handle.emit("models-changed",());
     Ok(rec)
 }
@@ -1643,7 +1634,7 @@ async fn refresh_model_civitai(
         model_by_id(&c, id)?
     };
 
-    let _ = sync_gallery_inner(app.inner().clone(), id, handle.clone(), true).await;
+    let _ = sync_gallery_inner(app.inner().clone(), id, handle.clone(), 20).await;
     let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
@@ -1663,6 +1654,21 @@ fn dir_size(path:&Path)->i64{if !path.exists(){return 0} WalkDir::new(path).into
 fn get_storage_stats(app:State<AppStateInner>)->AppResult<StorageStats>{storage_stats_inner(&app.app_data)}
 #[tauri::command]
 fn open_in_file_manager(path:String)->AppResult<()>{let p=PathBuf::from(path); let target=if p.is_file(){p.parent().unwrap_or(&p).to_path_buf()}else{p}; #[cfg(target_os="windows")] {std::process::Command::new("explorer").arg(target).spawn()?;} #[cfg(target_os="macos")] {std::process::Command::new("open").arg(target).spawn()?;} #[cfg(target_os="linux")] {std::process::Command::new("xdg-open").arg(target).spawn()?;} Ok(())}
+#[tauri::command]
+fn get_parallel_downloads(app: State<AppStateInner>) -> AppResult<i64> {
+    let value = app.parallel_downloads.lock().map_err(|_| AppError::Invalid("Parallel download setting is unavailable".into()))?;
+    Ok(*value as i64)
+}
+
+#[tauri::command]
+fn set_parallel_downloads(app: State<AppStateInner>, value: i64) -> AppResult<i64> {
+    let next = clamp_parallel_downloads(value);
+    let c = open_db(&app.app_data)?;
+    put_setting(&c, "parallel_downloads", &next.to_string())?;
+    *app.parallel_downloads.lock().map_err(|_| AppError::Invalid("Parallel download setting is unavailable".into()))? = next as usize;
+    Ok(next)
+}
+
 #[tauri::command]
 fn set_civitai_token(token:String)->AppResult<()>{let e=keyring::Entry::new("Raphael Model Manager","civitai").map_err(|e|AppError::Keyring(e.to_string()))?; if token.trim().is_empty(){let _=e.delete_credential();}else{e.set_password(token.trim()).map_err(|e|AppError::Keyring(e.to_string()))?;}Ok(())}
 #[tauri::command]
@@ -1806,14 +1812,16 @@ pub fn run() {
         .manage(web::WebServerController::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let app_data=app.path().app_data_dir()?;fs::create_dir_all(&app_data)?;let c=open_db(&app_data)?;let saved=setting(&c,"models_root")?;let state=AppStateInner{app_data:app_data.clone(),models_root:Arc::new(RwLock::new(saved.map(PathBuf::from))),watcher:Arc::new(Mutex::new(None)),scan_lock:Arc::new(Mutex::new(())),
+            let app_data=app.path().app_data_dir()?;fs::create_dir_all(&app_data)?;let c=open_db(&app_data)?;let saved=setting(&c,"models_root")?;let parallel=read_parallel_downloads(&c)?;let state=AppStateInner{app_data:app_data.clone(),models_root:Arc::new(RwLock::new(saved.map(PathBuf::from))),watcher:Arc::new(Mutex::new(None)),scan_lock:Arc::new(Mutex::new(())),
                 downloads:Arc::new(Mutex::new(Vec::new())),
                 active_download_paths:Arc::new(Mutex::new(HashSet::new())),
+                active_downloads:Arc::new(Mutex::new(0)),
+                parallel_downloads:Arc::new(Mutex::new(parallel)),
             };app.manage(state.clone());
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
@@ -1831,6 +1839,8 @@ mod tests {
             scan_lock: Arc::new(Mutex::new(())),
             downloads: Arc::new(Mutex::new(Vec::new())),
             active_download_paths: Arc::new(Mutex::new(HashSet::new())),
+            active_downloads: Arc::new(Mutex::new(0)),
+            parallel_downloads: Arc::new(Mutex::new(3)),
         }
     }
 
