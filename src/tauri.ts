@@ -4,6 +4,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import type {
   AppState,
   CivitaiImportPreview,
+  DownloadProgress,
   ModelImage,
   ModelRecord,
   StorageStats,
@@ -90,11 +91,15 @@ export const api = {
     targetDirectory?: string,
     selectedType?: ModelRecord['model_type']
   ) =>
-    command<ModelRecord>('install_civitai_model', {
+    command<DownloadProgress>('install_civitai_model', {
       url,
       targetDirectory,
       selectedType,
     }),
+  getDownloadProgress: () =>
+    command<DownloadProgress>('get_download_progress'),
+  clearDownloadProgress: () =>
+    command<void>('clear_download_progress'),
   refreshModel: (id: number) =>
     command<ModelRecord>('refresh_model_civitai', { id }),
   linkModelCivitai: (id: number, url: string) =>
