@@ -11,6 +11,7 @@ use std::{
     net::{IpAddr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
+    time::Duration,
 };
 use tauri::{path::BaseDirectory, AppHandle, Manager, State};
 use tokio::{net::TcpListener, sync::oneshot};
@@ -483,6 +484,9 @@ pub async fn set_web_app_enabled(
         return Ok(controller.status());
     }
 
+    // Bind once before reporting success so an occupied/unavailable port is
+    // surfaced immediately. After the server starts, the supervisor below
+    // will re-bind automatically if the listener ever exits unexpectedly.
     let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], WEB_PORT)))
         .await
         .map_err(AppError::Io)?;
@@ -501,27 +505,69 @@ pub async fn set_web_app_enabled(
         )
     };
 
-    let router = build_router(handle, controller.clone(), web_root);
     *controller.inner.shutdown.lock().unwrap() = Some(shutdown_tx);
     *controller.inner.enabled.write().unwrap() = true;
     *controller.inner.url.write().unwrap() = Some(url);
 
     let task_controller = controller.clone();
+    let task_handle = handle.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await;
+        let mut listener = listener;
+        let mut shutdown_rx = Some(shutdown_rx);
 
+        loop {
+            let router = build_router(task_handle.clone(), task_controller.clone(), web_root.clone());
+            let current_shutdown = shutdown_rx
+                .take()
+                .expect("web server shutdown receiver missing");
+
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = current_shutdown.await;
+                })
+                .await;
+
+            *task_controller.inner.shutdown.lock().unwrap() = None;
+
+            if !*task_controller.inner.enabled.read().unwrap() {
+                break;
+            }
+
+            // An unexpected listener exit should not leave clients stranded.
+            // Retry the bind while the user still has the web app enabled.
+            loop {
+                if !*task_controller.inner.enabled.read().unwrap() {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(750)).await;
+
+                match TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], WEB_PORT))).await {
+                    Ok(next_listener) => {
+                        listener = next_listener;
+                        let (next_shutdown_tx, next_shutdown_rx) = oneshot::channel();
+                        *task_controller.inner.shutdown.lock().unwrap() = Some(next_shutdown_tx);
+                        shutdown_rx = Some(next_shutdown_rx);
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("Raphael web server restart failed: {error}");
+                    }
+                }
+            }
+
+            if shutdown_rx.is_none() {
+                break;
+            }
+        }
+
+        *task_controller.inner.shutdown.lock().unwrap() = None;
         *task_controller.inner.enabled.write().unwrap() = false;
         *task_controller.inner.url.write().unwrap() = None;
-        *task_controller.inner.shutdown.lock().unwrap() = None;
     });
 
     Ok(controller.status())
 }
-
 #[tauri::command]
 pub async fn get_web_app_status(
     controller: State<'_, WebServerController>,
