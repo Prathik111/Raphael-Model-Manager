@@ -444,6 +444,75 @@ function SettingsOverlay({
         </section>
 
         <section className="settings-section">
+          <div className="section-head">CACHE MANAGEMENT</div>
+          <p className="settings-copy">Live filesystem accounting for the configured Raphael cache. Limits cover Civitai images, featured examples, thumbnails, stable covers, and temporary cache files.</p>
+
+          <div className="cache-panel">
+            {cacheStats ? <>
+              <div className="cache-summary">
+                <div className="cache-summary-main">
+                  <span className="cache-label">CACHE LOCATION</span>
+                  <b title={cacheStats.location}>{cacheStats.location}</b>
+                </div>
+                <div className="cache-usage">
+                  <span>{fmtBytes(cacheStats.used_bytes)}</span>
+                  <small>{cacheStats.max_bytes > 0 ? 'OF ' + fmtBytes(cacheStats.max_bytes) : 'UNLIMITED'}</small>
+                </div>
+              </div>
+              {cacheStats.max_bytes > 0 ? <div className="cache-progress"><div className={"cache-progress-fill" + (cacheStats.over_limit ? " over" : "")} style={{width: Math.min(100, cacheStats.used_bytes / cacheStats.max_bytes * 100) + "%"}}/></div> : null}
+              {cacheStats.over_limit ? <div className="cache-warning">CACHE LIMIT EXCEEDED BY {fmtBytes(cacheStats.used_bytes - cacheStats.max_bytes)} · OLDEST NON-COVER IMAGES ARE EVICTED AUTOMATICALLY</div> : null}
+              <div className="cache-stat-grid">
+                <div><span>FILES</span><b>{fmtCount(cacheStats.files)}</b></div>
+                <div><span>GALLERY</span><b>{fmtBytes(cacheStats.gallery_bytes)}</b></div>
+                <div><span>FEATURED</span><b>{fmtBytes(cacheStats.featured_bytes)}</b></div>
+                <div><span>THUMBNAILS</span><b>{fmtBytes(cacheStats.thumbnail_bytes)}</b></div>
+                <div><span>COVERS</span><b>{fmtBytes(cacheStats.cover_bytes)}</b></div>
+                <div><span>OTHER</span><b>{fmtBytes(cacheStats.other_bytes)}</b></div>
+              </div>
+            </> : <div className="cache-loading">READING CACHE…</div>}
+          </div>
+
+          <div className="cache-control">
+            <div>
+              <span className="cache-label">MAX CACHE MEMORY</span>
+              <p className="settings-copy">Set to 0 for unlimited. When exceeded, Raphael evicts the oldest non-cover image records first.</p>
+            </div>
+            <div className="cache-input-row">
+              <input className="cache-number-input" type="number" min="0" step="0.1" value={cacheMaxGb} onChange={e => setCacheMaxGb(e.target.value)} disabled={cacheBusy} aria-label="Maximum cache size in gigabytes" />
+              <span className="cache-unit">GB</span>
+              <button className="primary-btn small" onClick={() => void applyCacheLimit()} disabled={cacheBusy}>{cacheBusy ? 'WORKING…' : 'APPLY LIMIT'}</button>
+            </div>
+          </div>
+
+          <div className="cache-location-row">
+            <div className="cache-location-path" title={cacheStats?.location}>{cacheStats?.location || '—'}</div>
+            <button className="primary-btn small" onClick={() => void changeCacheLocation()} disabled={api.isWebApp || cacheBusy}>
+              {api.isWebApp ? 'DESKTOP ONLY' : cacheBusy ? 'MOVING…' : 'CHANGE LOCATION'}
+            </button>
+          </div>
+
+          <div className="cache-action-grid">
+            <button className="danger-btn" onClick={() => void cleanCacheOrphans()} disabled={cacheBusy}>CLEAN ORPHANS</button>
+            <button className="danger-btn" onClick={() => void clearImageCache()} disabled={cacheBusy}>DELETE IMAGES ONLY</button>
+            <button className="danger-btn" onClick={() => void clearCompleteCache()} disabled={cacheBusy}>DELETE COMPLETE CACHE</button>
+          </div>
+
+          <div className="cache-control cache-retention">
+            <div>
+              <span className="cache-label">RETAIN X IMAGES / MODEL</span>
+              <p className="settings-copy">Keeps the newest cached images for each model. Featured examples are preferred and active model cover images are protected.</p>
+            </div>
+            <div className="cache-input-row">
+              <input className="cache-number-input" type="number" min="0" step="1" value={cacheKeepPerModel} onChange={e => setCacheKeepPerModel(e.target.value)} disabled={cacheBusy} aria-label="Images to keep per model" />
+              <span className="cache-unit">IMAGES</span>
+              <button className="primary-btn small" onClick={() => void pruneCacheImages()} disabled={cacheBusy}>APPLY RETENTION</button>
+            </div>
+          </div>
+
+          {cacheMessage ? <div className="settings-success">{cacheMessage}</div> : null}
+        </section>
+
+        <section className="settings-section">
           <div className="section-head">DOWNLOAD CONCURRENCY</div>
           <p className="settings-download-copy">Controls how many model files Raphael downloads at the same time. Additional installs stay queued and start automatically as slots open.</p>
           <div className="settings-parallel-row">
