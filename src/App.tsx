@@ -286,7 +286,7 @@ function SettingsOverlay({
 
         <section className="settings-section">
           <div className="section-head">CIVITAI EXAMPLE CACHE</div>
-          <p className="settings-copy">Fetches the featured example images from the five newest Civitai versions for every linked model and rebuilds their local thumbnails.</p>
+          <p className="settings-copy">Fetches all creator-uploaded featured example images from every published Civitai version for every linked model and rebuilds their local thumbnails.</p>
           <button className="primary-btn" onClick={() => void onRefreshExamples()} disabled={running}>
             {running ? 'REFRESHING…' : 'REFRESH ALL EXAMPLES'}
           </button>
