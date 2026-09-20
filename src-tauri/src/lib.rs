@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -1270,6 +1270,31 @@ async fn sync_featured_examples_inner(
     let civitai_id = model_record.civitai_model_id.ok_or_else(|| AppError::Invalid("This model is not linked to Civitai".into()))?;
     let model_name = model_record.civitai_name.clone().unwrap_or_else(|| model_record.filename.clone());
 
+    let existing_featured: HashMap<i64, (PathBuf, String)> = {
+        let c = open_db(&app.app_data)?;
+        let mut stmt = c.prepare(
+            "SELECT civitai_image_id,local_path,COALESCE(meta_json,'')
+             FROM images
+             WHERE model_id=?1 AND meta_json LIKE '%\"featured\":true%'",
+        )?;
+        let rows = stmt.query_map([model_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.filter_map(Result::ok)
+            .filter_map(|(image_id,path,meta)| {
+                let path=PathBuf::from(path?);
+                let url=serde_json::from_str::<Value>(&meta)
+                    .ok()
+                    .and_then(|value| value.get("url").and_then(Value::as_str).map(str::to_string))?;
+                Some((image_id,(path,url)))
+            })
+            .collect()
+    };
+
     let model = api_get(&app, &format!("{API_BASE}/models/{civitai_id}")).await?;
     let mut versions = model.get("modelVersions").and_then(Value::as_array).cloned().unwrap_or_default();
     versions.sort_by(|a,b| {
@@ -1316,16 +1341,58 @@ async fn sync_featured_examples_inner(
         let version_dir=staging.join(version_id.to_string());
         fs::create_dir_all(&version_dir)?;
 
-        let jobs: Vec<(String,i64,Value)> = images
-            .into_iter()
-            .enumerate()
-            .filter_map(|(image_index,image)| {
-                let remote=image.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty()).map(str::to_string)?;
-                image_urls += 1;
-                let image_id=featured_image_key(&image,version_id,image_index)?;
-                Some((remote,image_id,image))
-            })
-            .collect();
+        let mut jobs: Vec<(String,i64,Value)> = Vec::new();
+
+        for (image_index,image) in images.into_iter().enumerate() {
+            let remote=match image.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty()).map(str::to_string) {
+                Some(value)=>value,
+                None=>continue,
+            };
+            image_urls += 1;
+            let image_id=match featured_image_key(&image,version_id,image_index) {
+                Some(value)=>value,
+                None=>continue,
+            };
+
+            let reused = existing_featured.get(&image_id).and_then(|(source,stored_url)| {
+                if stored_url != &remote || !source.is_file() {
+                    return None;
+                }
+                let ext=source.extension().and_then(|value| value.to_str()).unwrap_or("jpg");
+                let target=version_dir.join(format!("{image_id}.{ext}"));
+                if copy_or_hard_link(source,&target).is_err() {
+                    return None;
+                }
+                let mut meta=image.clone();
+                if let Some(map)=meta.as_object_mut() {
+                    map.insert("featured".into(),json!(true));
+                    map.insert("civitai_version_id".into(),json!(version_id));
+                    map.insert("civitai_version_name".into(),json!(version_name));
+                }
+                let prompt=meta.get("meta").and_then(|m|parse_meta(m,"prompt"));
+                let negative_prompt=meta.get("meta").and_then(|m|parse_meta(m,"negativePrompt").or_else(||parse_meta(m,"Negative prompt")));
+                let sampler=meta.get("meta").and_then(|m|parse_meta(m,"sampler").or_else(||parse_meta(m,"Sampler")));
+                let steps=meta.get("meta").and_then(|m|m.get("steps")).and_then(Value::as_i64);
+                let cfg=meta.get("meta").and_then(|m|m.get("cfgScale").or_else(||m.get("cfg"))).and_then(Value::as_f64);
+                let seed=meta.get("meta").and_then(|m|m.get("seed")).and_then(Value::as_i64);
+                let width=image.get("width").and_then(Value::as_i64);
+                let height=image.get("height").and_then(Value::as_i64);
+                let final_local=active.join(version_id.to_string()).join(format!("{image_id}.{ext}")).to_string_lossy().to_string();
+                Some((image_id,(image_id,Some(final_local),None,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into()))))
+            });
+
+            if let Some((image_id,record)) = reused {
+                records.push(record);
+                saved_count+=1;
+                emit_examples_progress(&handle,ExamplesRefreshProgress{
+                    current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                    version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                    status:format!("Reused cached featured image {image_id}"),done:false,error:None
+                });
+            } else {
+                jobs.push((remote,image_id,image));
+            }
+        }
 
         let results = stream::iter(jobs.into_iter().map(|(remote,image_id,image)| {
             let client=client.clone();
@@ -1799,6 +1866,16 @@ fn custom_cover_extension(path: &Path) -> Option<&'static str> {
         Some("webp") => Some("webp"),
         Some("avif") => Some("avif"),
         _ => None,
+    }
+}
+
+fn copy_or_hard_link(source: &Path, target: &Path) -> io::Result<()> {
+    match fs::hard_link(source, target) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(source, target)?;
+            Ok(())
+        }
     }
 }
 
