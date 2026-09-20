@@ -1855,7 +1855,15 @@ async fn preview_civitai_import(app:State<'_,AppStateInner>,url:String)->AppResu
     let root=app.models_root.read().unwrap().clone().ok_or_else(||AppError::Invalid("Choose your ComfyUI models folder first".into()))?; let typ=model.get("type").and_then(Value::as_str).unwrap_or("Other"); let target=root.join(civitai_type_to_folder(typ));
     let activation=json_strings(version.get("trainedWords"));
     let mid=model.get("id").and_then(Value::as_i64);
-    let thumb=match mid { Some(model_id)=>ensure_model_thumbnail(&app,model_id,&model,&version,&url).await?, None=>None };
+    let thumb=match mid {
+        Some(model_id)=>{
+            let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+            let result=ensure_model_thumbnail(&app,model_id,&model,&version,&url).await?;
+            let _=enforce_cache_limit_inner(&app.app_data);
+            result
+        },
+        None=>None
+    };
     Ok(CivitaiImportPreview{model:json!({"id":model.get("id"),"name":model.get("name"),"type":typ,"description":model.get("description"),"tags":model.get("tags"),"creator":model.get("creator").and_then(|v|v.get("username")),"thumbnail_path":thumb}),version:json!({"id":version.get("id"),"name":version.get("name"),"base_model":version.get("baseModel"),"download_url":dl,"filename":filename,"size_bytes":size,"sha256":sha256,"activation_prompts":activation}),target_directory:target.to_string_lossy().to_string(),thumbnail_path:thumb,images_count_hint:version.get("images").and_then(Value::as_array).map(|x|x.len() as i64)})
 }
 
@@ -2071,7 +2079,12 @@ async fn install_civitai_model(
             let vid = version.get("id").and_then(Value::as_i64);
             let civitai_url = canonical_civitai_url(&url, mid, vid)?;
             let thumb = match mid {
-                Some(model_id) => ensure_model_thumbnail(&state, model_id, &model, &version, &url).await?,
+                Some(model_id) => {
+                    let _guard=state.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
+                    let result=ensure_model_thumbnail(&state, model_id, &model, &version, &url).await?;
+                    let _=enforce_cache_limit_inner(&state.app_data);
+                    result
+                },
                 None => None
             };
 
@@ -2322,7 +2335,14 @@ async fn link_model_civitai(
     let mid=model.get("id").and_then(Value::as_i64);
     let vid=version.get("id").and_then(Value::as_i64);
     let canonical=canonical_civitai_url(trimmed,mid,vid)?;
-    let thumbnail_path=match mid { Some(model_id)=>ensure_model_thumbnail(&app,model_id,&model,&version,trimmed).await?, None=>None };
+    let thumbnail_path=match mid {
+        Some(model_id)=>{
+            let result=ensure_model_thumbnail(&app,model_id,&model,&version,trimmed).await?;
+            let _=enforce_cache_limit_inner(&app.app_data);
+            result
+        },
+        None=>None
+    };
     let rec={
         let c=open_db(&app.app_data)?;
         c.execute(
@@ -2393,7 +2413,14 @@ async fn refresh_model_civitai(
         .and_then(|v| v.get("username"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let thumbnail_path=match model.get("id").and_then(Value::as_i64) { Some(mid)=>ensure_model_thumbnail(&app,mid,&model,&version,&url).await?, None=>None };
+    let thumbnail_path=match model.get("id").and_then(Value::as_i64) {
+        Some(mid)=>{
+            let result=ensure_model_thumbnail(&app,mid,&model,&version,&url).await?;
+            let _=enforce_cache_limit_inner(&app.app_data);
+            result
+        },
+        None=>None
+    };
 
     let rec = {
         let c = open_db(&app.app_data)?;
