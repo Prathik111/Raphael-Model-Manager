@@ -21,7 +21,7 @@ use crate::{
     get_parallel_downloads, set_parallel_downloads,
     get_cache_stats, set_cache_max_bytes, set_cache_location, clear_cache_images, clear_complete_cache, prune_cache_images, clean_cache_orphans,
     get_tags, install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
-    refresh_all_examples, get_examples_refresh_status, refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
+    refresh_all_examples, get_examples_refresh_status, load_more_model_examples, get_example_load_amount, set_example_load_amount, refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
     set_model_tags, set_model_type, sync_model_gallery,
     is_civitai_token_set, AppError, AppResult, CivitaiImportPreview, ModelRecord,
 };
@@ -96,6 +96,11 @@ struct SyncGalleryArgs {
     id: i64,
     #[serde(rename = "targetCount")]
     target_count: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExampleLoadAmountArgs {
+    amount: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -333,6 +338,20 @@ async fn command_handler(
                 .await
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
+        "load_more_model_examples" => {
+            let args: SyncGalleryArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            load_more_model_examples(handle.state(), handle.clone(), args.id, args.target_count)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        }
+        "get_example_load_amount" => get_example_load_amount(handle.state())
+            .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "set_example_load_amount" => {
+            let args: ExampleLoadAmountArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            let amount=args.amount.unwrap_or(20);
+            set_example_load_amount(handle.state(), amount)
+                .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        },
         "refresh_all_examples" => {
             refresh_all_examples(handle.state(), handle.clone())
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
