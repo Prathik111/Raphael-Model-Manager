@@ -201,6 +201,7 @@ function SettingsOverlay({
         </div>
         <button className="settings-close" aria-label="Close settings" onClick={onClose}>×</button>
       </header>
+      {settingsError ? <div className="settings-global-error"><div className="error-box">{settingsError}</div></div> : null}
 
       <div className="settings-scroll">
         <section className="settings-section">
@@ -237,7 +238,6 @@ function SettingsOverlay({
             {tokenSet ? <button className="text-btn settings-clear-btn" onClick={clearCivitaiToken} disabled={tokenBusy}>CLEAR</button> : null}
           </div>
           {tokenMessage ? <div className="settings-success">{tokenMessage}</div> : null}
-          {settingsError ? <div className="error-box settings-error">{settingsError}</div> : null}
         </section>
 
         <section className="settings-section">
