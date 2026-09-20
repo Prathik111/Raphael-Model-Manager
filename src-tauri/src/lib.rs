@@ -64,7 +64,7 @@ struct AppStateInner {
     active_download_paths: Arc<Mutex<HashSet<PathBuf>>>,
     active_downloads: Arc<Mutex<usize>>,
     parallel_downloads: Arc<Mutex<usize>>,
-    examples_refresh_lock: Arc<Mutex<bool>>,
+    examples_refresh_state: Arc<Mutex<bool>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -158,6 +158,23 @@ struct ExamplesRefreshProgress {
     error: Option<String>,
 }
 
+#[derive(Clone)]
+struct ExamplesRefreshState {
+    progress: Option<ExamplesRefreshProgress>,
+    running: bool,
+}
+
+impl Default for ExamplesRefreshState {
+    fn default() -> Self {
+        Self { progress: None, running: false }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ModelImagesResponse {
+    images: Vec<ModelImage>,
+    has_more: bool,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CivitaiEnvelope { metadata: Option<Value>, items: Vec<Value> }
@@ -585,6 +602,24 @@ async fn ensure_model_thumbnail(app:&AppStateInner, model_id:i64, model:&Value, 
 
 fn emit_examples_progress(handle: &AppHandle, progress: ExamplesRefreshProgress) {
     let _ = handle.emit("examples-refresh-progress", progress);
+}
+
+fn store_examples_refresh_state(
+    state: &Arc<Mutex<ExamplesRefreshState>>,
+    handle: &AppHandle,
+    progress: ExamplesRefreshProgress,
+) {
+    if let Ok(mut guard) = state.lock() {
+        guard.progress = Some(progress.clone());
+        guard.running = !progress.done;
+    }
+    emit_examples_progress(handle, progress);
+}
+
+fn get_examples_refresh_state(
+    state: &Arc<Mutex<ExamplesRefreshState>>,
+) -> Option<ExamplesRefreshProgress> {
+    state.lock().ok().and_then(|guard| guard.progress.clone())
 }
 
 fn featured_remote_url(image: &Value) -> Option<String> {
@@ -1762,7 +1797,7 @@ async fn link_model_civitai(
         )?;
         model_by_id(&c,id)?
     };
-    let _ = sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await;
+    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
     let _=handle.emit("models-changed",());
     Ok(rec)
 }
@@ -1831,57 +1866,102 @@ async fn refresh_model_civitai(
         model_by_id(&c, id)?
     };
 
-    let _ = sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await;
+    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
     let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
 #[tauri::command]
-fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResult<()> {
+fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResult<ExamplesRefreshProgress> {
     {
-        let mut running=app.examples_refresh_lock.lock().map_err(|_|AppError::Invalid("Featured example refresh state is unavailable".into()))?;
-        if *running { return Err(AppError::Invalid("Featured example refresh is already running".into())); }
-        *running=true;
+        let guard = app.examples_refresh_state.lock()
+            .map_err(|_| AppError::Invalid("Featured example refresh state is unavailable".into()))?;
+        if guard.running {
+            return Err(AppError::Invalid("Featured example refresh is already running".into()));
+        }
     }
+    let initial = ExamplesRefreshProgress {
+        current: 0, total: 0, model_id: None, model_name: None,
+        version_current: 0, version_total: 5, images_saved: 0,
+        status: "Starting featured example refresh".into(), done: false, error: None,
+    };
+    store_examples_refresh_state(&app.examples_refresh_state, &handle, initial.clone());
 
-    let state=app.inner().clone();
-    let refresh_lock=state.examples_refresh_lock.clone();
-    tauri::async_runtime::spawn(async move{
-        let models:Vec<(i64,String)>=match open_db(&state.app_data).and_then(|c|{
-            let mut stmt=c.prepare("SELECT id,COALESCE(civitai_name,filename) FROM models WHERE civitai_model_id IS NOT NULL ORDER BY id")?;
-            let rows=stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let state = app.inner().clone();
+    let refresh_state = state.examples_refresh_state.clone();
+    tauri::async_runtime::spawn(async move {
+        let models: Vec<(i64, String)> = match open_db(&state.app_data).and_then(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id,COALESCE(civitai_name,filename) FROM models WHERE civitai_model_id IS NOT NULL ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             Ok(rows.filter_map(Result::ok).collect())
-        }){
-            Ok(v)=>v,
-            Err(e)=>{
-                emit_examples_progress(&handle,ExamplesRefreshProgress{current:0,total:0,model_id:None,model_name:None,version_current:0,version_total:0,images_saved:0,status:"Could not read linked models".into(),done:true,error:Some(e.to_string())});
-                *refresh_lock.lock().unwrap()=false;
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+                    current: 0, total: 0, model_id: None, model_name: None,
+                    version_current: 0, version_total: 0, images_saved: 0,
+                    status: "Could not read linked models".into(), done: true, error: Some(e.to_string()),
+                });
                 return;
             }
         };
-        let total=models.len();
-        emit_examples_progress(&handle,ExamplesRefreshProgress{current:0,total,model_id:None,model_name:None,version_current:0,version_total:if total>0{5}else{0},images_saved:0,status:if total==0{"No Civitai-linked models found".into()}else{"Starting featured example refresh".into()},done:total==0,error:None});
-        if total==0{*refresh_lock.lock().unwrap()=false;return;}
+        let total = models.len();
+        store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+            current: 0, total, model_id: None, model_name: None,
+            version_current: 0, version_total: if total > 0 { 5 } else { 0 },
+            images_saved: 0,
+            status: if total == 0 { "No Civitai-linked models found".into() } else { "Starting featured example refresh".into() },
+            done: total == 0, error: None,
+        });
+        if total == 0 { return; }
 
-        let mut saved_total=0usize;
-        let mut first_error=None;
-        for (index,(local_id,name)) in models.iter().enumerate(){
-            match sync_featured_examples_inner(state.clone(),*local_id,handle.clone(),Some((index,total))).await{
-                Ok(saved)=>{
-                    saved_total+=saved;
-                    emit_examples_progress(&handle,ExamplesRefreshProgress{current:index+1,total,model_id:Some(*local_id),model_name:Some(name.clone()),version_current:5,version_total:5,images_saved:saved_total,status:format!("Finished {name} ({saved} examples)"),done:false,error:None});
+        let mut saved_total = 0usize;
+        let mut first_error: Option<String> = None;
+        for (index, (local_id, name)) in models.iter().enumerate() {
+            store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+                current: index, total, model_id: Some(*local_id), model_name: Some(name.clone()),
+                version_current: 0, version_total: 5, images_saved: saved_total,
+                status: format!("Refreshing {name}"), done: false, error: None,
+            });
+            match sync_featured_examples_inner(state.clone(), *local_id, handle.clone(), Some((index, total))).await {
+                Ok(saved) => {
+                    saved_total += saved;
+                    store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+                        current: index + 1, total, model_id: Some(*local_id), model_name: Some(name.clone()),
+                        version_current: 5, version_total: 5, images_saved: saved_total,
+                        status: format!("Finished {name} ({saved} examples)"), done: false, error: None,
+                    });
                 }
-                Err(e)=>{
-                    let msg=e.to_string();
-                    if first_error.is_none(){first_error=Some(msg.clone());}
-                    emit_examples_progress(&handle,ExamplesRefreshProgress{current:index+1,total,model_id:Some(*local_id),model_name:Some(name.clone()),version_current:0,version_total:5,images_saved:saved_total,status:format!("Failed {name}"),done:false,error:Some(msg)});
+                Err(e) => {
+                    let msg = e.to_string();
+                    if first_error.is_none() { first_error = Some(msg.clone()); }
+                    store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+                        current: index + 1, total, model_id: Some(*local_id), model_name: Some(name.clone()),
+                        version_current: 0, version_total: 5, images_saved: saved_total,
+                        status: format!("Failed {name}"), done: false, error: Some(msg),
+                    });
                 }
             }
         }
-        emit_examples_progress(&handle,ExamplesRefreshProgress{current:total,total,model_id:None,model_name:None,version_current:0,version_total:0,images_saved:saved_total,status:format!("Finished refreshing {total} model{}",if total==1{""}else{"s"}),done:true,error:first_error});
-        let _=handle.emit("models-changed",());
-        *refresh_lock.lock().unwrap()=false;
+        store_examples_refresh_state(&refresh_state, &handle, ExamplesRefreshProgress {
+            current: total, total, model_id: None, model_name: None,
+            version_current: 0, version_total: 0, images_saved: saved_total,
+            status: if first_error.is_some() {
+                format!("Finished refreshing {total} model{} with errors", if total == 1 { "" } else { "s" })
+            } else {
+                format!("Finished refreshing {total} model{}", if total == 1 { "" } else { "s" })
+            },
+            done: true, error: first_error,
+        });
+        let _ = handle.emit("models-changed", ());
     });
-    Ok(())
+    Ok(initial)
+}
+
+#[tauri::command]
+fn get_examples_refresh_status(app: State<AppStateInner>) -> Option<ExamplesRefreshProgress> {
+    get_examples_refresh_state(&app.examples_refresh_state)
 }
 
 #[tauri::command]
@@ -2063,7 +2143,7 @@ pub fn run() {
                 active_download_paths:Arc::new(Mutex::new(HashSet::new())),
                 active_downloads:Arc::new(Mutex::new(0)),
                 parallel_downloads:Arc::new(Mutex::new(parallel)),
-                examples_refresh_lock:Arc::new(Mutex::new(false)),
+                examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
             };app.manage(state.clone());
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
@@ -2088,7 +2168,7 @@ mod tests {
             active_download_paths: Arc::new(Mutex::new(HashSet::new())),
             active_downloads: Arc::new(Mutex::new(0)),
             parallel_downloads: Arc::new(Mutex::new(3)),
-            examples_refresh_lock: Arc::new(Mutex::new(false)),
+            examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
         }
     }
 
