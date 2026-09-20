@@ -1060,11 +1060,12 @@ async fn download_file(
         total += bytes.len() as i64;
         hasher.update(&bytes);
         file.write_all(&bytes)?;
-        let percent = response_total.filter(|x| *x > 0).map(|x| (total as f64 / x as f64 * 100.0).clamp(0.0, 100.0));
         set_download_progress(&progress, task_id, |p| {
             p.downloaded_bytes = total;
             p.total_bytes = response_total.or(p.total_bytes);
-            p.percent = percent;
+            p.percent = p.total_bytes
+                .filter(|x| *x > 0)
+                .map(|x| (total as f64 / x as f64 * 100.0).clamp(0.0, 100.0));
         });
     }
 
@@ -1139,7 +1140,7 @@ async fn install_civitai_model(
     } else {
         civitai_type_to_model_type(civitai_typ).to_string()
     };
-    let (dl, _, filename, sha256) = selected_file(&version)
+    let (dl, file_size, filename, sha256) = selected_file(&version)
         .ok_or_else(|| AppError::Api("No downloadable public file found for this version".into()))?;
 
     let root = app.models_root.read().unwrap().clone()
@@ -1164,8 +1165,8 @@ async fn install_civitai_model(
         filename: if filename.is_empty() { "model".into() } else { filename.clone() },
         phase: "STARTING".into(),
         downloaded_bytes: 0,
-        total_bytes: None,
-        percent: None,
+        total_bytes: file_size,
+        percent: file_size.filter(|x| *x > 0).map(|_| 0.0),
         error: None,
     };
     {
