@@ -304,15 +304,53 @@ function ModelCard({ model, selected, onClick }: { model: ModelRecord; selected:
   </button>;
 }
 
-function Gallery({ images }: { images: ModelImage[] }) {
+function Gallery({ model, images, onChooseThumbnail }: { model: ModelRecord; images: ModelImage[]; onChooseThumbnail: (imageId: number) => Promise<void> }) {
+  const [busyImage, setBusyImage] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
   if (!images.length) return <div className="empty-inline">No cached Civitai images yet.</div>;
-  return <div className="gallery-grid">{images.map((img) => <div className="gallery-item" key={img.id}>
-    {img.local_path ? <img src={fileUrl(img.local_path)} alt="Civitai example"/> : <div className="thumb placeholder">IMAGE</div>}
-    {img.prompt ? <div className="gallery-prompt">{img.prompt}</div> : null}<div className="gallery-meta">
-      {img.steps || img.cfg || img.sampler ? <span>{img.sampler || 'sampler'} {img.steps ? `· ${img.steps} steps` : ''}</span> : null}
-      {img.prompt ? <button onClick={()=>navigator.clipboard?.writeText(img.prompt!)}>COPY PROMPT</button> : null}
+
+  const choose = async (imageId: number) => {
+    if (busyImage !== null) return;
+    setBusyImage(imageId);
+    setError(null);
+    try {
+      await onChooseThumbnail(imageId);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusyImage(null);
+    }
+  };
+
+  return <div className="gallery-shell">
+    {error ? <div className="error-box gallery-error">{error}</div> : null}
+    <div className="gallery-grid">
+      {images.map((img) => {
+        const imagePath = img.local_path || img.thumbnail_path;
+        const active = model.cover_path === img.thumbnail_path || model.cover_path === img.local_path;
+        const ready = Boolean(img.thumbnail_path || img.local_path);
+        return <div className={`gallery-item ${active ? 'active-thumbnail' : ''}`} key={img.id}>
+          <div className="gallery-image-wrap">
+            {imagePath ? <img src={fileUrl(imagePath)} alt="Civitai example"/> : <div className="thumb placeholder">IMAGE</div>}
+            {active ? <span className="gallery-active-badge">ACTIVE THUMBNAIL</span> : null}
+          </div>
+          {img.prompt ? <div className="gallery-prompt">{img.prompt}</div> : null}
+          <div className="gallery-meta">
+            <span>{img.steps || img.cfg || img.sampler ? `${img.sampler || 'sampler'}${img.steps ? ` · ${img.steps} steps` : ''}` : 'CIVITAI EXAMPLE'}</span>
+            {img.prompt ? <button onClick={()=>navigator.clipboard?.writeText(img.prompt!)}>COPY PROMPT</button> : null}
+          </div>
+          <button
+            className={`gallery-thumbnail-btn ${active ? 'active' : ''}`}
+            onClick={() => void choose(img.id)}
+            disabled={!ready || busyImage !== null}
+          >
+            {busyImage === img.id ? 'APPLYING…' : active ? 'ACTIVE THUMBNAIL' : 'USE AS THUMBNAIL'}
+          </button>
+        </div>;
+      })}
     </div>
-  </div>)}</div>;
+  </div>;
 }
 
 
@@ -540,7 +578,7 @@ function CoverEditorOverlay({
   </div>;
 }
 
-function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTags, onSaveType, onDelete, onFilterTag, onChangeCover }: { model: ModelRecord; images: ModelImage[]; allTags: TagRecord[]; onRefresh: ()=>void; onLinkCivitai: (url: string)=>Promise<void>; onSaveTags: (tags: string[])=>Promise<void>; onSaveType: (type: string)=>Promise<void>; onDelete: ()=>Promise<void>; onFilterTag: (tag: string)=>void; onChangeCover: ()=>void }) {
+function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTags, onSaveType, onDelete, onFilterTag, onChangeCover, onChooseThumbnail }: { model: ModelRecord; images: ModelImage[]; allTags: TagRecord[]; onRefresh: ()=>void; onLinkCivitai: (url: string)=>Promise<void>; onSaveTags: (tags: string[])=>Promise<void>; onSaveType: (type: string)=>Promise<void>; onDelete: ()=>Promise<void>; onFilterTag: (tag: string)=>void; onChangeCover: ()=>void; onChooseThumbnail: (imageId: number)=>Promise<void> }) {
   const [tab, setTab] = useState<'overview'|'examples'|'files'>('overview');
   const [civitaiUrl, setCivitaiUrl] = useState(model.civitai_url || '');
   const [linkBusy, setLinkBusy] = useState(false);
@@ -562,7 +600,7 @@ function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTag
       <section><div className="section-head">LOCATION</div><div className="mono-box">{model.path}</div><button className="text-btn" disabled={api.isWebApp} title={api.isWebApp ? 'Opening the Windows file manager is available only in the desktop app' : undefined} onClick={()=>api.openFolder(model.path)}>{api.isWebApp ? 'OPEN FOLDER · DESKTOP' : 'OPEN FOLDER'}</button></section>
       <section><div className="section-head">CIVITAI SOURCE</div>{model.civitai_url ? <div className="civitai-source-panel"><div className="source-line"><span className="source-dot"/><span className="source-label">LINKED SOURCE</span><span className="source-domain">{new URL(model.civitai_url).hostname.replace(/^www\./,'').toUpperCase()}</span></div><div className="mono-box source-url">{model.civitai_url}</div><button className="text-btn" onClick={onRefresh}>REFRESH SOURCE DATA</button></div> : <div className="civitai-link-panel"><div className="source-line"><span className="source-dot"/><span className="source-label">LINK LOCAL MODEL</span><span className="source-domain">CIVITAI</span></div><p className="empty-inline">Paste a Civitai model page to pull its metadata, gallery and thumbnail into Raphael.</p><div className="link-row"><input value={civitaiUrl} onChange={e=>{setCivitaiUrl(e.target.value);setLinkError(null);}} placeholder="civitai.com/models/... or civitai.red/models/..."/><button className="primary-btn small" disabled={linkBusy} onClick={async()=>{if(!civitaiUrl.trim()) return; setLinkBusy(true); setLinkError(null); try { await onLinkCivitai(civitaiUrl.trim()); } catch (e) { setLinkError(String(e)); } finally { setLinkBusy(false); }}}>{linkBusy?'FETCHING…':'FETCH DETAILS'}</button></div>{linkError ? <div className="error-box">{linkError}</div> : null}</div>}</section>
     </div>}
-    {tab==='examples' && <div className="inspector-scroll"><section><div className="section-head">CACHED CIVITAI GALLERY · {images.length}</div><Gallery images={images}/></section></div>}
+    {tab==='examples' && <div className="inspector-scroll"><section><div className="section-head section-head-row"><span>CACHED CIVITAI GALLERY · {images.length}</span><span className="section-action">PICK A THUMBNAIL</span></div><Gallery model={model} images={images} onChooseThumbnail={onChooseThumbnail}/></section></div>}
     {tab==='files' && <div className="inspector-scroll"><section><div className="section-head">LOCAL FILE</div><div className="kv"><span>SIZE</span><b>{fmtBytes(model.size_bytes)}</b></div><div className="kv"><span>TYPE</span><b>{model.model_type}</b></div><div className="kv"><span>BASE</span><b>{model.base_model || '—'}</b></div><div className="kv"><span>VERSION</span><b>{model.version_name || '—'}</b></div><div className="kv"><span>CREATOR</span><b>{model.creator || '—'}</b></div><div className="kv"><span>SHA256</span><b className="wrap">{model.source_hash || 'Not computed'}</b></div></section><section className="danger-section"><div className="section-head">DANGER ZONE</div><p className="danger-copy">Permanently delete this model file from disk and remove its Raphael metadata and cached gallery entries.</p><button className="danger-btn" onClick={()=>{setDeleteError(null);setDeleteOpen(true);}} disabled={deleteBusy}>DELETE MODEL</button></section></div>}
     {deleteOpen && <div className="modal-backdrop inspector-delete-backdrop" onClick={()=>{if(!deleteBusy)setDeleteOpen(false);}}><div className="delete-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">DESTRUCTIVE ACTION</div><h3>DELETE MODEL?</h3><p>This will permanently remove <b>{model.filename}</b> from your ComfyUI models folder. Raphael metadata and cached gallery files for this model will also be removed.</p>{deleteError ? <div className="error-box modal-error">{deleteError}</div> : null}<div className="modal-actions"><button className="text-btn" onClick={()=>setDeleteOpen(false)} disabled={deleteBusy}>CANCEL</button><button className="danger-btn confirm" disabled={deleteBusy} onClick={async()=>{setDeleteBusy(true);setDeleteError(null);try{await onDelete();setDeleteOpen(false);}catch(e){setDeleteError(String(e));}finally{setDeleteBusy(false);}}}>{deleteBusy?'DELETING…':'DELETE PERMANENTLY'}</button></div></div></div>}
   </aside>;
@@ -638,7 +676,7 @@ function App() {
         </button>
       </div></aside>
       <main className="library"><div className="library-head"><div><div className="eyebrow">{type.toUpperCase()}</div><h1>{type==='All'?'MODEL LIBRARY':type.toUpperCase()}</h1></div><div className="library-tools"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search models, tags, tag:…"/><button className={`tag-filter-button ${activeTags.length?'active':''}`} onClick={()=>setTagPanelOpen(v=>!v)}>TAGS{activeTags.length ? ` · ${activeTags.length}` : ''}</button><button className="import-btn" onClick={()=>{setImportError(null);setImportUrl('');setImportType('Other');setCustomDownloadPath(false);setDownloadPath('');setPreview({model:{},version:{id:0,name:'',base_model:null,download_url:'',filename:null,size_bytes:null,activation_prompts:[]},target_directory:'',thumbnail_path:null});}}>IMPORT CIVITAI</button><select value={sort} onChange={e=>setSort(e.target.value)}><option value="name">NAME</option><option value="size">SIZE</option><option value="path">PATH</option></select></div>{tagPanelOpen && <TagFilterPanel tags={allTags} activeTags={activeTags} onToggle={tag=>setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current.filter(x=>x.toLowerCase()!==tag.toLowerCase()):[...current,tag])} onClear={()=>setActiveTags([])}/>}</div>{activeTags.length ? <div className="active-tag-bar">{activeTags.map(tag=><button key={tag} onClick={()=>setActiveTags(current=>current.filter(x=>x.toLowerCase()!==tag.toLowerCase()))}>{tag}<span>×</span></button>)}<span className="active-tag-help">TAG FILTERS</span></div> : null}<div className="grid">{models.map(m=><ModelCard key={m.id} model={m} selected={m.id===selectedId} onClick={()=>setSelectedId(m.id)}/>)}{!models.length&&<div className="empty-state">No models match the current view.</div>}</div></main>
-      {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} onRefresh={async()=>{await api.refreshModel(selected.id); await refresh();}} onLinkCivitai={async(url)=>{await api.linkModelCivitai(selected.id,url); await refresh();}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)}/>}
+      {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} onRefresh={async()=>{await api.refreshModel(selected.id); await refresh();}} onLinkCivitai={async(url)=>{await api.linkModelCivitai(selected.id,url); await refresh();}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)} onChooseThumbnail={async imageId=>{const updated=await api.setModelCoverFromImage(selected.id,imageId); setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
       {selected && coverEditorOpen && <CoverEditorOverlay model={selected} onClose={()=>setCoverEditorOpen(false)} onUpdated={updated=>{setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
     </div>
     {settingsOpen && <SettingsOverlay thumbnailFit={thumbnailFit} onThumbnailFitChange={setThumbnailFit} onClose={()=>setSettingsOpen(false)}/>}
