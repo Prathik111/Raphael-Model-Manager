@@ -70,10 +70,10 @@ impl WebTaskStore {
         }
     }
 
-    fn start<F, Fut>(&self, operation: F) -> String
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = AppResult<Value>> + Send + 'static,
+    fn start(
+        &self,
+        operation: std::pin::Pin<Box<dyn Future<Output = AppResult<Value>> + Send>>,
+    ) -> String {
     {
         self.prune();
         let task_id = format!("web-{}", WEB_TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
@@ -565,153 +565,164 @@ async fn task_start_handler(
     let handle = state.handle.clone();
     let app = handle.state::<crate::AppStateInner>().inner().clone();
 
-    let operation = match request.command.as_str() {
-        "preview_civitai_import" => {
-            let args: UrlArgs = match arg(request.args) {
-                Ok(value) => value,
-                Err(error) => return response_err(error),
-            };
-            move || async move {
-                let value = preview_civitai_import(&app, args.url).await?;
-                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
-            }
-        }
-        "sync_model_gallery" => {
-            let args: SyncGalleryArgs = match arg(request.args) {
-                Ok(value) => value,
-                Err(error) => return response_err(error),
-            };
-            let handle = handle.clone();
-            move || async move {
-                let target_count = args.target_count.unwrap_or(20).clamp(1, 200);
-                let value = sync_gallery_inner(&app, args.id, handle, target_count).await?;
-                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
-            }
-        }
-        "load_more_model_examples" => {
-            let args: LoadMoreArgs = match arg(request.args) {
-                Ok(value) => value,
-                Err(error) => return response_err(error),
-            };
-            let handle = handle.clone();
-            move || async move {
-                let requested = args.amount.unwrap_or_else(|| {
-                    open_db(&app.app_data)
-                        .ok()
-                        .and_then(|c| read_example_load_amount(&c).ok())
-                        .unwrap_or(20)
-                }).clamp(1, 100);
-                let current_count = {
-                    let c = open_db(&app.app_data)?;
-                    c.query_row(
-                        "SELECT COUNT(*) FROM images WHERE model_id=?1 AND meta_json NOT LIKE '%\"featured\":true%'",
-                        [args.id],
-                        |row| row.get::<_, i64>(0),
-                    )?
+    let operation: std::pin::Pin<Box<dyn Future<Output = AppResult<Value>> + Send>> =
+        match request.command.as_str() {
+            "preview_civitai_import" => {
+                let args: UrlArgs = match arg(request.args) {
+                    Ok(value) => value,
+                    Err(error) => return response_err(error),
                 };
-                let value = sync_gallery_inner(
-                    &app,
-                    args.id,
-                    handle,
-                    current_count.saturating_add(requested).clamp(1, 1000),
-                ).await?;
-                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+                Box::pin(async move {
+                    let value = preview_civitai_import_inner(&app, args.url).await?;
+                    serde_json::to_value(value)
+                        .map_err(|error| AppError::Invalid(error.to_string()))
+                })
             }
-        }
-        "add_subfolder_tags" => {
-            move || async move {
+            "sync_model_gallery" => {
+                let args: SyncGalleryArgs = match arg(request.args) {
+                    Ok(value) => value,
+                    Err(error) => return response_err(error),
+                };
+                let task_handle = handle.clone();
+                Box::pin(async move {
+                    let target_count = args.target_count.unwrap_or(20).clamp(1, 200);
+                    let value = sync_gallery_inner(&app, args.id, task_handle, target_count).await?;
+                    serde_json::to_value(value)
+                        .map_err(|error| AppError::Invalid(error.to_string()))
+                })
+            }
+            "load_more_model_examples" => {
+                let args: LoadMoreArgs = match arg(request.args) {
+                    Ok(value) => value,
+                    Err(error) => return response_err(error),
+                };
+                let task_handle = handle.clone();
+                Box::pin(async move {
+                    let requested = args.amount.unwrap_or_else(|| {
+                        open_db(&app.app_data)
+                            .ok()
+                            .and_then(|c| read_example_load_amount(&c).ok())
+                            .unwrap_or(20)
+                    }).clamp(1, 100);
+                    let current_count = {
+                        let c = open_db(&app.app_data)?;
+                        c.query_row(
+                            "SELECT COUNT(*) FROM images WHERE model_id=?1 AND meta_json NOT LIKE '%\"featured\":true%'",
+                            [args.id],
+                            |row| row.get::<_, i64>(0),
+                        )?
+                    };
+                    let value = sync_gallery_inner(
+                        &app,
+                        args.id,
+                        task_handle,
+                        current_count.saturating_add(requested).clamp(1, 1000),
+                    ).await?;
+                    serde_json::to_value(value)
+                        .map_err(|error| AppError::Invalid(error.to_string()))
+                })
+            }
+            "add_subfolder_tags" => Box::pin(async move {
                 let value = crate::add_subfolder_tags_inner(&app)?;
-                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+                serde_json::to_value(value)
+                    .map_err(|error| AppError::Invalid(error.to_string()))
+            }),
+            "delete_model" => {
+                let args: IdArgs = match arg(request.args) {
+                    Ok(value) => value,
+                    Err(error) => return response_err(error),
+                };
+                let task_handle = handle.clone();
+                Box::pin(async move {
+                    delete_model_inner(&app, task_handle, args.id).await?;
+                    Ok(Value::Null)
+                })
             }
-        }
-        "delete_model" => {
-            let args: IdArgs = match arg(request.args) {
-                Ok(value) => value,
-                Err(error) => return response_err(error),
-            };
-            let handle = handle.clone();
-            move || async move {
-                delete_model_inner(&app, handle, args.id).await?;
-                Ok(Value::Null)
+            "set_cache_max_bytes" => {
+                let args: CacheMaxBytesArgs = match arg(request.args) {
+                    Ok(value) => value,
+                    Err(error) => return response_err(error),
+                };
+                Box::pin(async move {
+                    let _guard = app.cache_lock.lock().await;
+                    let value = set_cache_max_bytes_inner(&app.app_data, args.max_bytes)?;
+                    serde_json::to_value(value)
+                        .map_err(|error| AppError::Invalid(error.to_string()))
+                })
             }
-        }
-        "set_cache_max_bytes" => {
-            let args: CacheMaxBytesArgs = match arg(request.args) {
-                Ok(value) => value,
-                Err(error) => return response_err(error),
-            };
-            move || async move {
+            "set_cache_location" => {
+                let args: CacheLocationArgs = match arg(request.args) {
+                    Ok(value) => value,
+                    Err(error) => return response_err(error),
+                };
+                Box::pin(async move {
+                    let _guard = app.cache_lock.lock().await;
+                    let value = set_cache_location_inner(&app.app_data, &args.path)?;
+                    serde_json::to_value(value)
+                        .map_err(|error| AppError::Invalid(error.to_string()))
+                })
+            }
+            "clear_cache_images" => Box::pin(async move {
                 let _guard = app.cache_lock.lock().await;
-                let value = set_cache_max_bytes_inner(&app.app_data, args.max_bytes)?;
-                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
-            }
-        }
-        "set_cache_location" => {
-            let args: CacheLocationArgs = match arg(request.args) {
-                Ok(value) => value,
-                Err(error) => return response_err(error),
-            };
-            move || async move {
+                let value = clear_cache_images_inner(&app.app_data)?;
+                serde_json::to_value(value)
+                    .map_err(|error| AppError::Invalid(error.to_string()))
+            }),
+            "clear_complete_cache" => Box::pin(async move {
                 let _guard = app.cache_lock.lock().await;
-                let value = set_cache_location_inner(&app.app_data, &args.path)?;
-                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+                let value = clear_complete_cache_inner(&app.app_data)?;
+                serde_json::to_value(value)
+                    .map_err(|error| AppError::Invalid(error.to_string()))
+            }),
+            "prune_cache_images" => {
+                let args: KeepImagesArgs = match arg(request.args) {
+                    Ok(value) => value,
+                    Err(error) => return response_err(error),
+                };
+                Box::pin(async move {
+                    let _guard = app.cache_lock.lock().await;
+                    let value = prune_cache_images_inner(&app.app_data, args.keep_per_model)?;
+                    serde_json::to_value(value)
+                        .map_err(|error| AppError::Invalid(error.to_string()))
+                })
             }
-        }
-        "clear_cache_images" => move || async move {
-            let _guard = app.cache_lock.lock().await;
-            let value = clear_cache_images_inner(&app.app_data)?;
-            serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
-        },
-        "clear_complete_cache" => move || async move {
-            let _guard = app.cache_lock.lock().await;
-            let value = clear_complete_cache_inner(&app.app_data)?;
-            serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
-        },
-        "prune_cache_images" => {
-            let args: KeepImagesArgs = match arg(request.args) {
-                Ok(value) => value,
-                Err(error) => return response_err(error),
-            };
-            move || async move {
+            "clean_cache_orphans" => Box::pin(async move {
                 let _guard = app.cache_lock.lock().await;
-                let value = prune_cache_images_inner(&app.app_data, args.keep_per_model)?;
-                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+                let value = clean_cache_orphans_inner(&app.app_data)?;
+                serde_json::to_value(value)
+                    .map_err(|error| AppError::Invalid(error.to_string()))
+            }),
+            "link_model_civitai" => {
+                let args: LinkArgs = match arg(request.args) {
+                    Ok(value) => value,
+                    Err(error) => return response_err(error),
+                };
+                let task_handle = handle.clone();
+                Box::pin(async move {
+                    let value = link_model_civitai_inner(&app, task_handle, args.id, args.url).await?;
+                    serde_json::to_value(value)
+                        .map_err(|error| AppError::Invalid(error.to_string()))
+                })
             }
-        }
-        "clean_cache_orphans" => move || async move {
-            let _guard = app.cache_lock.lock().await;
-            let value = clean_cache_orphans_inner(&app.app_data)?;
-            serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
-        },
-        "link_model_civitai" => {
-            let args: LinkArgs = match arg(request.args) {
-                Ok(value) => value,
-                Err(error) => return response_err(error),
-            };
-            let handle = handle.clone();
-            move || async move {
-                let value = link_model_civitai_inner(&app, handle, args.id, args.url).await?;
-                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+            "refresh_model_civitai" => {
+                let args: IdArgs = match arg(request.args) {
+                    Ok(value) => value,
+                    Err(error) => return response_err(error),
+                };
+                let task_handle = handle.clone();
+                Box::pin(async move {
+                    let value = refresh_model_civitai_inner(&app, task_handle, args.id).await?;
+                    serde_json::to_value(value)
+                        .map_err(|error| AppError::Invalid(error.to_string()))
+                })
             }
-        }
-        "refresh_model_civitai" => {
-            let args: IdArgs = match arg(request.args) {
-                Ok(value) => value,
-                Err(error) => return response_err(error),
-            };
-            let handle = handle.clone();
-            move || async move {
-                let value = refresh_model_civitai_inner(&app, handle, args.id).await?;
-                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+            _ => {
+                return response_err(AppError::Invalid(format!(
+                    "Command '{}' is not eligible for background web execution",
+                    request.command
+                )));
             }
-        }
-        _ => {
-            return response_err(AppError::Invalid(format!(
-                "Command '{}' is not eligible for background web execution",
-                request.command
-            )));
-        }
-    };
+        };
 
     let task_id = state.controller.inner.tasks.start(operation);
     response_ok(json!({ "task_id": task_id, "state": "queued" }))
