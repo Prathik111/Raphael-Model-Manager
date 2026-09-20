@@ -53,6 +53,11 @@ export const api = {
     const result = await open({ directory: true, multiple: false, title: 'Choose model download folder', defaultPath });
     return Array.isArray(result) ? result[0] ?? null : result;
   },
+  chooseCacheDirectory: async (defaultPath?: string) => {
+    if (isWebApp) throw new Error('Folder browsing is only available in the Raphael desktop app.');
+    const result = await open({ directory: true, multiple: false, title: 'Select Raphael cache folder', defaultPath });
+    return Array.isArray(result) ? result[0] ?? null : result;
+  },
   chooseImageFile: async () => {
     if (isWebApp) throw new Error('Custom cover selection is only available in the Raphael desktop app.');
     const result = await open({
