@@ -1128,7 +1128,6 @@ function App() {
         if (currentId != null) {
           void api.getImages(currentId, 1000).then(result => {
             setImages(result.images);
-            setGalleryHasMore(result.has_more);
           }).catch(() => {});
         }
       }
@@ -1225,34 +1224,48 @@ function App() {
     };
   },[type,query,sort,activeTags]);
   useEffect(()=>{
-    if(!selected){setImages([]);setGalleryHasMore(false);setGalleryFetchBusy(false);setImageViewerId(null);return;}
+    let cancelled=false;
+    if(!selected){
+      setImages([]);
+      setGalleryHasMore(false);
+      setGalleryFetchBusy(false);
+      setImageViewerId(null);
+      return;
+    }
     const modelId=selected.id;
     setGalleryHasMore(false);
     setGalleryFetchBusy(false);
     setImageViewerId(null);
+
     const loadImages = async () => {
       try {
         const result = await api.getImages(modelId,1000);
+        if(cancelled) return;
         setImages(result.images);
-        if (result.images.length < 200) setGalleryHasMore(false);
       } catch {
+        if(cancelled) return;
         setImages([]);
-        setGalleryHasMore(false);
       }
     };
+
     const primePagination = async () => {
       try {
         const remoteHasMore = await api.syncModelGallery(modelId,20);
         const result = await api.getImages(modelId,1000);
+        if(cancelled) return;
         setImages(result.images);
         setGalleryHasMore(remoteHasMore);
       } catch {
         await loadImages();
       }
     };
+
     void primePagination();
     const timer=window.setInterval(()=>void loadImages(),2000);
-    return ()=>window.clearInterval(timer);
+    return ()=>{
+      cancelled=true;
+      window.clearInterval(timer);
+    };
   },[selectedId, selected?.civitai_model_id]);
   useEffect(()=>{const t=setTimeout(()=>refresh(),180); return ()=>clearTimeout(t);},[query,type,sort,activeTags]);
   if(!state) return <div className="loading-shell"><PulseMark/></div>;
@@ -1278,14 +1291,14 @@ function App() {
   };
   const onFetchMore = async()=>{
     if(!selected || galleryFetchBusy || !galleryHasMore) return;
+    const modelId=selected.id;
     setGalleryFetchBusy(true);
     try {
-      const more=await api.loadMoreModelExamples(selected.id);
-      const next=await api.getImages(selected.id,1000);
+      const more=await api.loadMoreModelExamples(modelId);
+      const next=await api.getImages(modelId,1000);
+      if(selectedIdRef.current!==modelId) return;
       setImages(next.images);
       setGalleryHasMore(more);
-    } catch {
-      setGalleryHasMore(true);
     } finally {
       setGalleryFetchBusy(false);
     }
