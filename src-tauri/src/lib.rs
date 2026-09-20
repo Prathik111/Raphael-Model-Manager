@@ -172,6 +172,8 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
         UNIQUE(model_id, civitai_image_id)
       );
     "#)?;
+    let has_thumbnail:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='thumbnail_path'",[],|r|r.get(0))?;
+    if has_thumbnail==0 { c.execute("ALTER TABLE models ADD COLUMN thumbnail_path TEXT",[])?; }
     Ok(c)
 }
 
@@ -260,7 +262,7 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
     let tags: String = r.get(15)?; let activ: String = r.get(16)?;
     Ok(ModelRecord { id:r.get(0)?, path:r.get(1)?, relative_path:r.get(2)?, filename:r.get(3)?, model_type:r.get(4)?, size_bytes:r.get(5)?, modified_at:r.get(6)?, civitai_model_id:r.get(7)?, civitai_version_id:r.get(8)?, civitai_url:r.get(9)?, civitai_name:r.get(10)?, version_name:r.get(11)?, base_model:r.get(12)?, creator:r.get(13)?, description:r.get(14)?, tags:serde_json::from_str(&tags).unwrap_or_default(), activation_prompts:serde_json::from_str(&activ).unwrap_or_default(), source_hash:r.get(17)?, thumbnail_path:r.get(18)?, updated_at:r.get(19)? })
 }
-const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,(SELECT local_path FROM images WHERE images.model_id=models.id AND local_path IS NOT NULL ORDER BY id LIMIT 1) AS thumbnail_path,updated_at FROM models";
+const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,thumbnail_path,updated_at FROM models";
 fn model_by_id(c: &Connection, id: i64) -> AppResult<ModelRecord> {
     Ok(c.query_row(&format!("{MODEL_SELECT} WHERE id=?1"), [id], model_from_row)?)
 }
@@ -632,6 +634,7 @@ async fn install_civitai_model(
     let mid=model.get("id").and_then(Value::as_i64);
     let vid=version.get("id").and_then(Value::as_i64);
     let civitai_url=canonical_civitai_url(&url,mid,vid)?;
+    let thumb=match mid { Some(model_id)=>ensure_model_thumbnail(&app,model_id,&model,&version,&url).await?, None=>None };
     let rec = {
         let c = open_db(&app.app_data)?;
         c.execute(
@@ -639,10 +642,10 @@ async fn install_civitai_model(
                 path,relative_path,filename,model_type,size_bytes,modified_at,
                 civitai_model_id,civitai_version_id,civitai_url,civitai_name,
                 version_name,base_model,creator,description,tags_json,
-                activation_json,source_hash,updated_at
+                activation_json,source_hash,thumbnail_path,updated_at
              )
              VALUES(
-                ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18
+                ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19
              )
              ON CONFLICT(path) DO UPDATE SET
                 size_bytes=excluded.size_bytes,
@@ -658,6 +661,7 @@ async fn install_civitai_model(
                 tags_json=excluded.tags_json,
                 activation_json=excluded.activation_json,
                 source_hash=excluded.source_hash,
+                thumbnail_path=excluded.thumbnail_path,
                 updated_at=excluded.updated_at",
             params![
                 path.to_string_lossy(),
@@ -679,6 +683,7 @@ async fn install_civitai_model(
                 serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
                 serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
                 hash,
+                thumb,
                 now()
             ],
         )?;
@@ -921,7 +926,8 @@ async fn link_model_civitai(
                  description=?9,
                  tags_json=?10,
                  activation_json=?11,
-                 updated_at=?12
+                 thumbnail_path=?12,
+                 updated_at=?13
              WHERE id=?1",
             params![
                 id,
@@ -935,6 +941,7 @@ async fn link_model_civitai(
                 desc,
                 serde_json::to_string(&tags).unwrap_or_else(|_|"[]".into()),
                 serde_json::to_string(&activation).unwrap_or_else(|_|"[]".into()),
+                match mid { Some(model_id)=>ensure_model_thumbnail(&app,model_id,&model,&version,trimmed).await?, None=>None },
                 now()
             ],
         )?;
@@ -988,7 +995,8 @@ async fn refresh_model_civitai(
                  description=?8,
                  tags_json=?9,
                  activation_json=?10,
-                 updated_at=?11
+                 thumbnail_path=?11,
+                 updated_at=?12
              WHERE id=?1",
             params![
                 id,
@@ -1001,6 +1009,7 @@ async fn refresh_model_civitai(
                 desc,
                 serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
                 serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
+                match model.get("id").and_then(Value::as_i64) { Some(mid)=>ensure_model_thumbnail(&app,mid,&model,&version,&url).await?, None=>None },
                 now()
             ],
         )?;
@@ -1221,6 +1230,10 @@ mod tests {
         assert_eq!(
             model_id_and_version("https://civitai.com/models/12345").unwrap(),
             (12345, None)
+        );
+        assert_eq!(
+            model_id_and_version("https://civitai.red/models/12345?modelVersionId=67890").unwrap(),
+            (12345, Some(67890))
         );
         assert_eq!(
             model_id_and_version("https://civitai.red/models/12345?modelVersionId=67890").unwrap(),
