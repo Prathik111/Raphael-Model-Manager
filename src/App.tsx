@@ -621,11 +621,74 @@ function ModelCard({ model, selected, onClick }: { model: ModelRecord; selected:
   </button>;
 }
 
-function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetchMore }: { model: ModelRecord; images: ModelImage[]; hasMore: boolean; fetchBusy: boolean; onChooseThumbnail: (imageId: number) => Promise<void>; onFetchMore: () => Promise<void> }) {
+function ImageViewerOverlay({ images, imageId, onClose, onNavigate }: {
+  images: ModelImage[];
+  imageId: number;
+  onClose: () => void;
+  onNavigate: (direction: -1 | 1) => void;
+}) {
+  const index = images.findIndex(image => image.id === imageId);
+  const image = index >= 0 ? images[index] : null;
+
+  useEffect(() => {
+    if (!image) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+      } else if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        onNavigate(-1);
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        onNavigate(1);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [image?.id, onClose, onNavigate]);
+
+  if (!image) return null;
+  const imagePath = image.local_path || image.thumbnail_path;
+  if (!imagePath) return null;
+
+  return <div className="image-viewer-backdrop" onClick={onClose}>
+    <div className="image-viewer hud-panel" onClick={event => event.stopPropagation()}>
+      <header className="image-viewer-header">
+        <div>
+          <div className="eyebrow">CIVITAI EXAMPLE VIEWER</div>
+          <div className="image-viewer-count">{index + 1} / {images.length}</div>
+        </div>
+        <button className="image-viewer-close" onClick={onClose} aria-label="Close image viewer">×</button>
+      </header>
+      <div className="image-viewer-stage">
+        <button className="image-viewer-nav left" onClick={() => onNavigate(-1)} aria-label="Previous image">‹</button>
+        <img src={fileUrl(imagePath)} alt={image.prompt || 'Civitai example'} />
+        <button className="image-viewer-nav right" onClick={() => onNavigate(1)} aria-label="Next image">›</button>
+      </div>
+      <div className="image-viewer-footer">
+        <div className="image-viewer-meta">
+          <span>{image.width && image.height ? `${image.width} × ${image.height}` : 'IMAGE'}</span>
+          <span>{image.sampler || 'CIVITAI EXAMPLE'}{image.steps ? ` · ${image.steps} STEPS` : ''}</span>
+        </div>
+        {image.prompt ? <div className="image-viewer-prompt">{image.prompt}</div> : null}
+        <div className="image-viewer-help"><span>← / → NAVIGATE</span><span>ESC CLOSE</span></div>
+      </div>
+    </div>
+  </div>;
+}
+
+function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetchMore, onOpenImage }: {
+  model: ModelRecord;
+  images: ModelImage[];
+  hasMore: boolean;
+  fetchBusy: boolean;
+  onChooseThumbnail: (imageId: number) => Promise<void>;
+  onFetchMore: () => Promise<void>;
+  onOpenImage: (imageId: number) => void;
+}) {
   const [busyImage, setBusyImage] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  if (!images.length) return <div className="empty-inline">No cached featured examples yet.</div>;
 
   const choose = async (imageId: number) => {
     if (busyImage !== null) return;
@@ -642,16 +705,19 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
 
   return <div className="gallery-shell">
     {error ? <div className="error-box gallery-error">{error}</div> : null}
-    <div className="gallery-grid">
+    {images.length ? <div className="gallery-grid">
       {images.map((img) => {
         const imagePath = img.local_path || img.thumbnail_path;
         const active = model.cover_source_image_id === img.id || model.cover_path === img.thumbnail_path || model.cover_path === img.local_path;
         const ready = Boolean(img.thumbnail_path || img.local_path);
         return <div className={`gallery-item ${active ? 'active-thumbnail' : ''}`} key={img.id}>
-          <div className="gallery-image-wrap">
-            {imagePath ? <img src={fileUrl(imagePath)} alt="Civitai example"/> : <div className="thumb placeholder">IMAGE</div>}
-            {active ? <span className="gallery-active-badge">ACTIVE THUMBNAIL</span> : null}
-          </div>
+          <button className="gallery-image-button" onClick={() => ready && onOpenImage(img.id)} disabled={!ready} aria-label="Open image viewer">
+            <div className="gallery-image-wrap">
+              {imagePath ? <img src={fileUrl(imagePath)} alt="Civitai example"/> : <div className="thumb placeholder">IMAGE</div>}
+              {active ? <span className="gallery-active-badge">ACTIVE THUMBNAIL</span> : null}
+              {ready ? <span className="gallery-open-hint">OPEN</span> : null}
+            </div>
+          </button>
           {img.prompt ? <div className="gallery-prompt">{img.prompt}</div> : null}
           <div className="gallery-meta">
             <span>{img.steps || img.cfg || img.sampler ? `${img.sampler || 'sampler'}${img.steps ? ` · ${img.steps} steps` : ''}` : 'CIVITAI EXAMPLE'}</span>
@@ -666,8 +732,8 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
           </button>
         </div>;
       })}
-    </div>
-    {hasMore ? <button className="gallery-more-btn" onClick={() => void onFetchMore()} disabled={fetchBusy}>{fetchBusy ? 'FETCHING 10 MORE…' : 'FETCH 10 MORE EXAMPLES'}</button> : <div className="gallery-end-note">END OF CIVITAI EXAMPLES</div>}
+    </div> : <div className="empty-inline">No community gallery examples are cached yet. Use LOAD MORE EXAMPLES to retrieve them.</div>}
+    {hasMore ? <button className="gallery-more-btn" onClick={() => void onFetchMore()} disabled={fetchBusy}>{fetchBusy ? 'FETCHING…' : 'LOAD MORE EXAMPLES'}</button> : <div className="gallery-end-note">END OF CIVITAI COMMUNITY EXAMPLES</div>}
   </div>;
 }
 
