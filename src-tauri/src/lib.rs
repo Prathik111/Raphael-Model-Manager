@@ -156,7 +156,10 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
         model_type_user_modified INTEGER NOT NULL DEFAULT 0,
         activation_json TEXT NOT NULL DEFAULT '[]',
         source_hash TEXT,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        cover_path TEXT,
+        cover_position_x REAL NOT NULL DEFAULT 50,
+        cover_position_y REAL NOT NULL DEFAULT 50
       );
       CREATE INDEX IF NOT EXISTS idx_models_type ON models(model_type);
       CREATE INDEX IF NOT EXISTS idx_models_civitai ON models(civitai_model_id, civitai_version_id);
@@ -184,6 +187,12 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
     if has_tag_lock==0 { c.execute("ALTER TABLE models ADD COLUMN tags_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     let has_type_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='model_type_user_modified'",[],|r|r.get(0))?;
     if has_type_lock==0 { c.execute("ALTER TABLE models ADD COLUMN model_type_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
+    let has_cover_path:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_path'",[],|r|r.get(0))?;
+    if has_cover_path==0 { c.execute("ALTER TABLE models ADD COLUMN cover_path TEXT",[])?; }
+    let has_cover_x:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_position_x'",[],|r|r.get(0))?;
+    if has_cover_x==0 { c.execute("ALTER TABLE models ADD COLUMN cover_position_x REAL NOT NULL DEFAULT 50",[])?; }
+    let has_cover_y:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_position_y'",[],|r|r.get(0))?;
+    if has_cover_y==0 { c.execute("ALTER TABLE models ADD COLUMN cover_position_y REAL NOT NULL DEFAULT 50",[])?; }
     Ok(c)
 }
 
@@ -270,9 +279,17 @@ fn recursive_scan_and_emit(app: AppStateInner, handle: AppHandle) {
 
 fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
     let tags: String = r.get(15)?; let activ: String = r.get(16)?;
-    Ok(ModelRecord { id:r.get(0)?, path:r.get(1)?, relative_path:r.get(2)?, filename:r.get(3)?, model_type:r.get(4)?, size_bytes:r.get(5)?, modified_at:r.get(6)?, civitai_model_id:r.get(7)?, civitai_version_id:r.get(8)?, civitai_url:r.get(9)?, civitai_name:r.get(10)?, version_name:r.get(11)?, base_model:r.get(12)?, creator:r.get(13)?, description:r.get(14)?, tags:serde_json::from_str(&tags).unwrap_or_default(), activation_prompts:serde_json::from_str(&activ).unwrap_or_default(), source_hash:r.get(17)?, thumbnail_path:r.get(18)?, updated_at:r.get(19)? })
+    Ok(ModelRecord {
+        id:r.get(0)?, path:r.get(1)?, relative_path:r.get(2)?, filename:r.get(3)?, model_type:r.get(4)?,
+        size_bytes:r.get(5)?, modified_at:r.get(6)?, civitai_model_id:r.get(7)?, civitai_version_id:r.get(8)?,
+        civitai_url:r.get(9)?, civitai_name:r.get(10)?, version_name:r.get(11)?, base_model:r.get(12)?,
+        creator:r.get(13)?, description:r.get(14)?, tags:serde_json::from_str(&tags).unwrap_or_default(),
+        activation_prompts:serde_json::from_str(&activ).unwrap_or_default(), source_hash:r.get(17)?,
+        thumbnail_path:r.get(18)?, updated_at:r.get(19)?, cover_path:r.get(20)?,
+        cover_position_x:r.get(21)?, cover_position_y:r.get(22)?
+    })
 }
-const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,thumbnail_path,updated_at FROM models";
+const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,thumbnail_path,updated_at,cover_path,cover_position_x,cover_position_y FROM models";
 fn model_by_id(c: &Connection, id: i64) -> AppResult<ModelRecord> {
     Ok(c.query_row(&format!("{MODEL_SELECT} WHERE id=?1"), [id], model_from_row)?)
 }
@@ -620,7 +637,7 @@ fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<(
     let root = app.models_root.read().unwrap().clone()
         .ok_or_else(|| AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
 
-    let (path, thumbnail_path, image_paths) = {
+    let (path, thumbnail_path, cover_path, image_paths) = {
         let c = open_db(&app.app_data)?;
         let model = model_by_id(&c, id)?;
         let mut stmt = c.prepare("SELECT local_path,thumbnail_path FROM images WHERE model_id=?1")?;
@@ -628,7 +645,7 @@ fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<(
             Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
         })?;
         let image_paths: Vec<(Option<String>,Option<String>)> = rows.filter_map(Result::ok).collect();
-        (PathBuf::from(model.path), model.thumbnail_path, image_paths)
+        (PathBuf::from(model.path), model.thumbnail_path, model.cover_path, image_paths)
     };
 
     if !path.starts_with(&root) {
@@ -661,6 +678,13 @@ fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<(
         }
     }
 
+    if let Some(cover) = cover_path {
+        let cover_path = PathBuf::from(cover);
+        if cover_path.starts_with(&app.app_data) && cover_path.is_file() {
+            let _ = fs::remove_file(cover_path);
+        }
+    }
+
     let c = open_db(&app.app_data)?;
     let deleted = c.execute("DELETE FROM models WHERE id=?1", [id])?;
     if deleted == 0 {
@@ -688,6 +712,107 @@ fn set_model_type(app:State<AppStateInner>, handle:AppHandle, id:i64, model_type
     c.execute("UPDATE models SET model_type=?2,model_type_user_modified=?3,updated_at=?4 WHERE id=?1",params![id,next_type,locked,now()])?;
     let rec=model_by_id(&c,id)?;
     let _=handle.emit("models-changed",());
+    Ok(rec)
+}
+
+fn cover_position(value: f64) -> f64 { value.clamp(0.0, 100.0) }
+
+fn custom_cover_extension(path: &Path) -> Option<&'static str> {
+    match path.extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase())?.as_str() {
+        "png" => Some("png"),
+        "jpg" | "jpeg" => Some("jpg"),
+        "webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+fn copy_custom_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<PathBuf> {
+    if !source.is_file() {
+        return Err(AppError::Invalid("Selected cover image is not a file".into()));
+    }
+    let ext = custom_cover_extension(source)
+        .ok_or_else(|| AppError::Invalid("Custom covers must be PNG, JPG, JPEG, or WebP images".into()))?;
+    image::open(source)
+        .map_err(|e| AppError::Invalid(format!("Could not read the custom cover image: {e}")))?;
+    let dir = app.app_data.join("cache").join("covers");
+    fs::create_dir_all(&dir)?;
+    let target = dir.join(format!("model_{id}.{ext}"));
+
+    for candidate in ["png", "jpg", "webp"] {
+        let path = dir.join(format!("model_{id}.{candidate}"));
+        if path != target && path.is_file() {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fs::copy(source, &target)?;
+    Ok(target)
+}
+
+#[tauri::command]
+fn set_model_cover_position(
+    app: State<AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    x: f64,
+    y: f64,
+) -> AppResult<ModelRecord> {
+    let x = cover_position(x);
+    let y = cover_position(y);
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET cover_position_x=?2,cover_position_y=?3,updated_at=?4 WHERE id=?1",
+        params![id, x, y, now()],
+    )?;
+    let rec = model_by_id(&c, id)?;
+    let _ = handle.emit("models-changed", ());
+    Ok(rec)
+}
+
+#[tauri::command]
+fn set_model_custom_cover(
+    app: State<AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    source_path: String,
+) -> AppResult<ModelRecord> {
+    let source = PathBuf::from(source_path);
+    let target = copy_custom_cover(&app, id, &source)?;
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET cover_path=?2,cover_position_x=50,cover_position_y=50,updated_at=?3 WHERE id=?1",
+        params![id, target.to_string_lossy().to_string(), now()],
+    )?;
+    let rec = model_by_id(&c, id)?;
+    let _ = handle.emit("models-changed", ());
+    Ok(rec)
+}
+
+#[tauri::command]
+fn reset_model_cover(
+    app: State<AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+) -> AppResult<ModelRecord> {
+    let old_cover = {
+        let c = open_db(&app.app_data)?;
+        c.query_row("SELECT cover_path FROM models WHERE id=?1", [id], |r| r.get::<_, Option<String>>(0))?
+    };
+
+    if let Some(path) = old_cover {
+        let cover = PathBuf::from(path);
+        if cover.starts_with(app.app_data) && cover.is_file() {
+            let _ = fs::remove_file(cover);
+        }
+    }
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET cover_path=NULL,cover_position_x=50,cover_position_y=50,updated_at=?2 WHERE id=?1",
+        params![id, now()],
+    )?;
+    let rec = model_by_id(&c, id)?;
+    let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
 
@@ -1454,7 +1579,7 @@ pub fn run() {
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,delete_model,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
@@ -1698,5 +1823,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(type_lock_column, 1);
+
+        let cover_path_column: i64 = second
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_path'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cover_path_column, 1);
+
+        let cover_x_column: i64 = second
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_position_x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cover_x_column, 1);
+
+        let cover_y_column: i64 = second
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_position_y'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cover_y_column, 1);
     }
 }
