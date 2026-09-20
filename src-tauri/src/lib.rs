@@ -12,7 +12,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, RwLock},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, OnceLock, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex as AsyncMutex;
@@ -335,10 +335,9 @@ pub(crate) fn cache_root(app_data: &Path) -> PathBuf {
         .filter(|path| path.is_absolute())
         .unwrap_or(fallback)
 }
-fn open_db(app_data: &Path) -> AppResult<Connection> {
-    fs::create_dir_all(app_data)?;
-    let c = Connection::open(db_path(app_data))?;
-    c.busy_timeout(Duration::from_secs(5))?;
+static DB_SCHEMA_READY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn initialize_db_schema(c: &Connection) -> AppResult<()> {
     c.execute_batch(r#"
       PRAGMA journal_mode=WAL;
       PRAGMA foreign_keys=ON;
@@ -392,6 +391,7 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
         UNIQUE(model_id, civitai_image_id)
       );
     "#)?;
+
     let has_thumbnail:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='thumbnail_path'",[],|r|r.get(0))?;
     if has_thumbnail==0 { c.execute("ALTER TABLE models ADD COLUMN thumbnail_path TEXT",[])?; }
     let has_tag_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='tags_user_modified'",[],|r|r.get(0))?;
@@ -419,9 +419,26 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('parallel_downloads','3')",[])?;
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('cache_max_bytes','0')",[])?;
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('example_load_amount','20')",[])?;
-    Ok(c)
+    Ok(())
 }
 
+fn open_db(app_data: &Path) -> AppResult<Connection> {
+    fs::create_dir_all(app_data)?;
+    let db_file = db_path(app_data);
+    let c = Connection::open(&db_file)?;
+    c.busy_timeout(Duration::from_secs(5))?;
+
+    let ready = DB_SCHEMA_READY.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = ready
+        .lock()
+        .map_err(|_| AppError::Invalid("Database initialization state is unavailable".into()))?;
+    if !guard.contains(&db_file) {
+        initialize_db_schema(&c)?;
+        guard.insert(db_file);
+    }
+
+    Ok(c)
+}
 fn setting(c: &Connection, key: &str) -> AppResult<Option<String>> {
     Ok(c.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()?)
 }
