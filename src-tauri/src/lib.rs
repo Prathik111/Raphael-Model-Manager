@@ -691,12 +691,27 @@ async fn sync_featured_examples_inner(
     versions.sort_by(|a,b| {
         let ac=a.get("createdAt").and_then(Value::as_str).unwrap_or("");
         let bc=b.get("createdAt").and_then(Value::as_str).unwrap_or("");
-        let ai=a.get("id").and_then(Value::as_i64).unwrap_or_default();
-        let bi=b.get("id").and_then(Value::as_i64).unwrap_or_default();
+        let ai=a.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))).unwrap_or_default();
+        let bi=b.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))).unwrap_or_default();
         bc.cmp(ac).then_with(|| bi.cmp(&ai))
     });
+
+    // Civitai may return recent versions with no creator/featured images
+    // (for example moderated or taken-down versions). Walk newest-to-oldest
+    // and keep the first five versions that contain at least one usable image.
+    versions.retain(|version| {
+        version
+            .get("images")
+            .and_then(Value::as_array)
+            .map(|images| images.iter().any(|image| {
+                image.get("url").and_then(Value::as_str).map(|url| !url.trim().is_empty()).unwrap_or(false)
+            }))
+            .unwrap_or(false)
+    });
     versions.truncate(5);
-    if versions.is_empty() { return Err(AppError::Api("Civitai returned no model versions".into())); }
+    if versions.is_empty() {
+        return Err(AppError::Api("Civitai returned no featured images in any published model version".into()));
+    }
 
     let total_versions=versions.len();
     let (model_index, model_total)=progress_model.unwrap_or((0,1));
@@ -2543,6 +2558,29 @@ mod tests {
         let state = ExamplesRefreshState::default();
         assert!(!state.running);
         assert!(state.progress.is_none());
+    }
+
+    #[test]
+    fn featured_version_selection_skips_empty_versions() {
+        let mut versions = vec![
+            json!({"id": 3, "createdAt": "2026-03-03T00:00:00Z", "images": []}),
+            json!({"id": 2, "createdAt": "2026-03-02T00:00:00Z", "images": [{"url": ""}]}),
+            json!({"id": 1, "createdAt": "2026-03-01T00:00:00Z", "images": [{"url": "https://example.com/a.jpg"}]}),
+        ];
+        versions.sort_by(|a,b| {
+            let ac=a.get("createdAt").and_then(Value::as_str).unwrap_or("");
+            let bc=b.get("createdAt").and_then(Value::as_str).unwrap_or("");
+            bc.cmp(ac)
+        });
+        versions.retain(|version| {
+            version.get("images").and_then(Value::as_array).map(|images| {
+                images.iter().any(|image| {
+                    image.get("url").and_then(Value::as_str).map(|url| !url.trim().is_empty()).unwrap_or(false)
+                })
+            }).unwrap_or(false)
+        });
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].get("id").and_then(Value::as_i64), Some(1));
     }
 
     #[test]
