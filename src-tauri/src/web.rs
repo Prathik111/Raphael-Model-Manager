@@ -514,6 +514,183 @@ async fn file_handler(
 }
 
 
+
+#[derive(Debug, Deserialize)]
+struct TaskStartArgs {
+    command: String,
+    #[serde(default)]
+    args: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct RevisionQuery {
+    since: Option<u64>,
+}
+
+async fn model_changes_handler(Query(query): Query<RevisionQuery>) -> Response {
+    let since = query.since.unwrap_or(0);
+    let current = crate::model_change_revision();
+    if current <= since {
+        let notification = crate::model_change_notify();
+        let _ = tokio::time::timeout(Duration::from_secs(25), notification.notified()).await;
+    }
+
+    response_ok(json!({ "revision": crate::model_change_revision() }))
+}
+
+async fn task_status_handler(
+    AxumState(state): AxumState<WebServerState>,
+    AxumPath(task_id): AxumPath<String>,
+) -> Response {
+    match state.controller.inner.tasks.get(&task_id) {
+        Some(status) => response_ok(status),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Web task not found or expired" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn task_start_handler(
+    AxumState(state): AxumState<WebServerState>,
+    Json(request): Json<TaskStartArgs>,
+) -> Response {
+    let handle = state.handle.clone();
+    let app = handle.state::<crate::AppStateInner>().inner().clone();
+
+    let operation = match request.command.as_str() {
+        "preview_civitai_import" => {
+            let args: UrlArgs = match arg(request.args) {
+                Ok(value) => value,
+                Err(error) => return response_err(error),
+            };
+            move || async move {
+                let value = preview_civitai_import(&app, args.url).await?;
+                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+            }
+        }
+        "sync_model_gallery" => {
+            let args: SyncGalleryArgs = match arg(request.args) {
+                Ok(value) => value,
+                Err(error) => return response_err(error),
+            };
+            let handle = handle.clone();
+            move || async move {
+                let value = sync_model_gallery(&app, handle, args.id, args.target_count).await?;
+                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+            }
+        }
+        "load_more_model_examples" => {
+            let args: SyncGalleryArgs = match arg(request.args) {
+                Ok(value) => value,
+                Err(error) => return response_err(error),
+            };
+            let handle = handle.clone();
+            move || async move {
+                let value = load_more_model_examples(&app, handle, args.id, args.target_count).await?;
+                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+            }
+        }
+        "add_subfolder_tags" => {
+            move || async move {
+                let value = add_subfolder_tags_inner(&app)?;
+                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+            }
+        }
+        "delete_model" => {
+            let args: IdArgs = match arg(request.args) {
+                Ok(value) => value,
+                Err(error) => return response_err(error),
+            };
+            let handle = handle.clone();
+            move || async move {
+                delete_model(&app, handle, args.id).await?;
+                Ok(Value::Null)
+            }
+        }
+        "set_cache_max_bytes" => {
+            let args: CacheMaxBytesArgs = match arg(request.args) {
+                Ok(value) => value,
+                Err(error) => return response_err(error),
+            };
+            move || async move {
+                let _guard = app.cache_lock.lock().await;
+                let value = set_cache_max_bytes_inner(&app.app_data, args.max_bytes)?;
+                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+            }
+        }
+        "set_cache_location" => {
+            let args: CacheLocationArgs = match arg(request.args) {
+                Ok(value) => value,
+                Err(error) => return response_err(error),
+            };
+            move || async move {
+                let _guard = app.cache_lock.lock().await;
+                let value = set_cache_location_inner(&app.app_data, &args.path)?;
+                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+            }
+        }
+        "clear_cache_images" => move || async move {
+            let _guard = app.cache_lock.lock().await;
+            let value = clear_cache_images_inner(&app.app_data)?;
+            serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+        },
+        "clear_complete_cache" => move || async move {
+            let _guard = app.cache_lock.lock().await;
+            let value = clear_complete_cache_inner(&app.app_data)?;
+            serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+        },
+        "prune_cache_images" => {
+            let args: KeepImagesArgs = match arg(request.args) {
+                Ok(value) => value,
+                Err(error) => return response_err(error),
+            };
+            move || async move {
+                let _guard = app.cache_lock.lock().await;
+                let value = prune_cache_images_inner(&app.app_data, args.keep_per_model)?;
+                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+            }
+        }
+        "clean_cache_orphans" => move || async move {
+            let _guard = app.cache_lock.lock().await;
+            let value = clean_cache_orphans_inner(&app.app_data)?;
+            serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+        },
+        "link_model_civitai" => {
+            let args: LinkArgs = match arg(request.args) {
+                Ok(value) => value,
+                Err(error) => return response_err(error),
+            };
+            let handle = handle.clone();
+            move || async move {
+                let value = link_model_civitai(&app, handle, args.id, args.url).await?;
+                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+            }
+        }
+        "refresh_model_civitai" => {
+            let args: IdArgs = match arg(request.args) {
+                Ok(value) => value,
+                Err(error) => return response_err(error),
+            };
+            let handle = handle.clone();
+            move || async move {
+                let value = refresh_model_civitai(&app, handle, args.id).await?;
+                serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
+            }
+        }
+        _ => {
+            return response_err(AppError::Invalid(format!(
+                "Command '{}' is not eligible for background web execution",
+                request.command
+            )));
+        }
+    };
+
+    let task_id = state.controller.inner.tasks.start(operation);
+    response_ok(json!({ "task_id": task_id, "state": "queued" }))
+}
+
 async fn command_handler(
     AxumPath(command): AxumPath<String>,
     AxumState(state): AxumState<WebServerState>,
@@ -684,6 +861,9 @@ fn build_router(handle: AppHandle, controller: WebServerController, web_root: Op
 
     let mut router = Router::new()
         .route("/api/health", get(health_handler))
+        .route("/api/changes", get(model_changes_handler))
+        .route("/api/tasks/{task_id}", get(task_status_handler))
+        .route("/api/task/start", post(task_start_handler))
         .route("/api/status", get(status_handler))
         .route("/api/file", get(file_handler))
         .route("/api/command/{command}", post(command_handler))
