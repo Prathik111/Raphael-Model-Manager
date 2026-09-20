@@ -1718,19 +1718,11 @@ fn copy_custom_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
         .map_err(|e| AppError::Invalid(format!("Could not read the custom cover image: {e}")))?;
     let dir = cache_root(&app.app_data).join("covers");
     fs::create_dir_all(&dir)?;
-    let target = dir.join(format!("model_{id}.{ext}"));
-
-    for candidate in ["png", "jpg", "webp"] {
-        let path = dir.join(format!("model_{id}.{candidate}"));
-        if path != target && path.is_file() {
-            let _ = fs::remove_file(path);
-        }
-    }
-
+    let sequence = DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let target = dir.join(format!("model_{id}_{sequence}.{ext}"));
     fs::copy(source, &target)?;
     Ok(target)
 }
-
 
 fn copy_cached_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<PathBuf> {
     let cache_root = cache_root(&app.app_data)
@@ -1748,13 +1740,8 @@ fn copy_cached_cover(app: &AppStateInner, id: i64, source: &Path) -> AppResult<P
         .ok_or_else(|| AppError::Invalid("The cached example image has an unsupported format".into()))?;
     let dir = cache_root(&app.app_data).join("covers");
     fs::create_dir_all(&dir)?;
-    let target = dir.join(format!("model_{id}.{ext}"));
-    for candidate in ["png", "jpg", "webp"] {
-        let path = dir.join(format!("model_{id}.{candidate}"));
-        if path != target && path.is_file() {
-            let _ = fs::remove_file(path);
-        }
-    }
+    let sequence = DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let target = dir.join(format!("model_{id}_{sequence}.{ext}"));
     fs::copy(&canonical_source, &target)?;
     Ok(target)
 }
@@ -1787,6 +1774,10 @@ async fn set_model_custom_cover(
     source_path: String,
 ) -> AppResult<ModelRecord> {
     let _guard=app.cache_lock.lock().await;
+    let old_cover: Option<String> = {
+        let c = open_db(&app.app_data)?;
+        c.query_row("SELECT cover_path FROM models WHERE id=?1", [id], |r| r.get(0))?
+    };
     let source = PathBuf::from(source_path);
     let target = copy_custom_cover(&app, id, &source)?;
     let c = open_db(&app.app_data)?;
@@ -1795,6 +1786,13 @@ async fn set_model_custom_cover(
         params![id, target.to_string_lossy().to_string(), now()],
     )?;
     let rec = model_by_id(&c, id)?;
+    drop(c);
+    if let Some(old) = old_cover {
+        let old_path = PathBuf::from(old);
+        if old_path != target && path_is_in_cache(&app.app_data, &old_path) && old_path.is_file() {
+            let _ = fs::remove_file(old_path);
+        }
+    }
     let _ = enforce_cache_limit_inner(&app.app_data);
     let _ = handle.emit("models-changed", ());
     Ok(rec)
@@ -1825,6 +1823,13 @@ async fn reset_model_cover(
         params![id, now()],
     )?;
     let rec = model_by_id(&c, id)?;
+    drop(c);
+    if let Some(path) = old_cover {
+        let cover = PathBuf::from(path);
+        if path_is_in_cache(&app.app_data,&cover) && cover.is_file() {
+            let _ = fs::remove_file(cover);
+        }
+    }
     let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
@@ -1865,20 +1870,19 @@ async fn set_model_cover_from_image(
         .ok_or_else(|| AppError::Invalid("That example image has not finished caching yet".into()))?;
     let new_cover = copy_cached_cover(&app, id, &source)?;
 
-    if let Some(old) = old_cover {
-        let old_path = PathBuf::from(old);
-        let covers_root = cache_root(&app.app_data).join("covers");
-        if old_path != new_cover && old_path.starts_with(&covers_root) && old_path.is_file() {
-            let _ = fs::remove_file(old_path);
-        }
-    }
-
     let c = open_db(&app.app_data)?;
     c.execute(
         "UPDATE models SET cover_path=?2,cover_source_image_id=?3,cover_position_x=50,cover_position_y=50,updated_at=?4 WHERE id=?1",
         params![id, new_cover.to_string_lossy().to_string(), image_id, now()],
     )?;
     let rec = model_by_id(&c, id)?;
+    drop(c);
+    if let Some(old) = old_cover {
+        let old_path = PathBuf::from(old);
+        if old_path != new_cover && path_is_in_cache(&app.app_data, &old_path) && old_path.is_file() {
+            let _ = fs::remove_file(old_path);
+        }
+    }
     let _ = enforce_cache_limit_inner(&app.app_data);
     let _ = handle.emit("models-changed", ());
     Ok(rec)
