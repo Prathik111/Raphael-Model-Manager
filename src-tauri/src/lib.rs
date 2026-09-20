@@ -1305,5 +1305,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 3);
+
+        let thumbnail_column: i64 = second
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='thumbnail_path'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(thumbnail_column, 1);
     }
 }
