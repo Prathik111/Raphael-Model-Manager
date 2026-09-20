@@ -20,7 +20,7 @@ use crate::{
     add_subfolder_tags, clear_download_progress, delete_model, get_app_state, get_download_progress, get_library_counts, get_model_images, get_storage_stats,
     get_parallel_downloads, set_parallel_downloads,
     get_tags, install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
-    refresh_all_examples, refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
+    refresh_all_examples, get_examples_refresh_status, refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
     set_model_tags, set_model_type, sync_model_gallery,
     is_civitai_token_set, AppError, AppResult, CivitaiImportPreview, ModelRecord,
 };
@@ -314,7 +314,12 @@ async fn command_handler(
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "refresh_all_examples" => {
-            refresh_all_examples(handle.state(), handle.clone()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+            refresh_all_examples(handle.state(), handle.clone())
+                .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        }
+        "get_examples_refresh_status" => {
+            serde_json::to_value(get_examples_refresh_status(handle.state()))
+                .map_err(|e| AppError::Invalid(e.to_string()))
         },
         "preview_civitai_import" => {
             let args: UrlArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
