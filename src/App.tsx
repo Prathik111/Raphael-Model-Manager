@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, fileUrl, subscribeToModelChanges } from './tauri';
-import type { AppState, CivitaiImportPreview, ModelImage, ModelRecord, ModelType, LibraryCounts } from './types';
+import type { AppState, CivitaiImportPreview, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
 
 const TYPES: Array<{ key: ModelType | 'All'; label: string }> = [
   { key: 'All', label: 'ALL' }, { key: 'Checkpoint', label: 'CHECKPOINTS' }, { key: 'LoRA', label: 'LORAS' },
@@ -95,6 +95,68 @@ function Gallery({ images }: { images: ModelImage[] }) {
       {img.prompt ? <button onClick={()=>navigator.clipboard?.writeText(img.prompt!)}>COPY PROMPT</button> : null}
     </div>
   </div>)}</div>;
+}
+
+
+function TagEditor({ model, allTags, onSave, onFilter }: { model: ModelRecord; allTags: TagRecord[]; onSave: (tags: string[])=>Promise<void>; onFilter: (tag: string)=>void }) {
+  const [draft, setDraft] = useState<string[]>(model.tags);
+  const [input, setInput] = useState('');
+  const [saving, setSaving] = useState(false);
+  const needle = input.trim().toLowerCase();
+  const suggestions = allTags
+    .filter(tag => !draft.some(existing => existing.toLowerCase() === tag.name.toLowerCase()))
+    .filter(tag => !needle || tag.name.toLowerCase().includes(needle))
+    .slice(0, 8);
+
+  const add = (raw: string) => {
+    const value = raw.trim();
+    if (!value || draft.some(tag => tag.toLowerCase() === value.toLowerCase())) return;
+    setDraft(current => [...current, value]);
+    setInput('');
+  };
+  const remove = (tag: string) => setDraft(current => current.filter(existing => existing !== tag));
+  const save = async () => {
+    setSaving(true);
+    try { await onSave(draft); } finally { setSaving(false); }
+  };
+
+  return <div className="tag-editor">
+    <div className="tag-editor-chips">
+      {draft.map(tag => <span className="editable-tag" key={tag}>
+        <button className="tag-value" title="Filter by this tag" onClick={()=>onFilter(tag)}>{tag}</button>
+        <button className="tag-remove" aria-label={'Remove ' + tag} onClick={()=>remove(tag)}>×</button>
+      </span>)}
+      {!draft.length ? <span className="empty-inline">No tags assigned.</span> : null}
+    </div>
+    <div className="tag-input-row">
+      <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();add(input);}}} placeholder="Type a tag…" disabled={saving}/>
+      <button className="primary-btn small" onClick={()=>add(input)} disabled={saving || !input.trim()}>ADD</button>
+    </div>
+    {input.trim() ? <div className="tag-suggestions">
+      {suggestions.length ? suggestions.map(tag => <button key={tag.name} onClick={()=>add(tag.name)}><span>{tag.name}</span><b>{tag.count}</b></button>) : <div className="tag-create-hint">Press ENTER to create “{input.trim()}”.</div>}
+    </div> : null}
+    <div className="tag-editor-footer">
+      <span>{draft.length} TAG{draft.length === 1 ? '' : 'S'}</span>
+      <button className="text-btn" onClick={save} disabled={saving}>{saving ? 'SAVING…' : 'SAVE TAGS'}</button>
+    </div>
+  </div>;
+}
+
+function TagFilterPanel({ tags, activeTags, onToggle, onClear }: { tags: TagRecord[]; activeTags: string[]; onToggle: (tag: string)=>void; onClear: ()=>void }) {
+  const [filter, setFilter] = useState('');
+  const visible = tags.filter(tag => !filter.trim() || tag.name.toLowerCase().includes(filter.trim().toLowerCase()));
+  return <div className="tag-filter-panel" onClick={e=>e.stopPropagation()}>
+    <div className="tag-filter-head"><span>TAG FILTERS</span><b>{activeTags.length ? activeTags.length + ' ACTIVE' : 'ALL TAGS'}</b></div>
+    <input className="tag-filter-input" value={filter} onChange={e=>setFilter(e.target.value)} placeholder="Find a tag…"/>
+    <div className="tag-filter-list">
+      {visible.map(tag => <button key={tag.name} className={activeTags.some(x=>x.toLowerCase()===tag.name.toLowerCase())?'active':''} onClick={()=>onToggle(tag.name)}><span>{tag.name}</span><b>{tag.count}</b></button>)}
+      {!visible.length ? <div className="empty-inline">No tags found.</div> : null}
+    </div>
+    <div className="tag-filter-foot">
+      <span>AND logic · combine multiple tags</span>
+      {activeTags.length ? <button className="text-btn" onClick={onClear}>CLEAR</button> : null}
+    </div>
+  </div>;
 }
 
 function Inspector({ model, images, onRefresh, onLinkCivitai }: { model: ModelRecord; images: ModelImage[]; onRefresh: ()=>void; onLinkCivitai: (url: string)=>Promise<void> }) {
