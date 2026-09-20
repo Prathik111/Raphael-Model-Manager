@@ -1057,49 +1057,121 @@ fn canonical_civitai_url(source:&str,model_id:Option<i64>,version_id:Option<i64>
 fn json_strings(v:Option<&Value>)->Vec<String>{v.and_then(Value::as_array).map(|a|a.iter().filter_map(|x|x.as_str().map(str::to_string)).collect()).unwrap_or_default()}
 fn strip_html(s:&str)->String{let mut out=String::with_capacity(s.len());let mut in_tag=false;for ch in s.chars(){match ch{ '<'=>in_tag=true,'>'=>in_tag=false,_ if !in_tag=>out.push(ch),_=>{}}}out.replace("&nbsp;"," ").replace("&amp;","&").replace("&lt;","<").replace("&gt;",">")}
 
-async fn download_cached_thumbnail(app:&AppStateInner, cache: &Path, url:&str)->AppResult<Option<String>>{
-    if cache.exists(){return Ok(Some(cache.to_string_lossy().to_string()));}
-    let client=civitai_client(app)?;
-    let mut req=client.get(url);
-    if let Some(t)=token(){req=req.bearer_auth(t);}
-    let res=req.send().await?;
-    if !res.status().is_success(){return Ok(None);}
-    let bytes=res.bytes().await?;
-    if bytes.is_empty(){return Ok(None);}
-    if let Some(parent)=cache.parent(){fs::create_dir_all(parent)?;}
-    fs::write(cache,&bytes)?;
-    Ok(Some(cache.to_string_lossy().to_string()))
-}
+async fn download_cached_thumbnail(
+    app: &AppStateInner,
+    directory: &Path,
+    url: &str,
+) -> AppResult<Option<String>> {
+    fs::create_dir_all(directory)?;
 
-async fn ensure_model_thumbnail(app:&AppStateInner, model_id:i64, model:&Value, version:&Value, source_url:&str)->AppResult<Option<String>>{
-    let root=cache_root(&app.app_data).join(model_id.to_string());
-    fs::create_dir_all(&root)?;
-    let mut remote:Option<String>=model.get("images").and_then(Value::as_array).and_then(|a|a.iter().find_map(|x|x.get("url").and_then(Value::as_str).map(str::to_string)));
-    if remote.is_none(){remote=version.get("images").and_then(Value::as_array).and_then(|a|a.iter().find_map(|x|x.get("url").and_then(Value::as_str).map(str::to_string)));}
+    let digest = Sha256::digest(url.as_bytes());
+    let key = hex::encode(&digest[..8]);
 
-    if let Some(url)=remote {
-        let ext=Url::parse(&url).ok().and_then(|u|Path::new(u.path()).extension().and_then(|x|x.to_str()).map(str::to_string)).unwrap_or_else(||"jpg".into());
-        return download_cached_thumbnail(app,&root.join(format!("thumbnail.{ext}")),&url).await;
+    // The filename includes the source URL hash, so changing the Civitai
+    // thumbnail URL automatically gets a fresh cached file instead of reusing
+    // a stale thumbnail from an earlier version/link.
+    for ext in ["jpg", "png", "webp", "avif"] {
+        let candidate = directory.join(format!("thumbnail-{key}.{ext}"));
+        if candidate.is_file() && fs::metadata(&candidate).map(|m| m.len() > 0).unwrap_or(false) {
+            return Ok(Some(candidate.to_string_lossy().to_string()));
+        }
     }
 
-    let client=civitai_client(app)?;
-    let mut req=client.get(source_url);
-    if let Some(t)=token(){req=req.bearer_auth(t);}
-    let res=req.send().await?;
-    if !res.status().is_success(){return Ok(None);}
-    let html=res.text().await?;
-    let lower=html.to_ascii_lowercase();
-    let marker="property=\"og:image\"";
-    if let Some(pos)=lower.find(marker){
-        let tail=&html[pos+marker.len()..];
-        if let Some(content_pos)=tail.to_ascii_lowercase().find("content=\""){
-            let value=&tail[content_pos+9..];
-            if let Some(end)=value.find('"'){
-                let image_url=&value[..end];
-                return download_cached_thumbnail(app,&root.join("thumbnail.jpg"),image_url).await;
+    let client = civitai_client(app)?;
+    let mut req = client.get(url);
+    if let Some(t) = token() {
+        req = req.bearer_auth(t);
+    }
+
+    let res = req.send().await?;
+    if !res.status().is_success() {
+        return Ok(None);
+    }
+
+    let bytes = res.bytes().await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+
+    let format = detect_image_format_from_bytes(&bytes)?;
+    let ext = image_format_extension(format)
+        .ok_or_else(|| AppError::Invalid("Civitai returned an unsupported thumbnail format".into()))?;
+    let final_path = directory.join(format!("thumbnail-{key}.{ext}"));
+    let temp_path = directory.join(format!("thumbnail-{key}.{ext}.part"));
+
+    fs::write(&temp_path, &bytes)?;
+    if let Err(error) = fs::rename(&temp_path, &final_path) {
+        let _ = fs::remove_file(&temp_path);
+        if !final_path.is_file() {
+            return Err(AppError::Io(error));
+        }
+    }
+
+    Ok(Some(final_path.to_string_lossy().to_string()))
+}
+
+async fn ensure_model_thumbnail(
+    app: &AppStateInner,
+    model_id: i64,
+    model: &Value,
+    version: &Value,
+    source_url: &str,
+) -> AppResult<Option<String>> {
+    let root = cache_root(&app.app_data).join(model_id.to_string());
+    fs::create_dir_all(&root)?;
+
+    let mut remote: Option<String> = model
+        .get("images")
+        .and_then(Value::as_array)
+        .and_then(|a| {
+            a.iter().find_map(|x| {
+                x.get("url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        });
+
+    if remote.is_none() {
+        remote = version
+            .get("images")
+            .and_then(Value::as_array)
+            .and_then(|a| {
+                a.iter().find_map(|x| {
+                    x.get("url")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+            });
+    }
+
+    if let Some(url) = remote {
+        return download_cached_thumbnail(app, &root, &url).await;
+    }
+
+    let client = civitai_client(app)?;
+    let mut req = client.get(source_url);
+    if let Some(t) = token() {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await?;
+    if !res.status().is_success() {
+        return Ok(None);
+    }
+
+    let html = res.text().await?;
+    let lower = html.to_ascii_lowercase();
+    let marker = "property=\"og:image\"";
+    if let Some(pos) = lower.find(marker) {
+        let tail = &html[pos + marker.len()..];
+        if let Some(content_pos) = tail.to_ascii_lowercase().find("content=\"") {
+            let value = &tail[content_pos + 9..];
+            if let Some(end) = value.find('"') {
+                let image_url = &value[..end];
+                return download_cached_thumbnail(app, &root, image_url).await;
             }
         }
     }
+
     Ok(None)
 }
 
