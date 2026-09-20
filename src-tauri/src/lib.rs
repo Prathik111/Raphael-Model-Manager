@@ -728,6 +728,7 @@ async fn sync_featured_examples_inner(
     let mut image_entries=0usize;
     let mut image_urls=0usize;
     let mut download_failures=0usize;
+    let mut read_failures=0usize;
     let mut decode_failures=0usize;
 
     for (version_index,version) in versions.iter().enumerate(){
@@ -739,7 +740,10 @@ async fn sync_featured_examples_inner(
         image_entries += images.len();
         for (image_index, image) in images.into_iter().enumerate(){
             let remote=match image.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty()).map(str::to_string) {
-                Some(v)=>v,
+                Some(v)=>{
+                    image_urls += 1;
+                    v
+                }
                 None=>continue
             };
             let image_id=match featured_image_key(&image, version_id, image_index) {
@@ -780,7 +784,7 @@ async fn sync_featured_examples_inner(
                     Ok(value)=>value,
                     Err(error)=>{
                         had_errors=true;
-                        decode_failures += 1;
+                        read_failures += 1;
                         emit_examples_progress(&handle,ExamplesRefreshProgress{
                             current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                             version_current:version_index,version_total:total_versions,images_saved:saved_count,
@@ -789,14 +793,24 @@ async fn sync_featured_examples_inner(
                         continue;
                     }
                 };
-                if bytes.is_empty(){continue;}
+                if bytes.is_empty(){
+                    had_errors=true;
+                    download_failures += 1;
+                    emit_examples_progress(&handle,ExamplesRefreshProgress{
+                        current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                        version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                        status:format!("Civitai returned an empty featured image {image_id}"),done:false,error:None
+                    });
+                    continue;
+                }
                 fs::write(&local,&bytes)?;
             }
             if !thumb.exists(){
                 let img=match image::open(&local) {
                     Ok(value)=>value,
                     Err(error)=>{
-                had_errors=true;
+                        had_errors=true;
+                        decode_failures += 1;
                         emit_examples_progress(&handle,ExamplesRefreshProgress{
                             current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
                             version_current:version_index,version_total:total_versions,images_saved:saved_count,
@@ -841,8 +855,8 @@ async fn sync_featured_examples_inner(
     if had_errors {
         let _=fs::remove_dir_all(&staging);
         return Err(AppError::Api(format!(
-            "Featured example refresh encountered image errors; previous cache preserved ({} versions, {} image entries, {} usable URLs, {} download failures, {} decode failures)",
-            total_versions, image_entries, image_urls, download_failures, decode_failures
+            "Featured example refresh encountered image errors; previous cache preserved ({} versions, {} image entries, {} usable URLs, {} download failures, {} read failures, {} decode failures)",
+            total_versions, image_entries, image_urls, download_failures, read_failures, decode_failures
         )));
     }
 
