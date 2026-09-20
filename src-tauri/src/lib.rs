@@ -2023,13 +2023,22 @@ async fn install_civitai_model(
 
     if let Some(vid) = version_id {
         let c0 = open_db(&app.app_data)?;
-        let existing_id: Result<i64, rusqlite::Error> = c0.query_row(
-            "SELECT id FROM models WHERE civitai_version_id=?1 AND path IS NOT NULL",
+        let existing_path: Result<String, rusqlite::Error> = c0.query_row(
+            "SELECT path FROM models WHERE civitai_version_id=?1 AND path IS NOT NULL",
             [vid],
-            |r| r.get::<_, i64>(0),
+            |r| r.get::<_, String>(0),
         );
-        if let Ok(existing_id) = existing_id {
-            let existing = model_by_id(&c0, existing_id)?;
+        if let Ok(existing_path) = existing_path {
+            if !Path::new(&existing_path).is_file() {
+                // The database can outlive a manually removed model file. In that
+                // case allow a fresh download instead of falsely reporting it installed.
+            } else {
+                let existing_id: i64 = c0.query_row(
+                    "SELECT id FROM models WHERE civitai_version_id=?1 AND path=?2",
+                    params![vid, existing_path],
+                    |r| r.get::<_, i64>(0),
+                )?;
+                let existing = model_by_id(&c0, existing_id)?;
             let progress = DownloadProgress {
                 visible: true,
                 task_id: Some(task_id.clone()),
@@ -2048,7 +2057,8 @@ async fn install_civitai_model(
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 let _ = remove_download_progress(&clear_progress, &clear_task_id);
             });
-            return Ok(progress);
+                return Ok(progress);
+            }
         }
     }
 
