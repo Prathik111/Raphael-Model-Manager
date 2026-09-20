@@ -930,9 +930,10 @@ function App() {
     galleryTargetRef.current=200;
     const loadImages = async () => {
       try {
+        const remoteHasMore = await api.syncModelGallery(modelId,20).catch(() => false);
         const result = await api.getImages(modelId,200);
         setImages(result.images);
-        setGalleryHasMore(result.has_more);
+        setGalleryHasMore(remoteHasMore || result.has_more);
       } catch {
         setImages([]);
         setGalleryHasMore(false);
