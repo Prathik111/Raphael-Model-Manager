@@ -2,7 +2,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use image::imageops::FilterType;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use reqwest::{header, Client};
+use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -702,7 +702,7 @@ async fn sync_featured_examples_inner(
     let db_result:AppResult<()>=(||{
         let mut c=open_db(&app.app_data)?;
         let tx=c.transaction()?;
-        tx.execute("DELETE FROM images WHERE model_id=?1 AND meta_json LIKE '%\\"featured\\":true%'",[model_id])?;
+        tx.execute("DELETE FROM images WHERE model_id=?1 AND meta_json LIKE '%\"featured\":true%'", [model_id])?;
         for record in &records{
             tx.execute(
                 "INSERT INTO images(model_id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
@@ -1203,7 +1203,7 @@ async fn download_file(
     app: &AppStateInner,
     url: &str,
     target_dir: &Path,
-    preferred_name: &str,
+    _preferred_name: &str,
     expected_sha256: Option<&str>,
     progress: Arc<Mutex<Vec<DownloadProgress>>>,
     task_id: &str,
@@ -1532,8 +1532,7 @@ async fn sync_gallery_inner(
         let c = open_db(&app.app_data)?;
         c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1", [model_id], |r| r.get(0))?
     };
-    let mut has_more = false;
-    loop {
+    let has_more = loop {
         let mut url = format!("{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true");
         if let Some(c) = &cursor { url.push_str("&cursor="); url.push_str(&urlencoding::encode(c)); }
         let mut req = client.get(&url);
@@ -1612,10 +1611,14 @@ async fn sync_gallery_inner(
             if !existed { cached_count += 1; }
         }
         let next_cursor = body.metadata.and_then(|m| m.get("nextCursor").and_then(Value::as_str).map(str::to_string));
-        has_more = next_cursor.is_some();
-        if cached_count >= target_count || next_cursor.is_none() { break; }
+        if cached_count >= target_count {
+            break next_cursor.is_some();
+        }
+        if next_cursor.is_none() {
+            break false;
+        }
         cursor = next_cursor;
-    }
+    };
     if let Ok(c) = open_db(&app.app_data) {
         let bytes = dir_size(&cache_root(&app.app_data));
         let _ = put_setting(&c, "cache_bytes", &bytes.to_string());
