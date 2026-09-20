@@ -211,6 +211,12 @@ struct SyncGalleryArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct LoadMoreArgs {
+    id: i64,
+    amount: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ExampleLoadAmountArgs {
     amount: Option<i64>,
 }
@@ -577,24 +583,44 @@ async fn task_start_handler(
             };
             let handle = handle.clone();
             move || async move {
-                let value = sync_model_gallery(&app, handle, args.id, args.target_count).await?;
+                let target_count = args.target_count.unwrap_or(20).clamp(1, 200);
+                let value = sync_gallery_inner(&app, args.id, handle, target_count).await?;
                 serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
             }
         }
         "load_more_model_examples" => {
-            let args: SyncGalleryArgs = match arg(request.args) {
+            let args: LoadMoreArgs = match arg(request.args) {
                 Ok(value) => value,
                 Err(error) => return response_err(error),
             };
             let handle = handle.clone();
             move || async move {
-                let value = load_more_model_examples(&app, handle, args.id, args.target_count).await?;
+                let requested = args.amount.unwrap_or_else(|| {
+                    open_db(&app.app_data)
+                        .ok()
+                        .and_then(|c| read_example_load_amount(&c).ok())
+                        .unwrap_or(20)
+                }).clamp(1, 100);
+                let current_count = {
+                    let c = open_db(&app.app_data)?;
+                    c.query_row(
+                        "SELECT COUNT(*) FROM images WHERE model_id=?1 AND meta_json NOT LIKE '%\"featured\":true%'",
+                        [args.id],
+                        |row| row.get::<_, i64>(0),
+                    )?
+                };
+                let value = sync_gallery_inner(
+                    &app,
+                    args.id,
+                    handle,
+                    current_count.saturating_add(requested).clamp(1, 1000),
+                ).await?;
                 serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
             }
         }
         "add_subfolder_tags" => {
             move || async move {
-                let value = add_subfolder_tags_inner(&app)?;
+                let value = crate::add_subfolder_tags_inner(&app)?;
                 serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
             }
         }
@@ -664,7 +690,7 @@ async fn task_start_handler(
             };
             let handle = handle.clone();
             move || async move {
-                let value = link_model_civitai(&app, handle, args.id, args.url).await?;
+                let value = link_model_civitai_inner(&app, handle, args.id, args.url).await?;
                 serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
             }
         }
@@ -675,7 +701,7 @@ async fn task_start_handler(
             };
             let handle = handle.clone();
             move || async move {
-                let value = refresh_model_civitai(&app, handle, args.id).await?;
+                let value = refresh_model_civitai_inner(&app, handle, args.id).await?;
                 serde_json::to_value(value).map_err(|error| AppError::Invalid(error.to_string()))
             }
         }
