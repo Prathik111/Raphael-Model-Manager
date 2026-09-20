@@ -343,7 +343,7 @@ async fn fetch_model_and_version(app:&AppStateInner, source:&str) -> AppResult<(
     Ok((model,version))
 }
 
-fn civitai_type_to_folder(t:&str)->&'static str { match t.to_lowercase().as_str(){"checkpoint"=>"checkpoints","lora"|"locon"|"lycoris"=>"loras","vae"=>"vae","controlnet"=>"controlnet","textualinversion"=>"embeddings","upscaler"=>"upscale_models","ipadapter"=>"ipadapter","clip"=>"text_encoders",_=>"other"} }
+fn civitai_type_to_folder(t:&str)->&'static str { match t.to_lowercase().as_str(){"checkpoint"=>"checkpoints","lora"|"locon"|"lycoris"=>"loras","vae"=>"vae","controlnet"=>"controlnet","textualinversion"|"embedding"=>"embeddings","upscaler"=>"upscale_models","ipadapter"|"ip-adapter"=>"ipadapter","clip"|"text encoder"=>"text_encoders","clipvision"|"clip vision"=>"clip_vision",_=>"other"} }
 fn civitai_type_to_model_type(t:&str)->&'static str { match t.to_lowercase().as_str(){"checkpoint"=>"Checkpoint","lora"|"locon"|"lycoris"=>"LoRA","vae"=>"VAE","controlnet"=>"ControlNet","textualinversion"|"embedding"=>"Embedding","upscaler"=>"Upscaler","clip"=>"Text Encoder","clipvision"=>"CLIP Vision","ipadapter"|"ip-adapter"=>"IP-Adapter",_=>"Other"} }
 fn normalized_import_type(t:&str)->Option<&'static str> { match t.to_ascii_lowercase().as_str(){"checkpoint"=>Some("Checkpoint"),"lora"=>Some("LoRA"),"vae"=>Some("VAE"),"controlnet"=>Some("ControlNet"),"embedding"=>Some("Embedding"),"upscaler"=>Some("Upscaler"),"text encoder"=>Some("Text Encoder"),"clip vision"=>Some("CLIP Vision"),"ip-adapter"|"ipadapter"=>Some("IP-Adapter"),"other"=>Some("Other"),_=>None} }
 fn civitai_host(url:&str)->AppResult<String>{Ok(Url::parse(url)?.host_str().unwrap_or("civitai.com").to_ascii_lowercase().replace("www.",""))}
