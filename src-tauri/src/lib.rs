@@ -623,8 +623,6 @@ async fn install_civitai_model(
         .and_then(|v| v.get("username"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let mid = model.get("id").and_then(Value::as_i64);
-    let vid = version.get("id").and_then(Value::as_i64);
     let vname = version.get("name").and_then(Value::as_str).map(str::to_string);
     let base = version
         .get("baseModel")
@@ -696,7 +694,6 @@ async fn install_civitai_model(
         model_by_id(&c, id)?
     };
 
-    let _ = ensure_model_thumbnail(&app, rec.civitai_model_id.unwrap_or_default(), &model, &version, &url).await;
     let _ = handle.emit("models-changed", ());
     let _ = sync_gallery_inner(app.inner().clone(), rec.id, handle.clone(), true).await;
     Ok(model_by_id(&open_db(&app.app_data)?, rec.id)?)
