@@ -64,6 +64,7 @@ struct AppStateInner {
     active_downloads: Arc<Mutex<usize>>,
     parallel_downloads: Arc<Mutex<usize>>,
     examples_refresh_state: Arc<Mutex<ExamplesRefreshState>>,
+    cache_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -114,6 +115,33 @@ struct ModelImage {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CategoryStats { r#type: String, count: i64, bytes: i64 }
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct CacheStats {
+    pub(crate) location: String,
+    pub(crate) used_bytes: i64,
+    pub(crate) max_bytes: i64,
+    pub(crate) over_limit: bool,
+    pub(crate) files: i64,
+    pub(crate) image_files: i64,
+    pub(crate) image_bytes: i64,
+    pub(crate) featured_files: i64,
+    pub(crate) featured_bytes: i64,
+    pub(crate) gallery_files: i64,
+    pub(crate) gallery_bytes: i64,
+    pub(crate) thumbnail_files: i64,
+    pub(crate) thumbnail_bytes: i64,
+    pub(crate) cover_files: i64,
+    pub(crate) cover_bytes: i64,
+    pub(crate) other_files: i64,
+    pub(crate) other_bytes: i64,
+}
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct CacheOperationResult {
+    pub(crate) deleted_files: i64,
+    pub(crate) freed_bytes: i64,
+    pub(crate) remaining_bytes: i64,
+    pub(crate) over_limit: bool,
+}
 #[derive(Debug, Serialize, Deserialize)]
 struct StorageStats { total_model_bytes: i64, cached_bytes: i64, categories: Vec<CategoryStats> }
 #[derive(Debug, Serialize, Deserialize)]
@@ -290,7 +318,20 @@ async fn acquire_download_slot(state: &AppStateInner) -> AppResult<DownloadSlot>
 }
 
 fn db_path(app_data: &Path) -> PathBuf { app_data.join("raphael.db") }
-fn cache_root(app_data: &Path) -> PathBuf { app_data.join("cache").join("civitai") }
+fn cache_base_default(app_data: &Path) -> PathBuf { app_data.join("cache") }
+pub(crate) fn cache_root(app_data: &Path) -> PathBuf {
+    let fallback = cache_base_default(app_data);
+    let connection = match Connection::open(db_path(app_data)) {
+        Ok(value) => value,
+        Err(_) => return fallback,
+    };
+    setting(&connection, "cache_location")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(fallback)
+}
 fn open_db(app_data: &Path) -> AppResult<Connection> {
     fs::create_dir_all(app_data)?;
     let c = Connection::open(db_path(app_data))?;
@@ -366,7 +407,13 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
         c.execute("ALTER TABLE models ADD COLUMN downloaded_at INTEGER NOT NULL DEFAULT 0",[])?;
         c.execute("UPDATE models SET downloaded_at=?1 WHERE downloaded_at=0",[now()])?;
     }
+    let has_cached_at:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('images') WHERE name='cached_at'",[],|r|r.get(0))?;
+    if has_cached_at==0 {
+        c.execute("ALTER TABLE images ADD COLUMN cached_at INTEGER NOT NULL DEFAULT 0",[])?;
+        c.execute("UPDATE images SET cached_at=?1 WHERE cached_at=0",[now()])?;
+    }
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('parallel_downloads','3')",[])?;
+    c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('cache_max_bytes','0')",[])?;
     Ok(c)
 }
 
