@@ -909,6 +909,7 @@ async fn link_model_civitai(
     let mid=model.get("id").and_then(Value::as_i64);
     let vid=version.get("id").and_then(Value::as_i64);
     let canonical=canonical_civitai_url(trimmed,mid,vid)?;
+    let thumbnail_path=match mid { Some(model_id)=>ensure_model_thumbnail(&app,model_id,&model,&version,trimmed).await?, None=>None };
     let rec={
         let c=open_db(&app.app_data)?;
         c.execute(
@@ -938,16 +939,15 @@ async fn link_model_civitai(
                 desc,
                 serde_json::to_string(&tags).unwrap_or_else(|_|"[]".into()),
                 serde_json::to_string(&activation).unwrap_or_else(|_|"[]".into()),
-                match mid { Some(model_id)=>ensure_model_thumbnail(&app,model_id,&model,&version,trimmed).await?, None=>None },
+                thumbnail_path,
                 now()
             ],
         )?;
         model_by_id(&c,id)?
     };
-    if let Some(mid)=mid { let _=ensure_model_thumbnail(&app,mid,&model,&version,trimmed).await; }
     sync_gallery_inner(app.inner().clone(),id,handle.clone(),true).await?;
     let _=handle.emit("models-changed",());
-    Ok(model_by_id(&open_db(&app.app_data)?, id)?)
+    Ok(rec)
 }
 
 #[tauri::command]
@@ -978,6 +978,7 @@ async fn refresh_model_civitai(
         .and_then(|v| v.get("username"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    let thumbnail_path=match model.get("id").and_then(Value::as_i64) { Some(mid)=>ensure_model_thumbnail(&app,mid,&model,&version,&url).await?, None=>None };
 
     let rec = {
         let c = open_db(&app.app_data)?;
@@ -1006,7 +1007,7 @@ async fn refresh_model_civitai(
                 desc,
                 serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
                 serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
-                match model.get("id").and_then(Value::as_i64) { Some(mid)=>ensure_model_thumbnail(&app,mid,&model,&version,&url).await?, None=>None },
+                thumbnail_path,
                 now()
             ],
         )?;
