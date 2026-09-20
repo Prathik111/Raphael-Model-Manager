@@ -1288,8 +1288,8 @@ async fn sync_featured_examples_inner(
         tx.execute("DELETE FROM images WHERE model_id=?1 AND meta_json LIKE '%\"featured\":true%'", [model_id])?;
         for record in &records{
             tx.execute(
-                "INSERT INTO images(model_id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                "INSERT INTO images(model_id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json,cached_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,CAST(strftime('%s','now') AS INTEGER))
                  ON CONFLICT(model_id,civitai_image_id) DO UPDATE SET
                     local_path=excluded.local_path,
                     thumbnail_path=excluded.thumbnail_path,
@@ -1301,7 +1301,8 @@ async fn sync_featured_examples_inner(
                     cfg=excluded.cfg,
                     sampler=excluded.sampler,
                     seed=excluded.seed,
-                    meta_json=excluded.meta_json",
+                    meta_json=excluded.meta_json,
+                    cached_at=excluded.cached_at",
                 params![model_id,record.0,record.1,record.2,record.3,record.4,record.5,record.6,record.7,record.8,record.9,record.10,record.11],
             )?;
         }
@@ -1314,6 +1315,7 @@ async fn sync_featured_examples_inner(
             if backup.exists(){let _=fs::remove_dir_all(&backup);}
             let bytes=dir_size(&cache_root(&app.app_data));
             if let Ok(c)=open_db(&app.app_data){let _=put_setting(&c,"cache_bytes",&bytes.to_string());}
+            let _=enforce_cache_limit_inner(&app.app_data);
             let _=handle.emit("models-changed",());
             Ok(saved_count)
         }
@@ -1831,6 +1833,9 @@ fn get_model_images(app: State<AppStateInner>, id: i64, limit: Option<i64>) -> A
         meta_json: r.get(12)?,
     }))?;
     let images: Vec<ModelImage> = rows.filter_map(Result::ok).collect();
+    for image in &images {
+        let _ = c.execute("UPDATE images SET cached_at=?2 WHERE id=?1", params![image.id, now()]);
+    }
     Ok(ModelImagesResponse { has_more: images.len() as i64 >= limit, images })
 }
 #[tauri::command]
@@ -2233,7 +2238,7 @@ async fn sync_gallery_inner(
                     model_id,civitai_image_id,local_path,thumbnail_path,width,height,
                     prompt,negative_prompt,steps,cfg,sampler,seed,meta_json
                  )
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,CAST(strftime('%s','now') AS INTEGER))
                  ON CONFLICT(model_id,civitai_image_id) DO UPDATE SET
                     local_path=excluded.local_path,
                     thumbnail_path=excluded.thumbnail_path,
@@ -2248,7 +2253,8 @@ async fn sync_gallery_inner(
                     meta_json=CASE
                         WHEN images.meta_json LIKE '%\"featured\":true%' THEN images.meta_json
                         ELSE excluded.meta_json
-                    END",
+                    END,
+                    cached_at=excluded.cached_at",
                 params![
                     model_id,iid,local_path,
                     if thumb.exists(){Some(thumb.to_string_lossy().to_string())}else{None::<String>},
@@ -2271,6 +2277,7 @@ async fn sync_gallery_inner(
         let bytes = dir_size(&cache_root(&app.app_data));
         let _ = put_setting(&c, "cache_bytes", &bytes.to_string());
     }
+    let _=enforce_cache_limit_inner(&app.app_data);
     let _ = handle.emit("models-changed", ());
     Ok(has_more)
 }
@@ -2293,6 +2300,7 @@ async fn link_model_civitai(
     id:i64,
     url:String,
 )->AppResult<ModelRecord>{
+    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
     let trimmed=url.trim();
     let (_mid,_vid)=model_id_and_version(trimmed)?;
     let (model,version)=fetch_model_and_version(&app,trimmed).await?;
@@ -2340,6 +2348,7 @@ async fn link_model_civitai(
         model_by_id(&c,id)?
     };
     let _=handle.emit("models-changed",());
+    drop(_guard);
     sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
     Ok(rec)
 }
@@ -2350,6 +2359,7 @@ async fn refresh_model_civitai(
     handle: AppHandle,
     id: i64,
 ) -> AppResult<ModelRecord> {
+    let _guard=app.cache_lock.lock().map_err(|_|AppError::Invalid("Cache manager is busy".into()))?;
     let current = {
         let c = open_db(&app.app_data)?;
         model_by_id(&c, id)?
@@ -2409,6 +2419,7 @@ async fn refresh_model_civitai(
     };
 
     let _ = handle.emit("models-changed", ());
+    drop(_guard);
     sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
     Ok(rec)
 }
@@ -2720,6 +2731,7 @@ pub fn run() {
                 active_downloads:Arc::new(Mutex::new(0)),
                 parallel_downloads:Arc::new(Mutex::new(parallel)),
                 examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
+                cache_lock: Arc::new(Mutex::new(())),
             };app.manage(state.clone());
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
