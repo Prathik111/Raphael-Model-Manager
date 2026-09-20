@@ -85,7 +85,7 @@ function Setup({ onReady }: { onReady: (state: AppState)=>void }) {
       <p>{webMode
         ? 'Select the models folder from Raphael on the Windows host. The LAN web app uses that same library.'
         : 'The manager watches this folder and everything beneath it. Your model files stay where they are.'}</p>
-      {!webMode ? <><button className="primary-btn" onClick={choose} disabled={busy}>{busy ? 'OPENING…' : 'BROWSE MODELS FOLDER'}</button><div className="tiny">Example: C:\ComfyUI\models</div></> : <div className="tiny">Return to the Raphael desktop window and choose the host models folder.</div>
+      {!webMode ? <><button className="primary-btn" onClick={choose} disabled={busy}>{busy ? 'OPENING…' : 'BROWSE MODELS FOLDER'}</button><div className="tiny">Example: C:\ComfyUI\models</div></> : <div className="tiny">Return to the Raphael desktop window and choose the host models folder.</div>}
     </div>
   </div>;
 }
