@@ -181,6 +181,13 @@ export const api = {
     if (!response.ok) throw new Error(payload?.error || `Web API status failed: ${response.status}`);
     return payload as WebAppStatus;
   },
+  checkWebHealth: async () => {
+    if (!isWebApp) return { latencyMs: 0 };
+    const started = performance.now();
+    const response = await webFetch('/api/health', {}, 2500);
+    if (!response.ok) throw new Error(`Web API health check failed: ${response.status}`);
+    return { latencyMs: Math.round(performance.now() - started) };
+  },
   setWebAppEnabled: (enabled: boolean) =>
     isWebApp
       ? Promise.reject(new Error('Web app controls are available from the desktop host only.'))
