@@ -631,7 +631,7 @@ async fn task_start_handler(
             };
             let handle = handle.clone();
             move || async move {
-                delete_model(&app, handle, args.id).await?;
+                delete_model_inner(&app, handle, args.id).await?;
                 Ok(Value::Null)
             }
         }
