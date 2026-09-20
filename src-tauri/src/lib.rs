@@ -102,6 +102,8 @@ struct CategoryStats { r#type: String, count: i64, bytes: i64 }
 #[derive(Debug, Serialize, Deserialize)]
 struct StorageStats { total_model_bytes: i64, cached_bytes: i64, categories: Vec<CategoryStats> }
 #[derive(Debug, Serialize, Deserialize)]
+struct LibraryCounts { all: i64, by_type: std::collections::BTreeMap<String, i64> }
+#[derive(Debug, Serialize, Deserialize)]
 struct AppStateResponse { models_root: Option<String>, storage: StorageStats }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -273,7 +275,17 @@ async fn api_get(app: &AppStateInner, url: &str) -> AppResult<Value> {
     let mut req=client.get(url);
     if let Some(t)=token(){ req=req.bearer_auth(t); }
     let res=req.send().await?;
-    if !res.status().is_success(){ return Err(AppError::Api(format!("Civitai returned {}",res.status()))); }
+    let status=res.status();
+    if !status.is_success(){
+        let body=res.text().await.unwrap_or_default();
+        let detail=serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("message").and_then(Value::as_str).or_else(|| v.get("error").and_then(Value::as_str)).map(str::to_string))
+            .filter(|x|!x.is_empty())
+            .unwrap_or_else(|| if body.trim().is_empty(){"No response body".into()}else{body.trim().chars().take(220).collect()});
+        let hint=match status.as_u16(){401|403=>" Check your Civitai token/permissions.",404=>" Check that the model URL and model version still exist.",_=>""};
+        return Err(AppError::Api(format!("Civitai returned {status}: {detail}.{hint}")));
+    }
     Ok(res.json::<Value>().await?)
 }
 
@@ -350,6 +362,17 @@ fn list_models(app:State<AppStateInner>, r#type:Option<String>, query:Option<Str
     if let Some(q)=query {sql.push_str(" AND (filename LIKE ? OR relative_path LIKE ? OR civitai_name LIKE ?)"); let x=format!("%{q}%");args.extend([x.clone(),x.clone(),x]);}
     sql.push_str(" ORDER BY COALESCE(civitai_name,filename) COLLATE NOCASE"); let mut stmt=c.prepare(&sql)?; let rows=stmt.query_map(rusqlite::params_from_iter(args.iter()),model_from_row)?; Ok(rows.filter_map(Result::ok).collect())
 }
+#[tauri::command]
+fn get_library_counts(app:State<AppStateInner>)->AppResult<LibraryCounts>{
+    let c=open_db(&app.app_data)?;
+    let all:i64=c.query_row("SELECT COUNT(*) FROM models",[],|r|r.get(0))?;
+    let mut stmt=c.prepare("SELECT model_type,COUNT(*) FROM models GROUP BY model_type")?;
+    let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?;
+    let mut by_type=std::collections::BTreeMap::new();
+    for row in rows { let (kind,count)=row?; by_type.insert(kind,count); }
+    Ok(LibraryCounts{all,by_type})
+}
+
 #[tauri::command]
 fn get_model_images(app:State<AppStateInner>, id:i64)->AppResult<Vec<ModelImage>>{
     let c=open_db(&app.app_data)?; let mut stmt=c.prepare("SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json FROM images WHERE model_id=?1 ORDER BY id")?; let rows=stmt.query_map([id],|r|Ok(ModelImage{id:r.get(0)?,civitai_image_id:r.get(1)?,local_path:r.get(2)?,thumbnail_path:r.get(3)?,width:r.get(4)?,height:r.get(5)?,prompt:r.get(6)?,negative_prompt:r.get(7)?,steps:r.get(8)?,cfg:r.get(9)?,sampler:r.get(10)?,seed:r.get(11)?,meta_json:r.get(12)?}))?; Ok(rows.filter_map(Result::ok).collect())
@@ -801,6 +824,65 @@ async fn sync_model_gallery(
 }
 
 #[tauri::command]
+async fn link_model_civitai(
+    app:State<'_,AppStateInner>,
+    handle:AppHandle,
+    id:i64,
+    url:String,
+)->AppResult<ModelRecord>{
+    let trimmed=url.trim();
+    let (_mid,_vid)=model_id_and_version(trimmed)?;
+    let (model,version)=fetch_model_and_version(&app,trimmed).await?;
+    let tags=json_strings(model.get("tags"));
+    let activation=json_strings(version.get("trainedWords"));
+    let desc=model.get("description").and_then(Value::as_str).map(strip_html);
+    let creator=model.get("creator").and_then(|v|v.get("username")).and_then(Value::as_str).map(str::to_string);
+    let mid=model.get("id").and_then(Value::as_i64);
+    let vid=version.get("id").and_then(Value::as_i64);
+    let canonical=match (mid,vid) {
+        (Some(m),Some(v))=>format!("https://civitai.com/models/{m}?modelVersionId={v}"),
+        (Some(m),None)=>format!("https://civitai.com/models/{m}"),
+        _=>trimmed.to_string(),
+    };
+    let rec={
+        let c=open_db(&app.app_data)?;
+        c.execute(
+            "UPDATE models
+             SET civitai_model_id=?2,
+                 civitai_version_id=?3,
+                 civitai_url=?4,
+                 civitai_name=?5,
+                 version_name=?6,
+                 base_model=?7,
+                 creator=?8,
+                 description=?9,
+                 tags_json=?10,
+                 activation_json=?11,
+                 updated_at=?12
+             WHERE id=?1",
+            params![
+                id,
+                mid,
+                vid,
+                canonical,
+                model.get("name").and_then(Value::as_str),
+                version.get("name").and_then(Value::as_str),
+                version.get("baseModel").and_then(Value::as_str),
+                creator,
+                desc,
+                serde_json::to_string(&tags).unwrap_or_else(|_|"[]".into()),
+                serde_json::to_string(&activation).unwrap_or_else(|_|"[]".into()),
+                now()
+            ],
+        )?;
+        model_by_id(&c,id)?
+    };
+    sync_gallery_inner(app.inner().clone(),id,handle.clone(),true).await?;
+    let _=handle.emit("models-changed",());
+    Ok(rec)
+}
+
+#[tauri::command]
 async fn refresh_model_civitai(
     app: State<'_, AppStateInner>,
     handle: AppHandle,
@@ -1017,7 +1099,7 @@ pub fn run() {
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
