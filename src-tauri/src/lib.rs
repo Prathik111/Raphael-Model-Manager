@@ -1185,7 +1185,7 @@ fn set_model_cover_from_image(
 fn get_model_images(app:State<AppStateInner>, id:i64, limit:Option<i64>)->AppResult<Vec<ModelImage>>{
     let c=open_db(&app.app_data)?;
     let limit=limit.unwrap_or(20).clamp(1,200);
-    let mut stmt=c.prepare("SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json FROM images WHERE model_id=?1 AND meta_json LIKE '%"featured":true%' ORDER BY id LIMIT ?2")?;
+    let mut stmt=c.prepare("SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json FROM images WHERE model_id=?1 AND meta_json LIKE '%\"featured\":true%' ORDER BY id LIMIT ?2")?;
     let rows=stmt.query_map(params![id,limit],|r|Ok(ModelImage{id:r.get(0)?,civitai_image_id:r.get(1)?,local_path:r.get(2)?,thumbnail_path:r.get(3)?,width:r.get(4)?,height:r.get(5)?,prompt:r.get(6)?,negative_prompt:r.get(7)?,steps:r.get(8)?,cfg:r.get(9)?,sampler:r.get(10)?,seed:r.get(11)?,meta_json:r.get(12)?}))?;
     Ok(rows.filter_map(Result::ok).collect())
 }
