@@ -119,7 +119,7 @@ export const api = {
   syncModelGallery: (id: number, targetCount = 20) =>
     command<boolean>('sync_model_gallery', { id, targetCount }),
   loadMoreModelExamples: (id: number, amount?: number) =>
-    command<boolean>('load_more_model_examples', { id, targetCount: amount }),
+    command<boolean>('load_more_model_examples', { id, amount }),
   getExampleLoadAmount: () =>
     command<number>('get_example_load_amount'),
   setExampleLoadAmount: (amount: number) =>
