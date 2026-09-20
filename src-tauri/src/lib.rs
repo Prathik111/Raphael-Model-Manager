@@ -621,9 +621,11 @@ async fn sync_featured_examples_inner(
     let model = api_get(&app, &format!("{API_BASE}/models/{civitai_id}")).await?;
     let mut versions = model.get("modelVersions").and_then(Value::as_array).cloned().unwrap_or_default();
     versions.sort_by(|a,b| {
+        let ac=a.get("createdAt").and_then(Value::as_str).unwrap_or("");
+        let bc=b.get("createdAt").and_then(Value::as_str).unwrap_or("");
         let ai=a.get("id").and_then(Value::as_i64).unwrap_or_default();
         let bi=b.get("id").and_then(Value::as_i64).unwrap_or_default();
-        bi.cmp(&ai)
+        bc.cmp(ac).then_with(|| bi.cmp(&ai))
     });
     versions.truncate(5);
     if versions.is_empty() { return Err(AppError::Api("Civitai returned no model versions".into())); }
@@ -643,7 +645,18 @@ async fn sync_featured_examples_inner(
 
     for (version_index,summary) in versions.iter().enumerate(){
         let version_id=summary.get("id").and_then(Value::as_i64).ok_or_else(||AppError::Api("Civitai returned a model version without an ID".into()))?;
-        let version=api_get(&app,&format!("{API_BASE}/model-versions/{version_id}")).await?;
+        let version=match api_get(&app,&format!("{API_BASE}/model-versions/{version_id}")).await {
+            Ok(value)=>value,
+            Err(error)=>{
+                emit_examples_progress(&handle,ExamplesRefreshProgress{
+                    current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                    version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                    status:format!("Could not fetch version {version_id}"),
+                    done:false,error:Some(error.to_string())
+                });
+                continue;
+            }
+        };
         let version_name=version.get("name").and_then(Value::as_str).unwrap_or("version");
         emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index,version_total:total_versions,images_saved:saved_count,status:format!("Fetching featured images from {version_name}"),done:false,error:None});
 
@@ -659,14 +672,60 @@ async fn sync_featured_examples_inner(
             if !local.exists(){
                 let mut request=client.get(&remote);
                 if let Some(t)=token(){request=request.bearer_auth(t);}
-                let bytes=request.send().await?.error_for_status()?.bytes().await?;
+                let response=match request.send().await {
+                    Ok(value)=>value,
+                    Err(error)=>{
+                        emit_examples_progress(&handle,ExamplesRefreshProgress{
+                            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                            version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                            status:format!("Could not download featured image {image_id}"),done:false,error:Some(error.to_string())
+                        });
+                        continue;
+                    }
+                };
+                if !response.status().is_success(){
+                    emit_examples_progress(&handle,ExamplesRefreshProgress{
+                        current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                        version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                        status:format!("Civitai returned {} for image {image_id}", response.status()),done:false,error:None
+                    });
+                    continue;
+                }
+                let bytes=match response.bytes().await {
+                    Ok(value)=>value,
+                    Err(error)=>{
+                        emit_examples_progress(&handle,ExamplesRefreshProgress{
+                            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                            version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                            status:format!("Could not read featured image {image_id}"),done:false,error:Some(error.to_string())
+                        });
+                        continue;
+                    }
+                };
                 if bytes.is_empty(){continue;}
                 fs::write(&local,&bytes)?;
             }
             if !thumb.exists(){
-                let img=image::open(&local).map_err(|e|AppError::Api(format!("Could not decode featured image {image_id}: {e}")))?;
+                let img=match image::open(&local) {
+                    Ok(value)=>value,
+                    Err(error)=>{
+                        emit_examples_progress(&handle,ExamplesRefreshProgress{
+                            current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                            version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                            status:format!("Could not decode featured image {image_id}"),done:false,error:Some(error.to_string())
+                        });
+                        continue;
+                    }
+                };
                 let thumb_image=img.thumbnail(420,420);
-                thumb_image.save_with_format(&thumb,image::ImageFormat::WebP).map_err(|e|AppError::Api(format!("Could not create featured thumbnail {image_id}: {e}")))?;
+                if let Err(error)=thumb_image.save_with_format(&thumb,image::ImageFormat::WebP){
+                    emit_examples_progress(&handle,ExamplesRefreshProgress{
+                        current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),
+                        version_current:version_index,version_total:total_versions,images_saved:saved_count,
+                        status:format!("Could not create thumbnail {image_id}"),done:false,error:Some(error.to_string())
+                    });
+                    continue;
+                }
             }
             let mut meta=image.clone();
             if let Some(map)=meta.as_object_mut(){
@@ -706,7 +765,20 @@ async fn sync_featured_examples_inner(
         tx.execute("DELETE FROM images WHERE model_id=?1 AND meta_json LIKE '%\"featured\":true%'", [model_id])?;
         for record in &records{
             tx.execute(
-                "INSERT INTO images(model_id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                "INSERT INTO images(model_id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                 ON CONFLICT(model_id,civitai_image_id) DO UPDATE SET
+                    local_path=excluded.local_path,
+                    thumbnail_path=excluded.thumbnail_path,
+                    width=excluded.width,
+                    height=excluded.height,
+                    prompt=excluded.prompt,
+                    negative_prompt=excluded.negative_prompt,
+                    steps=excluded.steps,
+                    cfg=excluded.cfg,
+                    sampler=excluded.sampler,
+                    seed=excluded.seed,
+                    meta_json=excluded.meta_json",
                 params![model_id,record.0,record.1,record.2,record.3,record.4,record.5,record.6,record.7,record.8,record.9,record.10,record.11],
             )?;
         }
