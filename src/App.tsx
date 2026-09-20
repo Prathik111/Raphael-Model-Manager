@@ -1066,6 +1066,7 @@ function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, r
                 <button className="text-btn" onClick={()=>void refreshSource()} disabled={refreshBusy || linkBusy}>{refreshBusy ? 'REFRESHING…' : 'REFRESH SOURCE DATA'}</button>
                 <button className="primary-btn small" onClick={()=>setEditingSource(true)} disabled={refreshBusy || linkBusy}>EDIT LINK</button>
               </div>
+              {refreshError ? <div className="error-box">{refreshError}</div> : null}
             </div>
           : <div className="civitai-link-panel">
               <div className="source-line"><span className="source-dot"/><span className="source-label">{model.civitai_url ? 'CHANGE LINKED SOURCE' : 'LINK LOCAL MODEL'}</span><span className="source-domain">CIVITAI</span></div>
@@ -1087,7 +1088,6 @@ function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, r
                 }}>{linkBusy ? 'FETCHING…' : model.civitai_url ? 'SAVE LINK' : 'FETCH DETAILS'}</button>
                 {model.civitai_url ? <button className="text-btn" onClick={()=>{setCivitaiUrl(model.civitai_url || '');setLinkError(null);setEditingSource(false);}} disabled={linkBusy}>CANCEL</button> : null}
               </div>
-              {refreshError ? <div className="error-box">{refreshError}</div> : null}
               {linkError ? <div className="error-box">{linkError}</div> : null}
             </div>}
       </section>
