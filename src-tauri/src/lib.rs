@@ -40,7 +40,7 @@ pub(crate) fn model_change_revision() -> u64 {
 fn emit_models_changed(handle: &AppHandle) {
     MODEL_CHANGE_REVISION.fetch_add(1, Ordering::AcqRel);
     model_change_notify().notify_waiters();
-    emit_models_changed(&handle);
+    let _ = handle.emit("models-changed", ());
 }
 
 #[derive(Debug, Error)]
