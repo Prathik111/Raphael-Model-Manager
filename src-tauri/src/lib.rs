@@ -567,21 +567,26 @@ fn rewrite_cache_paths(
     let old = old_root.to_string_lossy().to_string();
     let new = new_root.to_string_lossy().to_string();
     let separator = std::path::MAIN_SEPARATOR.to_string();
+    let alternate_separator = if separator == "/" { "\\".to_string() } else { "/".to_string() };
     let tx = c.transaction()?;
 
     for column in ["local_path", "thumbnail_path"] {
         let sql = format!(
             "UPDATE images SET {column}=?2 || substr({column}, length(?1)+1)
-             WHERE {column}=?1 OR substr({column},1,length(?1)+1)=?1 || ?3"
+             WHERE {column}=?1
+                OR substr({column},1,length(?1)+1)=?1 || ?3
+                OR substr({column},1,length(?1)+1)=?1 || ?4"
         );
-        tx.execute(&sql, params![old, new, separator])?;
+        tx.execute(&sql, params![old, new, separator, alternate_separator])?;
     }
     for column in ["thumbnail_path", "cover_path"] {
         let sql = format!(
             "UPDATE models SET {column}=?2 || substr({column}, length(?1)+1)
-             WHERE {column}=?1 OR substr({column},1,length(?1)+1)=?1 || ?3"
+             WHERE {column}=?1
+                OR substr({column},1,length(?1)+1)=?1 || ?3
+                OR substr({column},1,length(?1)+1)=?1 || ?4"
         );
-        tx.execute(&sql, params![old, new, separator])?;
+        tx.execute(&sql, params![old, new, separator, alternate_separator])?;
     }
     tx.execute(
         "INSERT INTO settings(key,value) VALUES('cache_location',?1)
