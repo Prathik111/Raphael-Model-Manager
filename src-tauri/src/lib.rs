@@ -814,14 +814,20 @@ async fn sync_featured_examples_inner(
         if old_path.starts_with(&active) {
             if old_path.is_file() {
                 let new_cover = copy_cached_cover(&app, model_id, &old_path)?;
-                let c = open_db(&app.app_data)?;
+                let cover_source_image_id: Option<i64> = c
+                    .query_row(
+                        "SELECT id FROM images WHERE model_id=?1 AND (local_path=?2 OR thumbnail_path=?2) LIMIT 1",
+                        params![model_id, old_path.to_string_lossy().to_string()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
                 c.execute(
-                    "UPDATE models SET cover_path=?2,updated_at=?3 WHERE id=?1",
-                    params![model_id, new_cover.to_string_lossy().to_string(), now()],
+                    "UPDATE models SET cover_path=?2,cover_source_image_id=?3,updated_at=?4 WHERE id=?1",
+                    params![model_id, new_cover.to_string_lossy().to_string(), cover_source_image_id, now()],
                 )?;
             } else {
                 let c = open_db(&app.app_data)?;
-                c.execute("UPDATE models SET cover_path=NULL,updated_at=?2 WHERE id=?1", params![model_id, now()])?;
+                c.execute("UPDATE models SET cover_path=NULL,cover_source_image_id=NULL,updated_at=?2 WHERE id=?1", params![model_id, now()])?;
             }
         }
     }
@@ -2583,5 +2589,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cover_y_column, 1);
+
+        let cover_source_image_column: i64 = second
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_source_image_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cover_source_image_column, 1);
     }
 }
