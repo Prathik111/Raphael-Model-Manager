@@ -138,6 +138,9 @@ function SettingsOverlay({
   const [cacheKeepPerModel, setCacheKeepPerModel] = useState('20');
   const [cacheBusy, setCacheBusy] = useState(false);
   const [cacheMessage, setCacheMessage] = useState<string | null>(null);
+  const [exampleLoadAmount, setExampleLoadAmount] = useState(20);
+  const [exampleLoadBusy, setExampleLoadBusy] = useState(false);
+  const [exampleLoadMessage, setExampleLoadMessage] = useState<string | null>(null);
 
 
   const showCacheResult = (result: CacheOperationResult, label: string) => {
@@ -241,6 +244,22 @@ function SettingsOverlay({
     }
   };
 
+  const saveExampleLoadAmount = async (value: number) => {
+    const next = Math.max(1, Math.min(100, Math.round(value)));
+    setExampleLoadBusy(true);
+    setSettingsError(null);
+    setExampleLoadMessage(null);
+    try {
+      const saved = await api.setExampleLoadAmount(next);
+      setExampleLoadAmount(saved);
+      setExampleLoadMessage(`LOAD MORE · ${saved} IMAGES / CLICK`);
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setExampleLoadBusy(false);
+    }
+  };
+
   const cleanCacheOrphans = async () => {
     if (cacheBusy) return;
     setCacheBusy(true);
@@ -271,6 +290,7 @@ function SettingsOverlay({
   useEffect(() => {
     api.getCivitaiTokenSet().then(setTokenSet).catch(() => setTokenSet(false));
     api.getParallelDownloads().then(value => setParallelDownloads(Math.max(1, Math.min(8, value)))).catch(() => setParallelDownloads(3));
+    api.getExampleLoadAmount().then(value => setExampleLoadAmount(Math.max(1, Math.min(100, value)))).catch(() => setExampleLoadAmount(20));
     void refreshCacheStats().catch(error => setSettingsError(String(error)));
     const timer = window.setInterval(() => {
       void refreshCacheStats().catch(error => setSettingsError(String(error)));
@@ -442,6 +462,19 @@ function SettingsOverlay({
               {progress.error ? <div className="examples-refresh-error">{progress.error}</div> : null}
             </div>;
           })() : null}
+
+          <div className="cache-control example-load-control">
+            <div>
+              <span className="cache-label">COMMUNITY GALLERY LOAD AMOUNT</span>
+              <p className="settings-copy">Controls how many additional community-generated Civitai images Raphael retrieves each time you press LOAD MORE EXAMPLES.</p>
+            </div>
+            <div className="cache-input-row">
+              <input className="cache-number-input" type="number" min="1" max="100" step="1" value={exampleLoadAmount} onChange={e => setExampleLoadAmount(Math.max(1, Math.min(100, Number(e.target.value) || 1)))} disabled={exampleLoadBusy} aria-label="Community gallery images loaded per click" />
+              <span className="cache-unit">IMAGES</span>
+              <button className="primary-btn small" onClick={() => void saveExampleLoadAmount(exampleLoadAmount)} disabled={exampleLoadBusy}>{exampleLoadBusy ? 'SAVING…' : 'SAVE'}</button>
+            </div>
+          </div>
+          {exampleLoadMessage ? <div className="settings-success">{exampleLoadMessage}</div> : null}
         </section>
 
         <section className="settings-section">
