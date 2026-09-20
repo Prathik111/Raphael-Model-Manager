@@ -19,7 +19,7 @@ use tower_http::{cors::CorsLayer, services::ServeDir};
 use crate::{
     add_subfolder_tags, delete_model, get_app_state, get_library_counts, get_model_images, get_storage_stats,
     get_tags, install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
-    refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position,
+    refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
     set_model_tags, set_model_type, sync_model_gallery,
     is_civitai_token_set, AppError, AppResult, CivitaiImportPreview, ModelRecord,
 };
@@ -101,6 +101,13 @@ struct CoverPositionArgs {
     id: i64,
     x: f64,
     y: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageArgs {
+    id: i64,
+    #[serde(rename = "imageId")]
+    image_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +266,11 @@ async fn command_handler(
         "reset_model_cover" => {
             let args: IdArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             reset_model_cover(handle.state(), handle.clone(), args.id)
+                .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        }
+        "set_model_cover_from_image" => {
+            let args: ImageArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            set_model_cover_from_image(handle.state(), handle.clone(), args.id, args.image_id)
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "set_model_custom_cover" => {
