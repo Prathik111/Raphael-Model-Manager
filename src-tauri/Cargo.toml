@@ -35,11 +35,12 @@ urlencoding = "2.1"
 [dev-dependencies]
 tempfile = "3.23"
 
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
 [profile.release]
 codegen-units = 1
 lto = true
 panic = "abort"
 strip = true
 opt-level = "s"
-axum = "0.8"
-tower-http = { version = "0.6", features = ["fs", "cors"] }
