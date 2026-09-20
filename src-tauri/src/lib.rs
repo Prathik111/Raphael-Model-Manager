@@ -661,7 +661,9 @@ fn enforce_cache_limit_inner(app_data: &Path) -> AppResult<CacheOperationResult>
     let mut c = open_db(app_data)?;
     let root = cache_root(app_data);
     let mut stmt = c.prepare(
-        "SELECT id FROM images ORDER BY CASE WHEN meta_json LIKE '%\"featured\":true%' THEN 1 ELSE 0 END, cached_at ASC, id ASC"
+        "SELECT i.id FROM images i
+         WHERE NOT EXISTS (SELECT 1 FROM models m WHERE m.cover_source_image_id=i.id)
+         ORDER BY CASE WHEN i.meta_json LIKE '%\"featured\":true%' THEN 1 ELSE 0 END, i.cached_at ASC, i.id ASC"
     )?;
     let ids: Vec<i64> = stmt.query_map([], |r| r.get(0))?.filter_map(Result::ok).collect();
     drop(stmt);
@@ -738,7 +740,10 @@ fn prune_cache_images_inner(app_data: &Path, keep_per_model: i64) -> AppResult<C
 
     for model_id in model_ids {
         let mut stmt = c.prepare(
-            "SELECT id FROM images WHERE model_id=?1 ORDER BY CASE WHEN meta_json LIKE '%\"featured\":true%' THEN 0 ELSE 1 END, cached_at DESC, id DESC"
+            "SELECT i.id FROM images i
+             WHERE i.model_id=?1
+               AND NOT EXISTS (SELECT 1 FROM models m WHERE m.cover_source_image_id=i.id)
+             ORDER BY CASE WHEN i.meta_json LIKE '%\"featured\":true%' THEN 0 ELSE 1 END, i.cached_at DESC, i.id DESC"
         )?;
         let ids: Vec<i64> = stmt.query_map([model_id], |r| r.get(0))?.filter_map(Result::ok).collect();
         drop(stmt);
