@@ -151,6 +151,7 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
         description TEXT,
         tags_json TEXT NOT NULL DEFAULT '[]',
         tags_user_modified INTEGER NOT NULL DEFAULT 0,
+        model_type_user_modified INTEGER NOT NULL DEFAULT 0,
         activation_json TEXT NOT NULL DEFAULT '[]',
         source_hash TEXT,
         updated_at INTEGER NOT NULL
@@ -179,6 +180,8 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
     if has_thumbnail==0 { c.execute("ALTER TABLE models ADD COLUMN thumbnail_path TEXT",[])?; }
     let has_tag_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='tags_user_modified'",[],|r|r.get(0))?;
     if has_tag_lock==0 { c.execute("ALTER TABLE models ADD COLUMN tags_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
+    let has_type_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='model_type_user_modified'",[],|r|r.get(0))?;
+    if has_type_lock==0 { c.execute("ALTER TABLE models ADD COLUMN model_type_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     Ok(c)
 }
 
@@ -233,10 +236,10 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
         let size = meta.len() as i64;
         let modified = mtime(&path);
         seen.push(path_s.clone());
-        let old: Option<(i64,i64,i64,Option<String>)> = c.query_row(
-            "SELECT id,size_bytes,modified_at,source_hash FROM models WHERE path=?1", [&path_s], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
+        let old: Option<(i64,i64,i64,Option<String>,i64)> = c.query_row(
+            "SELECT id,size_bytes,modified_at,source_hash,model_type_user_modified FROM models WHERE path=?1", [&path_s], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))
         ).optional()?;
-        if old.as_ref().map(|(_,s,m,_)| *s == size && *m == modified).unwrap_or(false) {
+        if old.as_ref().map(|(_,s,m,_,_)| *s == size && *m == modified).unwrap_or(false) {
             c.execute("UPDATE models SET modified_at=?2, updated_at=?3 WHERE path=?1", params![path_s, modified, now()])?;
             continue;
         }
@@ -244,8 +247,8 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
         let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let mtype = file_type_from_path(&path, root);
         let hash: Option<String> = None;
-        if let Some((id,_,_,_)) = old {
-            c.execute("UPDATE models SET relative_path=?2,filename=?3,model_type=?4,size_bytes=?5,modified_at=?6,source_hash=?7,updated_at=?8 WHERE id=?1", params![id,rel,filename,mtype,size,modified,hash,now()])?;
+        if let Some((id,_,_,_,type_locked)) = old {
+            c.execute("UPDATE models SET relative_path=?2,filename=?3,model_type=CASE WHEN model_type_user_modified=1 THEN model_type ELSE ?4 END,size_bytes=?5,modified_at=?6,source_hash=?7,updated_at=?8 WHERE id=?1", params![id,rel,filename,mtype,size,modified,hash,now()])?;
         } else {
             c.execute("INSERT INTO models(path,relative_path,filename,model_type,size_bytes,modified_at,source_hash,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![path_s,rel,filename,mtype,size,modified,hash,now()])?;
         }
@@ -543,6 +546,27 @@ fn set_model_tags(app:State<AppStateInner>, handle:AppHandle, id:i64, tags:Vec<S
         "UPDATE models SET tags_json=?2,tags_user_modified=1,updated_at=?3 WHERE id=?1",
         params![id,serde_json::to_string(&normalized).unwrap_or_else(|_|"[]".into()),now()],
     )?;
+    let rec=model_by_id(&c,id)?;
+    let _=handle.emit("models-changed",());
+    Ok(rec)
+}
+
+#[tauri::command]
+fn set_model_type(app:State<AppStateInner>, handle:AppHandle, id:i64, model_type:String)->AppResult<ModelRecord>{
+    let requested=model_type.trim();
+    let c=open_db(&app.app_data)?;
+    let current_path:String=c.query_row("SELECT path FROM models WHERE id=?1",[id],|r|r.get(0))?;
+    let next_type=if requested.eq_ignore_ascii_case("auto") {
+        let root=app.models_root.read().unwrap().clone().ok_or_else(||AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
+        file_type_from_path(Path::new(&current_path),&root)
+    } else {
+        match requested {
+            "Checkpoint"|"LoRA"|"VAE"|"ControlNet"|"Embedding"|"Upscaler"|"Text Encoder"|"CLIP Vision"|"IP-Adapter"|"Other" => requested.to_string(),
+            _ => return Err(AppError::Invalid("Unsupported model type".into())),
+        }
+    };
+    let locked=if requested.eq_ignore_ascii_case("auto"){0}else{1};
+    c.execute("UPDATE models SET model_type=?2,model_type_user_modified=?3,updated_at=?4 WHERE id=?1",params![id,next_type,locked,now()])?;
     let rec=model_by_id(&c,id)?;
     let _=handle.emit("models-changed",());
     Ok(rec)
@@ -1309,7 +1333,7 @@ pub fn run() {
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,set_model_tags,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,set_model_tags,set_model_type,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
@@ -1490,5 +1514,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tag_lock_column, 1);
+
+        let type_lock_column: i64 = second
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='model_type_user_modified'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(type_lock_column, 1);
     }
 }
