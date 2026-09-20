@@ -1888,7 +1888,7 @@ fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult
 }
 
 #[tauri::command]
-async fn delete_model(app:State<'_, AppStateInner>, handle:AppHandle, id:i64)->AppResult<()> {
+async fn delete_model_inner(app: &AppStateInner, handle: AppHandle, id: i64) -> AppResult<()> {
     let _guard=app.cache_lock.lock().await;
     let root = app.models_root.read().unwrap().clone()
         .ok_or_else(|| AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
@@ -1950,6 +1950,14 @@ async fn delete_model(app:State<'_, AppStateInner>, handle:AppHandle, id:i64)->A
     Ok(())
 }
 
+#[tauri::command]
+async fn delete_model(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+) -> AppResult<()> {
+    delete_model_inner(app.inner(), handle, id).await
+}
 #[tauri::command]
 fn set_model_type(app:State<AppStateInner>, handle:AppHandle, id:i64, model_type:String)->AppResult<ModelRecord>{
     let requested=model_type.trim();
