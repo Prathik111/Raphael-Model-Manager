@@ -89,6 +89,7 @@ struct ModelRecord {
     source_hash: Option<String>,
     thumbnail_path: Option<String>,
     cover_path: Option<String>,
+    cover_source_image_id: Option<i64>,
     cover_position_x: f64,
     cover_position_y: f64,
     downloaded_at: i64,
@@ -324,6 +325,7 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
         cover_path TEXT,
         cover_position_x REAL NOT NULL DEFAULT 50,
         cover_position_y REAL NOT NULL DEFAULT 50,
+        cover_source_image_id INTEGER,
         downloaded_at INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_models_type ON models(model_type);
@@ -358,6 +360,8 @@ fn open_db(app_data: &Path) -> AppResult<Connection> {
     if has_cover_x==0 { c.execute("ALTER TABLE models ADD COLUMN cover_position_x REAL NOT NULL DEFAULT 50",[])?; }
     let has_cover_y:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_position_y'",[],|r|r.get(0))?;
     if has_cover_y==0 { c.execute("ALTER TABLE models ADD COLUMN cover_position_y REAL NOT NULL DEFAULT 50",[])?; }
+    let has_cover_source_image_id:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_source_image_id'",[],|r|r.get(0))?;
+    if has_cover_source_image_id==0 { c.execute("ALTER TABLE models ADD COLUMN cover_source_image_id INTEGER",[])?; }
     let has_downloaded_at:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='downloaded_at'",[],|r|r.get(0))?;
     if has_downloaded_at==0 {
         c.execute("ALTER TABLE models ADD COLUMN downloaded_at INTEGER NOT NULL DEFAULT 0",[])?;
@@ -462,10 +466,10 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
         creator:r.get(13)?, description:r.get(14)?, tags:serde_json::from_str(&tags).unwrap_or_default(),
         activation_prompts:serde_json::from_str(&activ).unwrap_or_default(), source_hash:r.get(17)?,
         thumbnail_path:r.get(18)?, updated_at:r.get(19)?, cover_path:r.get(20)?,
-        cover_position_x:r.get(21)?, cover_position_y:r.get(22)?, downloaded_at:r.get(23)?
+        cover_source_image_id:r.get(21)?, cover_position_x:r.get(22)?, cover_position_y:r.get(23)?, downloaded_at:r.get(24)?
     })
 }
-const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,thumbnail_path,updated_at,cover_path,cover_position_x,cover_position_y,downloaded_at FROM models";
+const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,thumbnail_path,updated_at,cover_path,cover_source_image_id,cover_position_x,cover_position_y,downloaded_at FROM models";
 fn model_by_id(c: &Connection, id: i64) -> AppResult<ModelRecord> {
     Ok(c.query_row(&format!("{MODEL_SELECT} WHERE id=?1"), [id], model_from_row)?)
 }
@@ -1256,7 +1260,7 @@ fn set_model_custom_cover(
     let target = copy_custom_cover(&app, id, &source)?;
     let c = open_db(&app.app_data)?;
     c.execute(
-        "UPDATE models SET cover_path=?2,cover_position_x=50,cover_position_y=50,updated_at=?3 WHERE id=?1",
+        "UPDATE models SET cover_path=?2,cover_source_image_id=NULL,cover_position_x=50,cover_position_y=50,updated_at=?3 WHERE id=?1",
         params![id, target.to_string_lossy().to_string(), now()],
     )?;
     let rec = model_by_id(&c, id)?;
@@ -1284,7 +1288,7 @@ fn reset_model_cover(
 
     let c = open_db(&app.app_data)?;
     c.execute(
-        "UPDATE models SET cover_path=NULL,cover_position_x=50,cover_position_y=50,updated_at=?2 WHERE id=?1",
+        "UPDATE models SET cover_path=NULL,cover_source_image_id=NULL,cover_position_x=50,cover_position_y=50,updated_at=?2 WHERE id=?1",
         params![id, now()],
     )?;
     let rec = model_by_id(&c, id)?;
@@ -1337,8 +1341,8 @@ fn set_model_cover_from_image(
 
     let c = open_db(&app.app_data)?;
     c.execute(
-        "UPDATE models SET cover_path=?2,cover_position_x=50,cover_position_y=50,updated_at=?3 WHERE id=?1",
-        params![id, new_cover.to_string_lossy().to_string(), now()],
+        "UPDATE models SET cover_path=?2,cover_source_image_id=?3,cover_position_x=50,cover_position_y=50,updated_at=?4 WHERE id=?1",
+        params![id, new_cover.to_string_lossy().to_string(), image_id, now()],
     )?;
     let rec = model_by_id(&c, id)?;
     let _ = handle.emit("models-changed", ());
