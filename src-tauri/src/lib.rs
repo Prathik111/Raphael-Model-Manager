@@ -2812,7 +2812,7 @@ async fn refresh_model_civitai(
 
     let _ = handle.emit("models-changed", ());
     drop(_guard);
-    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await?;
+    sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None, true, true).await?;
     Ok(rec)
 }
 #[tauri::command]
