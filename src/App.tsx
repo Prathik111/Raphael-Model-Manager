@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, fileUrl, subscribeToModelChanges } from './tauri';
-import type { AppState, CivitaiImportPreview, DownloadProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
+import { api, fileUrl, subscribeToExamplesRefresh, subscribeToModelChanges } from './tauri';
+import type { AppState, CivitaiImportPreview, DownloadProgress, ExamplesRefreshProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
 
 const TYPES: Array<{ key: ModelType | 'All'; label: string }> = [
   { key: 'All', label: 'ALL' }, { key: 'Checkpoint', label: 'CHECKPOINTS' }, { key: 'LoRA', label: 'LORAS' },
@@ -108,10 +108,16 @@ function Setup({ onReady }: { onReady: (state: AppState)=>void }) {
 function SettingsOverlay({
   thumbnailFit,
   onThumbnailFitChange,
+  progress,
+  running,
+  onRefreshExamples,
   onClose,
 }: {
   thumbnailFit: ThumbnailFit;
   onThumbnailFitChange: (fit: ThumbnailFit) => void;
+  progress: ExamplesRefreshProgress | null;
+  running: boolean;
+  onRefreshExamples: () => Promise<void>;
   onClose: () => void;
 }) {
   const [folderBusy, setFolderBusy] = useState(false);
@@ -279,6 +285,32 @@ function SettingsOverlay({
         </section>
 
         <section className="settings-section">
+          <div className="section-head">CIVITAI EXAMPLE CACHE</div>
+          <p className="settings-copy">Fetches the featured example images from the five newest Civitai versions for every linked model and rebuilds their local thumbnails.</p>
+          <button className="primary-btn" onClick={() => void onRefreshExamples()} disabled={running}>
+            {running ? 'REFRESHING…' : 'REFRESH ALL EXAMPLES'}
+          </button>
+          {progress ? (() => {
+            const overall = progress.total > 0 ? Math.min(100, (progress.current / progress.total) * 100) : 0;
+            const versionTotal = progress.version_total || 0;
+            const versionCurrent = Math.min(progress.version_current || 0, versionTotal || 0);
+            return <div className="examples-refresh-progress">
+              <div className="examples-refresh-head">
+                <span>{progress.model_name || 'ALL LINKED MODELS'}</span>
+                <span>{progress.total ? `${progress.current}/${progress.total} MODELS` : 'NO LINKED MODELS'}</span>
+              </div>
+              <div className="examples-refresh-track"><div className="examples-refresh-fill" style={{width: `${overall}%`}}/></div>
+              <div className="examples-refresh-meta">
+                <span>{versionTotal ? `VERSION ${versionCurrent}/${versionTotal}` : 'VERSIONS —'}</span>
+                <span>{progress.images_saved} EXAMPLES</span>
+              </div>
+              <div className="examples-refresh-status">{progress.status}</div>
+              {progress.error ? <div className="examples-refresh-error">{progress.error}</div> : null}
+            </div>;
+          })() : null}
+        </section>
+
+        <section className="settings-section">
           <div className="section-head">DOWNLOAD CONCURRENCY</div>
           <p className="settings-download-copy">Controls how many model files Raphael downloads at the same time. Additional installs stay queued and start automatically as slots open.</p>
           <div className="settings-parallel-row">
@@ -357,7 +389,7 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
   const [busyImage, setBusyImage] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  if (!images.length) return <div className="empty-inline">No cached Civitai images yet.</div>;
+  if (!images.length) return <div className="empty-inline">No cached featured examples yet.</div>;
 
   const choose = async (imageId: number) => {
     if (busyImage !== null) return;
@@ -743,6 +775,8 @@ function App() {
   const [coverEditorOpen,setCoverEditorOpen]=useState(false);
   const [thumbnailFit,setThumbnailFit]=useState<ThumbnailFit>(initialThumbnailFit);
   const [downloadProgress,setDownloadProgress]=useState<DownloadProgress[]>([]);
+  const [examplesRefreshProgress,setExamplesRefreshProgress]=useState<ExamplesRefreshProgress|null>(null);
+  const [examplesRefreshRunning,setExamplesRefreshRunning]=useState(false);
   const [importClosing,setImportClosing]=useState(false);
   useEffect(()=>{window.localStorage.setItem(THUMBNAIL_FIT_KEY,thumbnailFit);},[thumbnailFit]);
 
@@ -758,6 +792,26 @@ function App() {
     const timer = window.setInterval(() => void pull(), 450);
     return () => { disposed = true; window.clearInterval(timer); };
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let stop: undefined | (() => void);
+    subscribeToExamplesRefresh(progress => {
+      if (disposed) return;
+      setExamplesRefreshProgress(progress);
+      setExamplesRefreshRunning(!progress.done);
+      if (progress.done && selectedId != null) {
+        void api.getImages(selectedId, 200).then(setImages).catch(() => {});
+      }
+    }).then(unlisten => {
+      if (disposed) unlisten();
+      else stop = unlisten;
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      stop?.();
+    };
+  }, [selectedId]);
 
   const selected = models.find(m=>m.id===selectedId) || null;
   const clearDownload = async (taskId: string) => {
@@ -844,12 +898,11 @@ function App() {
   useEffect(()=>{
     if(!selected){setImages([]);setGalleryHasMore(false);setGalleryFetchBusy(false);return;}
     const modelId=selected.id;
-    setGalleryHasMore(true);
+    setGalleryHasMore(false);
     setGalleryFetchBusy(false);
-    galleryTargetRef.current=20;
-    api.getImages(modelId,20).then(setImages).catch(()=>setImages([]));
-    void (async()=>{try{const more=await api.syncModelGallery(modelId,20);if(selectedId===modelId)setGalleryHasMore(more);}catch{}})();
-    const timer=window.setInterval(()=>api.getImages(modelId,galleryTargetRef.current).then(setImages).catch(()=>{}),2000);
+    galleryTargetRef.current=200;
+    api.getImages(modelId,200).then(setImages).catch(()=>setImages([]));
+    const timer=window.setInterval(()=>api.getImages(modelId,200).then(setImages).catch(()=>{}),2000);
     return ()=>window.clearInterval(timer);
   },[selectedId, selected?.civitai_model_id]);
   useEffect(()=>{const t=setTimeout(()=>refresh(),180); return ()=>clearTimeout(t);},[query,type,sort,activeTags]);
@@ -857,6 +910,22 @@ function App() {
   if(!state.models_root) return <><Background/><Setup onReady={s=>{setState(s); refresh();}}/></>;
   const doImport = async()=>{ if(!importUrl.trim()) return; setBusy(true); setImportError(null); try { const result=await api.importCivitai(importUrl.trim()); const nextType=civitaiTypeToModelType(result.model.type); setImportType(nextType); setCustomDownloadPath(false); setPreview(result); setDownloadPath(defaultImportDirectory(state.models_root,nextType) || result.target_directory); } catch (e) { setImportError(String(e)); } finally {setBusy(false);} };
   const install = async()=>{ if(!importUrl.trim()) return; setBusy(true); setImportError(null); try { await api.installCivitai(importUrl.trim(),customDownloadPath ? downloadPath : undefined,importType); setBusy(false); closeImport(); await refresh(); } catch (e) { setImportError(String(e)); setBusy(false); } };
+  const refreshAllExamples = async()=>{
+    if (examplesRefreshRunning) return;
+    setExamplesRefreshRunning(true);
+    setExamplesRefreshProgress({current:0,total:0,model_id:null,model_name:null,version_current:0,version_total:5,images_saved:0,status:'Starting featured example refresh',done:false,error:null});
+    try {
+      await api.refreshAllExamples();
+    } catch (e) {
+      setExamplesRefreshRunning(false);
+      setExamplesRefreshProgress(p=>({
+        ...(p || {current:0,total:0,model_id:null,model_name:null,version_current:0,version_total:0,images_saved:0,status:'',done:true,error:null}),
+        status:'Could not start featured example refresh',
+        done:true,
+        error:String(e),
+      }));
+    }
+  };
   const onFetchMore = async()=>{ if(!selected || galleryFetchBusy || !galleryHasMore) return; const modelId=selected.id; const target=images.length+10; galleryTargetRef.current=target; setGalleryFetchBusy(true); try { const more=await api.syncModelGallery(modelId,target); const next=await api.getImages(modelId,target); setImages(next); setGalleryHasMore(more); } catch { } finally { setGalleryFetchBusy(false); } };
   const handleBulkLinkFile = async(file: File)=>{
     setBulkBusy(true);
@@ -892,7 +961,7 @@ function App() {
       {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} galleryHasMore={galleryHasMore} galleryFetchBusy={galleryFetchBusy} onFetchMore={onFetchMore} onRefresh={async()=>{await api.refreshModel(selected.id); await refresh();}} onLinkCivitai={async(url)=>{await api.linkModelCivitai(selected.id,url); await refresh();}} onSaveTags={async(tags)=>{await api.setModelTags(selected.id,tags); await refresh();}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)} onChooseThumbnail={async imageId=>{const updated=await api.setModelCoverFromImage(selected.id,imageId); setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
       {selected && coverEditorOpen && <CoverEditorOverlay model={selected} onClose={()=>setCoverEditorOpen(false)} onUpdated={updated=>{setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
     </div>
-    {settingsOpen && <SettingsOverlay thumbnailFit={thumbnailFit} onThumbnailFitChange={setThumbnailFit} onClose={()=>setSettingsOpen(false)}/>}
+    {settingsOpen && <SettingsOverlay thumbnailFit={thumbnailFit} onThumbnailFitChange={setThumbnailFit} progress={examplesRefreshProgress} running={examplesRefreshRunning} onRefreshExamples={refreshAllExamples} onClose={()=>setSettingsOpen(false)}/>} 
     {(preview || importUrl) && <div className={"modal-backdrop" + (importClosing ? " overlay-leaving" : "")} onClick={()=>{if(!busy) closeImport();}}><div className="import-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">CIVITAI IMPORT</div><h2>INSTALL A MODEL</h2>{!preview || preview.version.id===0 ? <>{importError ? <div className="error-box modal-error">{importError}</div> : null}<div className="import-row"><input value={importUrl} onChange={e=>setImportUrl(e.target.value)} onKeyDown={e=>e.key==='Enter'&&doImport()} placeholder="civitai.com/models/... or civitai.red/models/..." autoFocus/><button className="primary-btn" onClick={doImport} disabled={busy || bulkBusy}>{busy?'ANALYZING…':'ANALYZE'}</button></div><div className="bulk-link-row"><input ref={bulkFileInputRef} className="bulk-link-input" type="file" accept=".txt,text/plain" onChange={e=>{const file=e.target.files?.[0];if(file)void handleBulkLinkFile(file);}}/><button className="text-btn" onClick={()=>bulkFileInputRef.current?.click()} disabled={busy || bulkBusy}>{bulkBusy?'QUEUING LINKS…':'UPLOAD LINK FILE'}</button><span className="bulk-link-status">ONE CIVITAI LINK PER LINE · DOWNLOADS FOLLOW YOUR PARALLEL SETTING</span>{bulkMessage ? <span className="bulk-link-status">{bulkMessage}</span> : null}</div></> : <><div className="import-preview-grid"><div className="preview-image">{preview.thumbnail_path ? <><TypePlaceholder type={importType}/><img src={fileUrl(preview.thumbnail_path)} alt="" onError={(e)=>{e.currentTarget.style.display="none";}}/></> : <TypePlaceholder type={importType}/>}</div><div className="preview-panel"><div className="preview-topline"><span className="type-chip">{importType}</span><span className="source-domain">CIVITAI</span></div><h3>{preview.model.name || preview.version.filename || 'Model'}</h3><div className="preview-meta">{preview.version.base_model || 'Base model unavailable'} · {preview.version.filename || 'Filename automatic'}</div><div className="kv"><span>MODEL FILE</span><b>{preview.version.filename || 'Automatic filename'}</b></div><div className="kv"><span>SIZE</span><b>{preview.version.size_bytes ? fmtBytes(preview.version.size_bytes) : 'Unknown'}</b></div><div className="section-head">LIBRARY TAG</div><div className="import-type-row"><label htmlFor="import-type">CLASSIFY AS</label><select id="import-type" className="import-type-select" value={importType} onChange={e=>{const next=e.target.value as ModelType; setImportType(next); if(!customDownloadPath) setDownloadPath(defaultImportDirectory(state.models_root,next));}} disabled={busy}>{IMPORT_TYPES.map(x=><option key={x} value={x}>{x}</option>)}</select></div><div className="import-type-note">Civitai suggests <b>{preview.model.type || 'Unknown'}</b>; Raphael uses the tag you choose for its library category and default folder.</div><div className="section-head">DOWNLOAD LOCATION</div><div className="destination-box"><div className="destination-path" title={downloadPath}>{downloadPath || defaultImportDirectory(state.models_root,importType) || preview.target_directory}</div><button className="primary-btn small" onClick={async()=>{const next=await api.chooseDirectory(downloadPath || defaultImportDirectory(state.models_root,importType) || preview.target_directory); if(next){setDownloadPath(next);setCustomDownloadPath(true);setImportError(null);}}} disabled={busy || api.isWebApp}>{api.isWebApp ? 'DESKTOP ONLY' : 'BROWSE'}</button></div><div className="destination-note">Choose a folder inside your configured ComfyUI models directory. Changing the tag updates the default folder until you manually browse.</div><div className="section-head">ACTIVATION PROMPTS</div><div className="chips">{preview.version.activation_prompts.map(x=><span key={x}>{x}</span>)}</div></div></div><div className="modal-actions"><button className="text-btn" onClick={closeImport}>BACK</button><button className="primary-btn" onClick={install} disabled={busy}>{busy?'STARTING…':'DOWNLOAD & INSTALL'}</button></div>{importError ? <div className="error-box modal-error">{importError}</div> : null}</>}</div></div>}
   </div>;
 }
