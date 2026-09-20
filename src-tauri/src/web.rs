@@ -904,6 +904,7 @@ pub async fn set_web_app_enabled(
         .await
         .map_err(AppError::Io)?;
 
+    let generation = controller.inner.generation.fetch_add(1, Ordering::AcqRel) + 1;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let url = web_url();
 
@@ -929,6 +930,12 @@ pub async fn set_web_app_enabled(
         let mut shutdown_rx = Some(shutdown_rx);
 
         loop {
+            if !*task_controller.inner.enabled.read().unwrap()
+                || task_controller.inner.generation.load(Ordering::Acquire) != generation
+            {
+                break;
+            }
+
             let router = build_router(task_handle.clone(), task_controller.clone(), web_root.clone());
             let current_shutdown = match shutdown_rx.take() {
                 Some(receiver) => receiver,
@@ -938,26 +945,38 @@ pub async fn set_web_app_enabled(
                 }
             };
 
-            let _ = axum::serve(listener, router)
+            match axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     let _ = current_shutdown.await;
                 })
-                .await;
+                .await
+            {
+                Ok(()) => {
+                    if *task_controller.inner.enabled.read().unwrap() {
+                        eprintln!("Raphael web server listener exited unexpectedly without an error");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Raphael web server listener failed: {error}");
+                }
+            }
 
-            *task_controller.inner.shutdown.lock().unwrap() = None;
-
-            if !*task_controller.inner.enabled.read().unwrap() {
+            if !*task_controller.inner.enabled.read().unwrap()
+                || task_controller.inner.generation.load(Ordering::Acquire) != generation
+            {
                 break;
             }
 
-            // An unexpected listener exit should not leave clients stranded.
-            // Retry the bind while the user still has the web app enabled.
+            *task_controller.inner.shutdown.lock().unwrap() = None;
+
             loop {
-                if !*task_controller.inner.enabled.read().unwrap() {
+                if !*task_controller.inner.enabled.read().unwrap()
+                    || task_controller.inner.generation.load(Ordering::Acquire) != generation
+                {
                     break;
                 }
 
-                tokio::time::sleep(Duration::from_millis(750)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
 
                 match TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], WEB_PORT))).await {
                     Ok(next_listener) => {
@@ -979,11 +998,12 @@ pub async fn set_web_app_enabled(
             }
         }
 
-        *task_controller.inner.shutdown.lock().unwrap() = None;
-        *task_controller.inner.enabled.write().unwrap() = false;
-        *task_controller.inner.url.write().unwrap() = None;
+        if task_controller.inner.generation.load(Ordering::Acquire) == generation {
+            *task_controller.inner.shutdown.lock().unwrap() = None;
+            *task_controller.inner.enabled.write().unwrap() = false;
+            *task_controller.inner.url.write().unwrap() = None;
+        }
     });
-
     Ok(controller.status())
 }
 #[tauri::command]
