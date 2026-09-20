@@ -88,8 +88,13 @@ export const api = {
     command<boolean>('is_civitai_token_set'),
   getStorage: () =>
     command<StorageStats>('get_storage_stats'),
-  getWebAppStatus: () =>
-    command<WebAppStatus>('get_web_app_status'),
+  getWebAppStatus: async () => {
+    if (!isWebApp) return invoke<WebAppStatus>('get_web_app_status');
+    const response = await fetch('/api/status');
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(payload?.error || `Web API status failed: ${response.status}`);
+    return payload as WebAppStatus;
+  },
   setWebAppEnabled: (enabled: boolean) =>
     isWebApp
       ? Promise.reject(new Error('Web app controls are available from the desktop host only.'))
