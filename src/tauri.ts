@@ -12,6 +12,8 @@ import type {
   WebAppStatus,
   ExamplesRefreshProgress,
   ModelImagesResponse,
+  CacheStats,
+  CacheOperationResult,
 } from './types';
 
 export const isWebApp = typeof window !== 'undefined' && !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
@@ -121,6 +123,20 @@ export const api = {
     command<boolean>('is_civitai_token_set'),
   getStorage: () =>
     command<StorageStats>('get_storage_stats'),
+  getCacheStats: () =>
+    command<CacheStats>('get_cache_stats'),
+  setCacheMaxBytes: (maxBytes: number) =>
+    command<CacheStats>('set_cache_max_bytes', { maxBytes }),
+  setCacheLocation: (path: string) =>
+    command<CacheStats>('set_cache_location', { path }),
+  clearCacheImages: () =>
+    command<CacheOperationResult>('clear_cache_images'),
+  clearCompleteCache: () =>
+    command<CacheOperationResult>('clear_complete_cache'),
+  pruneCacheImages: (keepPerModel: number) =>
+    command<CacheOperationResult>('prune_cache_images', { keepPerModel }),
+  cleanCacheOrphans: () =>
+    command<CacheOperationResult>('clean_cache_orphans'),
   getWebAppStatus: async () => {
     if (!isWebApp) return invoke<WebAppStatus>('get_web_app_status');
     const response = await fetch('/api/status');
