@@ -9,7 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     net::{IpAddr, SocketAddr, UdpSocket},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
 };
 use tauri::{path::BaseDirectory, AppHandle, Manager, State};
@@ -20,7 +20,7 @@ use crate::{
     add_subfolder_tags, clear_download_progress, delete_model, get_app_state, get_download_progress, get_library_counts, get_model_images, get_storage_stats,
     get_parallel_downloads, set_parallel_downloads,
     get_tags, install_civitai_model, link_model_civitai, list_models, preview_civitai_import,
-    refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
+    refresh_all_examples, refresh_model_civitai, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
     set_model_tags, set_model_type, sync_model_gallery,
     is_civitai_token_set, AppError, AppResult, CivitaiImportPreview, ModelRecord,
 };
@@ -213,11 +213,9 @@ fn web_url() -> String {
     }
 }
 
-fn validate_cached_file(path: &PathBuf, app_data: &PathBuf) -> AppResult<PathBuf> {
-    let app_data = app_data
-        .canonicalize()
-        .map_err(|e| AppError::Io(e))?;
-    let path = path.canonicalize().map_err(|e| AppError::Io(e))?;
+fn validate_cached_file(path: &Path, app_data: &Path) -> AppResult<PathBuf> {
+    let app_data = app_data.canonicalize().map_err(AppError::Io)?;
+    let path = path.canonicalize().map_err(AppError::Io)?;
     if !path.starts_with(&app_data) || !path.is_file() {
         return Err(AppError::Invalid("Requested file is outside Raphael's cache".into()));
     }
@@ -315,6 +313,9 @@ async fn command_handler(
                 .await
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
+        "refresh_all_examples" => {
+            refresh_all_examples(handle.state(), handle.clone()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        },
         "preview_civitai_import" => {
             let args: UrlArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             preview_civitai_import(handle.state(), args.url)
@@ -341,7 +342,7 @@ async fn command_handler(
         },
         "clear_download_progress" => {
             let args: DownloadProgressArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            clear_download_progress(handle.state(), args.task_id).and_then(|_| Ok(Value::Null))
+            clear_download_progress(handle.state(), args.task_id).map(|_| Value::Null)
         },
         "link_model_civitai" => {
             let args: LinkArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
@@ -423,7 +424,7 @@ pub async fn set_web_app_enabled(
 
     let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], WEB_PORT)))
         .await
-        .map_err(|error| AppError::Io(error))?;
+        .map_err(AppError::Io)?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let url = web_url();

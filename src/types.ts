@@ -19,4 +19,17 @@ export interface DownloadProgress {
   error: string | null;
 }
 
+export interface ExamplesRefreshProgress {
+  current: number;
+  total: number;
+  model_id: number | null;
+  model_name: string | null;
+  version_current: number;
+  version_total: number;
+  images_saved: number;
+  status: string;
+  done: boolean;
+  error: string | null;
+}
+
 export interface WebAppStatus { enabled: boolean; url: string | null; port: number; }

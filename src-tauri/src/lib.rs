@@ -2,7 +2,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use image::imageops::FilterType;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use reqwest::{header, Client};
+use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,6 +23,7 @@ use walkdir::WalkDir;
 mod web;
 
 const API_BASE: &str = "https://civitai.com/api/v1";
+const IMAGE_CDN_BASE: &str = "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA";
 const USER_AGENT: &str = "RaphaelModelManager/0.1.0";
 static DOWNLOAD_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -63,6 +64,7 @@ struct AppStateInner {
     active_download_paths: Arc<Mutex<HashSet<PathBuf>>>,
     active_downloads: Arc<Mutex<usize>>,
     parallel_downloads: Arc<Mutex<usize>>,
+    examples_refresh_lock: Arc<Mutex<bool>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -139,6 +141,20 @@ struct DownloadProgress {
     downloaded_bytes: i64,
     total_bytes: Option<i64>,
     percent: Option<f64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ExamplesRefreshProgress {
+    current: usize,
+    total: usize,
+    model_id: Option<i64>,
+    model_name: Option<String>,
+    version_current: usize,
+    version_total: usize,
+    images_saved: usize,
+    status: String,
+    done: bool,
     error: Option<String>,
 }
 
@@ -567,6 +583,143 @@ async fn ensure_model_thumbnail(app:&AppStateInner, model_id:i64, model:&Value, 
     Ok(None)
 }
 
+fn emit_examples_progress(handle: &AppHandle, progress: ExamplesRefreshProgress) {
+    let _ = handle.emit("examples-refresh-progress", progress);
+}
+
+fn featured_remote_url(image: &Value) -> Option<String> {
+    let raw = image.get("url").and_then(Value::as_str)?.trim();
+    if raw.is_empty() { return None; }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Some(raw.to_string());
+    }
+    let image_id = raw.trim_matches('/');
+    let filename = image.get("name").and_then(Value::as_str).filter(|x| !x.trim().is_empty()).unwrap_or("image.jpg");
+    Some(format!("{IMAGE_CDN_BASE}/{image_id}/original=true/{filename}"))
+}
+
+type FeaturedImageRecord = (i64, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<f64>, Option<String>, Option<i64>, String);
+
+fn featured_extension(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|u| Path::new(u.path()).extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase()))
+        .filter(|x| !x.is_empty() && x.len() <= 8)
+        .unwrap_or_else(|| "jpg".into())
+}
+
+async fn sync_featured_examples_inner(
+    app: AppStateInner,
+    model_id: i64,
+    handle: AppHandle,
+    progress_model: Option<(usize, usize)>,
+) -> AppResult<usize> {
+    let model_record = { let c = open_db(&app.app_data)?; model_by_id(&c, model_id)? };
+    let civitai_id = model_record.civitai_model_id.ok_or_else(|| AppError::Invalid("This model is not linked to Civitai".into()))?;
+    let model_name = model_record.civitai_name.clone().unwrap_or_else(|| model_record.filename.clone());
+
+    let model = api_get(&app, &format!("{API_BASE}/models/{civitai_id}")).await?;
+    let mut versions = model.get("modelVersions").and_then(Value::as_array).cloned().unwrap_or_default();
+    versions.sort_by(|a,b| {
+        let ai=a.get("id").and_then(Value::as_i64).unwrap_or_default();
+        let bi=b.get("id").and_then(Value::as_i64).unwrap_or_default();
+        bi.cmp(&ai)
+    });
+    versions.truncate(5);
+    if versions.is_empty() { return Err(AppError::Api("Civitai returned no model versions".into())); }
+
+    let total_versions=versions.len();
+    let (model_index, model_total)=progress_model.unwrap_or((0,1));
+    let cache=cache_root(&app.app_data).join(civitai_id.to_string());
+    fs::create_dir_all(&cache)?;
+    let staging=cache.join("featured.__staging");
+    let active=cache.join("featured");
+    if staging.exists(){let _=fs::remove_dir_all(&staging);}
+    fs::create_dir_all(&staging)?;
+    let client=civitai_client(&app)?;
+
+    let mut records:Vec<FeaturedImageRecord>=Vec::new();
+    let mut saved_count=0usize;
+
+    for (version_index,summary) in versions.iter().enumerate(){
+        let version_id=summary.get("id").and_then(Value::as_i64).ok_or_else(||AppError::Api("Civitai returned a model version without an ID".into()))?;
+        let version=api_get(&app,&format!("{API_BASE}/model-versions/{version_id}")).await?;
+        let version_name=version.get("name").and_then(Value::as_str).unwrap_or("version");
+        emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index,version_total:total_versions,images_saved:saved_count,status:format!("Fetching featured images from {version_name}"),done:false,error:None});
+
+        let images=version.get("images").and_then(Value::as_array).cloned().unwrap_or_default();
+        for image in images{
+            let image_id=match image.get("id").and_then(Value::as_i64){Some(v)=>v,None=>continue};
+            let remote=match featured_remote_url(&image){Some(v)=>v,None=>continue};
+            let ext=featured_extension(&remote);
+            let version_dir=staging.join(version_id.to_string());
+            fs::create_dir_all(&version_dir)?;
+            let local=version_dir.join(format!("{image_id}.{ext}"));
+            let thumb=version_dir.join(format!("{image_id}_thumb.webp"));
+            if !local.exists(){
+                let mut request=client.get(&remote);
+                if let Some(t)=token(){request=request.bearer_auth(t);}
+                let bytes=request.send().await?.error_for_status()?.bytes().await?;
+                if bytes.is_empty(){continue;}
+                fs::write(&local,&bytes)?;
+            }
+            if !thumb.exists(){
+                let img=image::open(&local).map_err(|e|AppError::Api(format!("Could not decode featured image {image_id}: {e}")))?;
+                let thumb_image=img.thumbnail(420,420);
+                thumb_image.save_with_format(&thumb,image::ImageFormat::WebP).map_err(|e|AppError::Api(format!("Could not create featured thumbnail {image_id}: {e}")))?;
+            }
+            let mut meta=image.clone();
+            if let Some(map)=meta.as_object_mut(){
+                map.insert("featured".into(),json!(true));
+                map.insert("civitai_version_id".into(),json!(version_id));
+                map.insert("civitai_version_name".into(),json!(version_name));
+            }
+            let prompt=meta.get("meta").and_then(|m|parse_meta(m,"prompt"));
+            let negative_prompt=meta.get("meta").and_then(|m|parse_meta(m,"negativePrompt").or_else(||parse_meta(m,"Negative prompt")));
+            let sampler=meta.get("meta").and_then(|m|parse_meta(m,"sampler").or_else(||parse_meta(m,"Sampler")));
+            let steps=meta.get("meta").and_then(|m|m.get("steps")).and_then(Value::as_i64);
+            let cfg=meta.get("meta").and_then(|m|m.get("cfgScale").or_else(||m.get("cfg"))).and_then(Value::as_f64);
+            let seed=meta.get("meta").and_then(|m|m.get("seed")).and_then(Value::as_i64);
+            let width=image.get("width").and_then(Value::as_i64);
+            let height=image.get("height").and_then(Value::as_i64);
+            let final_local=active.join(version_id.to_string()).join(format!("{image_id}.{ext}")).to_string_lossy().to_string();
+            let final_thumb=active.join(version_id.to_string()).join(format!("{image_id}_thumb.webp")).to_string_lossy().to_string();
+            records.push((image_id,Some(final_local),Some(final_thumb),width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into())));
+            saved_count+=1;
+        }
+        emit_examples_progress(&handle,ExamplesRefreshProgress{current:model_index,total:model_total,model_id:Some(model_id),model_name:Some(model_name.clone()),version_current:version_index+1,version_total:total_versions,images_saved:saved_count,status:format!("Saved featured examples from {version_name}"),done:false,error:None});
+    }
+
+    if records.is_empty(){
+        let _=fs::remove_dir_all(&staging);
+        return Err(AppError::Api("Civitai returned no featured images for the newest five versions".into()));
+    }
+
+    let backup=cache.join("featured.__backup");
+    if backup.exists(){let _=fs::remove_dir_all(&backup);}
+    if active.exists(){fs::rename(&active,&backup)?;}
+    fs::rename(&staging,&active)?;
+
+    let db_result:AppResult<()>=(||{
+        let mut c=open_db(&app.app_data)?;
+        let tx=c.transaction()?;
+        tx.execute("DELETE FROM images WHERE model_id=?1 AND meta_json LIKE '%\"featured\":true%'", [model_id])?;
+        for record in &records{
+            tx.execute(
+                "INSERT INTO images(model_id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![model_id,record.0,record.1,record.2,record.3,record.4,record.5,record.6,record.7,record.8,record.9,record.10,record.11],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+
+    match db_result{
+        Ok(())=>{if backup.exists(){let _=fs::remove_dir_all(&backup);} let _=handle.emit("models-changed",()); Ok(saved_count)}
+        Err(error)=>{let _=fs::remove_dir_all(&active);if backup.exists(){let _=fs::rename(&backup,&active);}Err(error)}
+    }
+}
+
 #[tauri::command]
 fn get_app_state(app: State<AppStateInner>) -> AppResult<AppStateResponse> {
     let c=open_db(&app.app_data)?; let root=setting(&c,"models_root")?; let storage=storage_stats_inner(&app.app_data)?; Ok(AppStateResponse{models_root:root,storage})
@@ -807,12 +960,10 @@ fn delete_model(app:State<AppStateInner>, handle:AppHandle, id:i64)->AppResult<(
     }
 
     for (local_path, thumb_path) in image_paths {
-        for cached in [local_path, thumb_path] {
-            if let Some(cached) = cached {
-                let cached_path = PathBuf::from(cached);
-                if cached_path.starts_with(&app.app_data) && cached_path.is_file() {
-                    let _ = fs::remove_file(cached_path);
-                }
+        for cached in [local_path, thumb_path].into_iter().flatten() {
+            let cached_path = PathBuf::from(cached);
+            if cached_path.starts_with(&app.app_data) && cached_path.is_file() {
+                let _ = fs::remove_file(cached_path);
             }
         }
     }
@@ -1033,7 +1184,7 @@ fn set_model_cover_from_image(
 fn get_model_images(app:State<AppStateInner>, id:i64, limit:Option<i64>)->AppResult<Vec<ModelImage>>{
     let c=open_db(&app.app_data)?;
     let limit=limit.unwrap_or(20).clamp(1,200);
-    let mut stmt=c.prepare("SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json FROM images WHERE model_id=?1 ORDER BY id LIMIT ?2")?;
+    let mut stmt=c.prepare("SELECT id,civitai_image_id,local_path,thumbnail_path,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,meta_json FROM images WHERE model_id=?1 AND meta_json LIKE '%\"featured\":true%' ORDER BY id LIMIT ?2")?;
     let rows=stmt.query_map(params![id,limit],|r|Ok(ModelImage{id:r.get(0)?,civitai_image_id:r.get(1)?,local_path:r.get(2)?,thumbnail_path:r.get(3)?,width:r.get(4)?,height:r.get(5)?,prompt:r.get(6)?,negative_prompt:r.get(7)?,steps:r.get(8)?,cfg:r.get(9)?,sampler:r.get(10)?,seed:r.get(11)?,meta_json:r.get(12)?}))?;
     Ok(rows.filter_map(Result::ok).collect())
 }
@@ -1047,11 +1198,12 @@ async fn preview_civitai_import(app:State<'_,AppStateInner>,url:String)->AppResu
     Ok(CivitaiImportPreview{model:json!({"id":model.get("id"),"name":model.get("name"),"type":typ,"description":model.get("description"),"tags":model.get("tags"),"creator":model.get("creator").and_then(|v|v.get("username")),"thumbnail_path":thumb}),version:json!({"id":version.get("id"),"name":version.get("name"),"base_model":version.get("baseModel"),"download_url":dl,"filename":filename,"size_bytes":size,"sha256":sha256,"activation_prompts":activation}),target_directory:target.to_string_lossy().to_string(),thumbnail_path:thumb,images_count_hint:version.get("images").and_then(Value::as_array).map(|x|x.len() as i64)})
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_file(
     app: &AppStateInner,
     url: &str,
     target_dir: &Path,
-    preferred_name: &str,
+    _preferred_name: &str,
     expected_sha256: Option<&str>,
     progress: Arc<Mutex<Vec<DownloadProgress>>>,
     task_id: &str,
@@ -1076,7 +1228,6 @@ async fn download_file(
         p.error = None;
     });
 
-    let path = path;
     let partial = path.with_extension(format!(
         "{}.part",
         path.extension().and_then(|x| x.to_str()).unwrap_or("bin")
@@ -1380,8 +1531,7 @@ async fn sync_gallery_inner(
         let c = open_db(&app.app_data)?;
         c.query_row("SELECT COUNT(*) FROM images WHERE model_id=?1", [model_id], |r| r.get(0))?
     };
-    let mut has_more = false;
-    loop {
+    let has_more = loop {
         let mut url = format!("{API_BASE}/images?modelId={civitai_id}&limit=200&withMeta=true");
         if let Some(c) = &cursor { url.push_str("&cursor="); url.push_str(&urlencoding::encode(c)); }
         let mut req = client.get(&url);
@@ -1460,10 +1610,14 @@ async fn sync_gallery_inner(
             if !existed { cached_count += 1; }
         }
         let next_cursor = body.metadata.and_then(|m| m.get("nextCursor").and_then(Value::as_str).map(str::to_string));
-        has_more = next_cursor.is_some();
-        if cached_count >= target_count || next_cursor.is_none() { break; }
+        if cached_count >= target_count {
+            break next_cursor.is_some();
+        }
+        if next_cursor.is_none() {
+            break false;
+        }
         cursor = next_cursor;
-    }
+    };
     if let Ok(c) = open_db(&app.app_data) {
         let bytes = dir_size(&cache_root(&app.app_data));
         let _ = put_setting(&c, "cache_bytes", &bytes.to_string());
@@ -1536,7 +1690,7 @@ async fn link_model_civitai(
         )?;
         model_by_id(&c,id)?
     };
-    sync_gallery_inner(app.inner().clone(),id,handle.clone(),20).await?;
+    let _ = sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await;
     let _=handle.emit("models-changed",());
     Ok(rec)
 }
@@ -1605,10 +1759,59 @@ async fn refresh_model_civitai(
         model_by_id(&c, id)?
     };
 
-    let _ = sync_gallery_inner(app.inner().clone(), id, handle.clone(), 20).await;
+    let _ = sync_featured_examples_inner(app.inner().clone(), id, handle.clone(), None).await;
     let _ = handle.emit("models-changed", ());
     Ok(rec)
 }
+#[tauri::command]
+fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResult<()> {
+    {
+        let mut running=app.examples_refresh_lock.lock().map_err(|_|AppError::Invalid("Featured example refresh state is unavailable".into()))?;
+        if *running { return Err(AppError::Invalid("Featured example refresh is already running".into())); }
+        *running=true;
+    }
+
+    let state=app.inner().clone();
+    let refresh_lock=state.examples_refresh_lock.clone();
+    tauri::async_runtime::spawn(async move{
+        let models:Vec<(i64,String)>=match open_db(&state.app_data).and_then(|c|{
+            let mut stmt=c.prepare("SELECT id,COALESCE(civitai_name,filename) FROM models WHERE civitai_model_id IS NOT NULL ORDER BY id")?;
+            let rows=stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            Ok(rows.filter_map(Result::ok).collect())
+        }){
+            Ok(v)=>v,
+            Err(e)=>{
+                emit_examples_progress(&handle,ExamplesRefreshProgress{current:0,total:0,model_id:None,model_name:None,version_current:0,version_total:0,images_saved:0,status:"Could not read linked models".into(),done:true,error:Some(e.to_string())});
+                *refresh_lock.lock().unwrap()=false;
+                return;
+            }
+        };
+        let total=models.len();
+        emit_examples_progress(&handle,ExamplesRefreshProgress{current:0,total,model_id:None,model_name:None,version_current:0,version_total:if total>0{5}else{0},images_saved:0,status:if total==0{"No Civitai-linked models found".into()}else{"Starting featured example refresh".into()},done:total==0,error:None});
+        if total==0{*refresh_lock.lock().unwrap()=false;return;}
+
+        let mut saved_total=0usize;
+        let mut first_error=None;
+        for (index,(local_id,name)) in models.iter().enumerate(){
+            match sync_featured_examples_inner(state.clone(),*local_id,handle.clone(),Some((index,total))).await{
+                Ok(saved)=>{
+                    saved_total+=saved;
+                    emit_examples_progress(&handle,ExamplesRefreshProgress{current:index+1,total,model_id:Some(*local_id),model_name:Some(name.clone()),version_current:5,version_total:5,images_saved:saved_total,status:format!("Finished {name} ({saved} examples)"),done:false,error:None});
+                }
+                Err(e)=>{
+                    let msg=e.to_string();
+                    if first_error.is_none(){first_error=Some(msg.clone());}
+                    emit_examples_progress(&handle,ExamplesRefreshProgress{current:index+1,total,model_id:Some(*local_id),model_name:Some(name.clone()),version_current:0,version_total:5,images_saved:saved_total,status:format!("Failed {name}"),done:false,error:Some(msg)});
+                }
+            }
+        }
+        emit_examples_progress(&handle,ExamplesRefreshProgress{current:total,total,model_id:None,model_name:None,version_current:0,version_total:0,images_saved:saved_total,status:format!("Finished refreshing {total} model{}",if total==1{""}else{"s"}),done:true,error:first_error});
+        let _=handle.emit("models-changed",());
+        *refresh_lock.lock().unwrap()=false;
+    });
+    Ok(())
+}
+
 #[tauri::command]
 fn get_download_progress(app: State<AppStateInner>) -> Vec<DownloadProgress> {
     app.downloads.lock().map(|g| g.clone()).unwrap_or_default()
@@ -1788,11 +1991,12 @@ pub fn run() {
                 active_download_paths:Arc::new(Mutex::new(HashSet::new())),
                 active_downloads:Arc::new(Mutex::new(0)),
                 parallel_downloads:Arc::new(Mutex::new(parallel)),
+                examples_refresh_lock:Arc::new(Mutex::new(false)),
             };app.manage(state.clone());
             if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
@@ -1812,6 +2016,7 @@ mod tests {
             active_download_paths: Arc::new(Mutex::new(HashSet::new())),
             active_downloads: Arc::new(Mutex::new(0)),
             parallel_downloads: Arc::new(Mutex::new(3)),
+            examples_refresh_lock: Arc::new(Mutex::new(false)),
         }
     }
 

@@ -11,6 +11,7 @@ import type {
   LibraryCounts,
   TagRecord,
   WebAppStatus,
+  ExamplesRefreshProgress,
 } from './types';
 
 export const isWebApp = typeof window !== 'undefined' && !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
@@ -84,6 +85,8 @@ export const api = {
     command<ModelImage[]>('get_model_images', { id, limit }),
   syncModelGallery: (id: number, targetCount = 20) =>
     command<boolean>('sync_model_gallery', { id, targetCount }),
+  refreshAllExamples: () =>
+    command<void>('refresh_all_examples'),
   importCivitai: (url: string) =>
     command<CivitaiImportPreview>('preview_civitai_import', { url }),
   installCivitai: (
@@ -135,4 +138,11 @@ export async function subscribeToModelChanges(cb: () => void) {
     return () => window.clearInterval(timer);
   }
   return listen('models-changed', cb);
+}
+
+export async function subscribeToExamplesRefresh(cb: (progress: ExamplesRefreshProgress) => void) {
+  if (isWebApp) {
+    return () => {};
+  }
+  return listen<ExamplesRefreshProgress>('examples-refresh-progress', event => cb(event.payload));
 }
