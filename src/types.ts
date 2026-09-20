@@ -32,4 +32,9 @@ export interface ExamplesRefreshProgress {
   error: string | null;
 }
 
+export interface ModelImagesResponse {
+  images: ModelImage[];
+  has_more: boolean;
+}
+
 export interface WebAppStatus { enabled: boolean; url: string | null; port: number; }
