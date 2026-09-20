@@ -3343,11 +3343,16 @@ mod tests {
         let source = temp.path().join("source.png");
         let image = image::RgbImage::from_pixel(2, 2, image::Rgb([0, 255, 0]));
         image.save(&source).unwrap();
+        let existing = target.join("covers/model_7.png");
+        fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        fs::write(&existing, b"old-cover").unwrap();
 
         let state = test_state(app_data.clone(), models_root);
         let copied = copy_custom_cover(&state, 7, &source).unwrap();
         assert!(copied.starts_with(target.join("covers")));
         assert!(copied.is_file());
+        assert_ne!(copied, existing);
+        assert_eq!(fs::read(&existing).unwrap(), b"old-cover");
     }
 
     #[test]
