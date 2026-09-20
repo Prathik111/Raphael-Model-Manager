@@ -1170,7 +1170,9 @@ function App() {
         const currentId = selectedIdRef.current;
         if (currentId != null) {
           void api.getImages(currentId, 1000).then(result => {
-            setImages(result.images);
+            if (selectedIdRef.current === currentId) {
+              setImages(result.images);
+            }
           }).catch(() => {});
         }
       }
@@ -1276,6 +1278,8 @@ function App() {
       return;
     }
     const modelId=selected.id;
+    // Never keep the previous model's gallery visible while the new model loads.
+    setImages([]);
     setGalleryHasMore(false);
     setGalleryFetchBusy(false);
     setImageViewerId(null);
