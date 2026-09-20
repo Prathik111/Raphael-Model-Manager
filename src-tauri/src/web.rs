@@ -74,7 +74,6 @@ impl WebTaskStore {
         &self,
         operation: std::pin::Pin<Box<dyn Future<Output = AppResult<Value>> + Send>>,
     ) -> String {
-    {
         self.prune();
         let task_id = format!("web-{}", WEB_TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
         let status = WebTaskStatus {
