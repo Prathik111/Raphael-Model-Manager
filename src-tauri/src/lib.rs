@@ -62,6 +62,7 @@ struct AppStateInner {
     scan_lock: Arc<Mutex<()>>,
     downloads: Arc<Mutex<Vec<DownloadProgress>>>,
     active_download_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    active_download_versions: Arc<Mutex<HashSet<i64>>>,
     active_downloads: Arc<Mutex<usize>>,
     parallel_downloads: Arc<Mutex<usize>>,
     examples_refresh_state: Arc<Mutex<ExamplesRefreshState>>,
@@ -230,6 +231,11 @@ fn push_download_progress(
         .lock()
         .map_err(|_| AppError::Invalid("Download state is unavailable".into()))?;
     guard.push(progress);
+    const MAX_DOWNLOAD_HISTORY: usize = 100;
+    if guard.len() > MAX_DOWNLOAD_HISTORY {
+        let excess = guard.len() - MAX_DOWNLOAD_HISTORY;
+        guard.drain(0..excess);
+    }
     Ok(())
 }
 
@@ -2082,6 +2088,32 @@ async fn install_civitai_model(
         .to_string();
     let reserved_path = reserve_download_path(&app.active_download_paths, &target, &safe_name)?;
 
+    let version_reserved = if let Some(vid) = version_id {
+        let mut versions = app.active_download_versions
+            .lock()
+            .map_err(|_| AppError::Invalid("Download version state is unavailable".into()))?;
+        if versions.contains(&vid) {
+            release_download_path(&app.active_download_paths, &reserved_path);
+            let progress = DownloadProgress {
+                visible: true,
+                task_id: Some(task_id.clone()),
+                filename: safe_name.clone(),
+                phase: "ALREADY QUEUED".into(),
+                downloaded_bytes: 0,
+                total_bytes: file_size,
+                percent: Some(100.0),
+                error: None,
+            };
+            push_download_progress(&app.downloads, progress.clone())?;
+            let _ = handle.emit("download-progress", progress.clone());
+            return Ok(progress);
+        }
+        versions.insert(vid);
+        Some(vid)
+    } else {
+        None
+    };
+
     let initial = DownloadProgress {
         visible: true,
         task_id: Some(task_id.clone()),
@@ -2094,6 +2126,11 @@ async fn install_civitai_model(
     };
     if let Err(error) = push_download_progress(&app.downloads, initial.clone()) {
         release_download_path(&app.active_download_paths, &reserved_path);
+        if let Some(vid) = version_reserved {
+            if let Ok(mut versions) = app.active_download_versions.lock() {
+                versions.remove(&vid);
+            }
+        }
         return Err(error);
     }
     let _ = handle.emit("download-progress", initial.clone());
@@ -2101,6 +2138,7 @@ async fn install_civitai_model(
     let state = app.inner().clone();
     let task_progress = state.downloads.clone();
     let task_active_paths = state.active_download_paths.clone();
+    let task_active_versions = state.active_download_versions.clone();
     let task_handle = handle.clone();
     tauri::async_runtime::spawn(async move {
         let result = async {
@@ -2140,9 +2178,13 @@ async fn install_civitai_model(
             let thumb = match mid {
                 Some(model_id) => {
                     let _guard=state.cache_lock.lock().await;
-                    let result=ensure_model_thumbnail(&state, model_id, &model, &version, &url).await?;
-                    let _=enforce_cache_limit_inner(&state.app_data);
-                    result
+                    match ensure_model_thumbnail(&state, model_id, &model, &version, &url).await {
+                        Ok(result) => {
+                            let _=enforce_cache_limit_inner(&state.app_data);
+                            result
+                        },
+                        Err(_) => None,
+                    }
                 },
                 None => None
             };
@@ -2233,13 +2275,12 @@ async fn install_civitai_model(
             progress.clone()
         };
         release_download_path(&task_active_paths, &reserved_path);
+        if let Some(vid) = version_reserved {
+            if let Ok(mut versions) = task_active_versions.lock() {
+                versions.remove(&vid);
+            }
+        }
         let _ = task_handle.emit("download-progress", final_progress);
-        let clear_progress = task_progress.clone();
-        let clear_task_id = task_id.clone();
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            let _ = remove_download_progress(&clear_progress, &clear_task_id);
-        });
         let _ = task_handle.emit("models-changed", ());
     });
 
@@ -2902,6 +2943,7 @@ mod tests {
             scan_lock: Arc::new(Mutex::new(())),
             downloads: Arc::new(Mutex::new(Vec::new())),
             active_download_paths: Arc::new(Mutex::new(HashSet::new())),
+            active_download_versions: Arc::new(Mutex::new(HashSet::new())),
             active_downloads: Arc::new(Mutex::new(0)),
             parallel_downloads: Arc::new(Mutex::new(3)),
             examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
