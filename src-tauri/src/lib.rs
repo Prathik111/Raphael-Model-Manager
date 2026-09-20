@@ -557,14 +557,16 @@ fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
     let c = open_db(&app.app_data)?;
     let rows: Vec<(i64, String, String)> = {
         let mut stmt = c.prepare("SELECT id,relative_path,tags_json FROM models")?;
-        stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
     };
 
     let mut updated = 0_i64;
