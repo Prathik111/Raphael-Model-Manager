@@ -49,6 +49,16 @@ export const api = {
     const result = await open({ directory: true, multiple: false, title: 'Choose model download folder', defaultPath });
     return Array.isArray(result) ? result[0] ?? null : result;
   },
+  chooseImageFile: async () => {
+    if (isWebApp) throw new Error('Custom cover selection is only available in the Raphael desktop app.');
+    const result = await open({
+      directory: false,
+      multiple: false,
+      title: 'Choose custom cover image',
+      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+    });
+    return Array.isArray(result) ? result[0] ?? null : result;
+  },
   setModelsRoot: (path: string) => command<AppState>('set_models_root', { path }),
   listModels: (params?: { type?: string; query?: string; tags?: string[] }) =>
     command<ModelRecord[]>('list_models', { ...params }),
@@ -59,6 +69,12 @@ export const api = {
     command<ModelRecord>('set_model_tags', { id, tags }),
   setModelType: (id: number, modelType: string) =>
     command<ModelRecord>('set_model_type', { id, modelType }),
+  setModelCoverPosition: (id: number, x: number, y: number) =>
+    command<ModelRecord>('set_model_cover_position', { id, x, y }),
+  setModelCustomCover: (id: number, sourcePath: string) =>
+    command<ModelRecord>('set_model_custom_cover', { id, sourcePath }),
+  resetModelCover: (id: number) =>
+    command<ModelRecord>('reset_model_cover', { id }),
   deleteModel: (id: number) =>
     command<void>('delete_model', { id }),
   getImages: (id: number) =>
