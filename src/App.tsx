@@ -114,6 +114,7 @@ function SettingsOverlay({
   onClose: () => void;
 }) {
   const [folderBusy, setFolderBusy] = useState(false);
+  const [closing, setClosing] = useState(false);
   const [tagBusy, setTagBusy] = useState(false);
   const [tagResult, setTagResult] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
@@ -122,9 +123,26 @@ function SettingsOverlay({
   const [tokenBusy, setTokenBusy] = useState(false);
   const [tokenMessage, setTokenMessage] = useState<string | null>(null);
 
+  const dismiss = () => {
+    if (closing) return;
+    setClosing(true);
+    window.setTimeout(onClose, 180);
+  };
+
   useEffect(() => {
     api.getCivitaiTokenSet().then(setTokenSet).catch(() => setTokenSet(false));
   }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        dismiss();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [closing]);
 
   const saveCivitaiToken = async () => {
     const value = civitaiToken.trim();
@@ -192,14 +210,14 @@ function SettingsOverlay({
     }
   };
 
-  return <div className="settings-backdrop" onClick={onClose}>
+  return <div className={"settings-backdrop" + (closing ? " overlay-leaving" : "")} onClick={dismiss}>
     <section className="settings-panel hud-panel" onClick={e => e.stopPropagation()}>
       <header className="settings-header">
         <div>
           <div className="eyebrow">RAPHAEL CORE</div>
           <h2>SETTINGS</h2>
         </div>
-        <button className="settings-close" aria-label="Close settings" onClick={onClose}>×</button>
+        <button className="settings-close" aria-label="Close settings" onClick={dismiss}>×</button>
       </header>
       {settingsError ? <div className="settings-global-error"><div className="error-box">{settingsError}</div></div> : null}
 
