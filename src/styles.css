@@ -17,3 +17,24 @@
 .web-app-url:hover{color:#fff}
 .web-app-error{color:rgba(255,255,255,.45);font-size:7px;letter-spacing:.08em}
 .text-btn:disabled{opacity:.35;cursor:default}
+
+/* Raphael themed scrollbars */
+*{scrollbar-width:thin;scrollbar-color:rgba(235,245,252,.28) transparent}
+*::-webkit-scrollbar{width:8px;height:8px}
+*::-webkit-scrollbar-track{background:rgba(0,0,0,.16);border-left:1px solid rgba(255,255,255,.035)}
+*::-webkit-scrollbar-thumb{min-height:38px;background:linear-gradient(180deg,rgba(255,255,255,.34),rgba(170,205,225,.18));border:1px solid rgba(255,255,255,.12);border-radius:0;box-shadow:inset 0 0 8px rgba(170,210,240,.06)}
+*::-webkit-scrollbar-thumb:hover{background:linear-gradient(180deg,rgba(255,255,255,.5),rgba(190,220,238,.28));border-color:rgba(255,255,255,.28)}
+*::-webkit-scrollbar-corner{background:transparent}
+
+/* Glass/HUD model placeholders */
+.type-placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:8px;overflow:hidden;background:
+linear-gradient(135deg,rgba(255,255,255,.055),rgba(110,170,205,.028) 48%,rgba(0,0,0,.16)),
+linear-gradient(90deg,transparent 0 48%,rgba(255,255,255,.03) 48.5%,transparent 49%);
+color:rgba(240,248,252,.58);border:1px solid rgba(255,255,255,.05)}
+.type-placeholder:before{content:"";position:absolute;inset:10%;border:1px solid rgba(255,255,255,.08);clip-path:polygon(0 0,100% 0,100% 14%,86% 14%,86% 100%,0 100%)}
+.type-placeholder-orbit{position:absolute;width:52%;aspect-ratio:1;border:1px solid rgba(255,255,255,.08);transform:rotate(45deg);box-shadow:0 0 24px rgba(140,195,225,.05)}
+.type-placeholder-mark{position:relative;z-index:2;font-size:22px;line-height:1;font-weight:400;letter-spacing:.12em;color:rgba(245,250,252,.44);text-shadow:0 0 14px rgba(170,215,240,.12)}
+.type-placeholder-label{position:relative;z-index:2;font-size:8px;letter-spacing:.28em;color:rgba(235,245,250,.34)}
+.type-placeholder-scan{position:absolute;left:0;right:0;top:22%;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);box-shadow:0 22px 0 rgba(255,255,255,.035),0 44px 0 rgba(255,255,255,.025),0 66px 0 rgba(255,255,255,.02)}
+.type-placeholder+.model-thumb img,.model-thumb>img{z-index:3}
+.type-placeholder ~ img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
