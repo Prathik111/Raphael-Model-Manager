@@ -23,7 +23,6 @@ use walkdir::WalkDir;
 mod web;
 
 const API_BASE: &str = "https://civitai.com/api/v1";
-const IMAGE_CDN_BASE: &str = "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA";
 const USER_AGENT: &str = "RaphaelModelManager/0.1.0";
 static DOWNLOAD_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -504,7 +503,7 @@ fn model_by_id(c: &Connection, id: i64) -> AppResult<ModelRecord> {
 }
 
 fn civitai_client(_app: &AppStateInner) -> AppResult<Client> {
-    let mut b=Client::builder().user_agent(USER_AGENT);
+    let mut b=Client::builder().user_agent(USER_AGENT).timeout(Duration::from_secs(30));
     let _ = &mut b;
     Ok(b.build()?)
 }
@@ -655,17 +654,6 @@ fn get_examples_refresh_state(
     state.lock().ok().and_then(|guard| guard.progress.clone())
 }
 
-fn featured_remote_url(image: &Value) -> Option<String> {
-    let raw = image.get("url").and_then(Value::as_str)?.trim();
-    if raw.is_empty() { return None; }
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        return Some(raw.to_string());
-    }
-    let image_id = raw.trim_matches('/');
-    let filename = image.get("name").and_then(Value::as_str).filter(|x| !x.trim().is_empty()).unwrap_or("image.jpg");
-    Some(format!("{IMAGE_CDN_BASE}/{image_id}/original=true/{filename}"))
-}
-
 type FeaturedImageRecord = (i64, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<f64>, Option<String>, Option<i64>, String);
 
 fn featured_extension(url: &str) -> String {
@@ -673,7 +661,7 @@ fn featured_extension(url: &str) -> String {
         .ok()
         .and_then(|u| Path::new(u.path()).extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase()))
         .filter(|x| !x.is_empty() && x.len() <= 8)
-        .unwrap_or_else(|| "jpg".into())
+        .unwrap_or_else(|| "jpeg".into())
 }
 
 fn featured_image_key(image: &Value, version_id: i64, index: usize) -> Option<i64> {
@@ -2620,18 +2608,6 @@ mod tests {
             value.as_i64().or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
         });
         assert_eq!(id, Some(123456789));
-    }
-
-    #[test]
-    fn featured_remote_url_builds_civitai_cdn_urls() {
-        let image = json!({
-            "url": "123456789",
-            "name": "example.webp"
-        });
-        assert_eq!(
-            featured_remote_url(&image).as_deref(),
-            Some("https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/123456789/original=true/example.webp")
-        );
     }
 
     #[test]
