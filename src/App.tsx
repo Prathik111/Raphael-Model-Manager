@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, fileUrl, subscribeToModelChanges } from './tauri';
-import type { AppState, CivitaiImportPreview, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
+import type { AppState, CivitaiImportPreview, DownloadProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
 
 const TYPES: Array<{ key: ModelType | 'All'; label: string }> = [
   { key: 'All', label: 'ALL' }, { key: 'Checkpoint', label: 'CHECKPOINTS' }, { key: 'LoRA', label: 'LORAS' },
@@ -358,29 +358,46 @@ function TagEditor({ model, allTags, onSave, onFilter }: { model: ModelRecord; a
   const [draft, setDraft] = useState<string[]>(model.tags);
   const [input, setInput] = useState('');
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const needle = input.trim().toLowerCase();
+
+  useEffect(() => {
+    setDraft(model.tags);
+  }, [model.id, model.tags.join('\u0001')]);
+
   const suggestions = allTags
     .filter(tag => !draft.some(existing => existing.toLowerCase() === tag.name.toLowerCase()))
     .filter(tag => !needle || tag.name.toLowerCase().includes(needle))
     .slice(0, 8);
 
+  const persist = async (next: string[]) => {
+    setSaving(true);
+    setSaveError(null);
+    try { await onSave(next); setDraft(next); }
+    catch (error) { setSaveError(String(error)); }
+    finally { setSaving(false); }
+  };
+
   const add = (raw: string) => {
     const value = raw.trim();
-    if (!value || draft.some(tag => tag.toLowerCase() === value.toLowerCase())) return;
-    setDraft(current => [...current, value]);
-    setInput('');
+    if (!value || draft.some(tag => tag.toLowerCase() === value.toLowerCase()) || saving) return;
+    const next = [...draft, value];
+    setDraft(next); setInput('');
+    if (api.isWebApp) void persist(next);
   };
-  const remove = (tag: string) => setDraft(current => current.filter(existing => existing !== tag));
-  const save = async () => {
-    setSaving(true);
-    try { await onSave(draft); } finally { setSaving(false); }
+  const remove = (tag: string) => {
+    if (saving) return;
+    const next = draft.filter(existing => existing !== tag);
+    setDraft(next);
+    if (api.isWebApp) void persist(next);
   };
+  const save = async () => persist(draft);
 
   return <div className="tag-editor">
     <div className="tag-editor-chips">
       {draft.map(tag => <span className="editable-tag" key={tag}>
         <button className="tag-value" title="Filter by this tag" onClick={()=>onFilter(tag)}>{tag}</button>
-        <button className="tag-remove" aria-label={'Remove ' + tag} onClick={()=>remove(tag)}>×</button>
+        <button className="tag-remove" aria-label={'Remove ' + tag} onClick={()=>remove(tag)} disabled={saving}>×</button>
       </span>)}
       {!draft.length ? <span className="empty-inline">No tags assigned.</span> : null}
     </div>
@@ -389,11 +406,12 @@ function TagEditor({ model, allTags, onSave, onFilter }: { model: ModelRecord; a
       <button className="primary-btn small" onClick={()=>add(input)} disabled={saving || !input.trim()}>ADD</button>
     </div>
     {input.trim() ? <div className="tag-suggestions">
-      {suggestions.length ? suggestions.map(tag => <button key={tag.name} onClick={()=>add(tag.name)}><span>{tag.name}</span><b>{tag.count}</b></button>) : <div className="tag-create-hint">Press ENTER to create “{input.trim()}”.</div>}
+      {suggestions.length ? suggestions.map(tag => <button key={tag.name} onClick={()=>add(tag.name)} disabled={saving}><span>{tag.name}</span><b>{tag.count}</b></button>) : <div className="tag-create-hint">Press ENTER to create “{input.trim()}”.</div>}
     </div> : null}
+    {saveError ? <div className="error-box tag-save-error">{saveError}</div> : null}
     <div className="tag-editor-footer">
-      <span>{draft.length} TAG{draft.length === 1 ? '' : 'S'}</span>
-      <button className="text-btn" onClick={save} disabled={saving}>{saving ? 'SAVING…' : 'SAVE TAGS'}</button>
+      <span>{api.isWebApp ? 'AUTO-SAVES' : `${draft.length} TAG${draft.length === 1 ? '' : 'S'}`}</span>
+      {!api.isWebApp ? <button className="text-btn" onClick={save} disabled={saving}>{saving ? 'SAVING…' : 'SAVE TAGS'}</button> : <span className="tag-save-state">{saving ? 'SYNCING…' : 'SYNCED'}</span>}
     </div>
   </div>;
 }
@@ -432,7 +450,25 @@ function CoverEditorOverlay({
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [closing, setClosing] = useState(false);
   const dragRef = useRef<{ pointerId: number; x: number; y: number; startX: number; startY: number } | null>(null);
+
+  const dismiss = () => {
+    if (busy || closing) return;
+    setClosing(true);
+    window.setTimeout(onClose, 180);
+  };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        dismiss();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [busy, closing]);
 
   const clamp = (value: number) => Math.max(0, Math.min(100, value));
 
@@ -519,14 +555,14 @@ function CoverEditorOverlay({
     }
   };
 
-  return <div className="modal-backdrop cover-editor-backdrop" onClick={() => { if (!busy) onClose(); }}>
+  return <div className={"modal-backdrop cover-editor-backdrop" + (closing ? " overlay-leaving" : "")} onClick={dismiss}>
     <div className="cover-editor hud-panel" onClick={e => e.stopPropagation()}>
       <header className="cover-editor-header">
         <div>
           <div className="eyebrow">COVER EDITOR</div>
           <h2>{model.civitai_name || model.filename}</h2>
         </div>
-        <button className="settings-close" aria-label="Close cover editor" onClick={onClose} disabled={busy}>×</button>
+        <button className="settings-close" aria-label="Close cover editor" onClick={dismiss} disabled={busy}>×</button>
       </header>
 
       <div className="cover-editor-body">
@@ -571,7 +607,7 @@ function CoverEditorOverlay({
       </div>
 
       <div className="modal-actions cover-editor-actions">
-        <button className="text-btn" onClick={onClose} disabled={busy}>CANCEL</button>
+        <button className="text-btn" onClick={dismiss} disabled={busy}>CANCEL</button>
         <button className="primary-btn" onClick={apply} disabled={busy}>{busy ? 'SAVING…' : 'APPLY COVER'}</button>
       </div>
     </div>
@@ -586,11 +622,34 @@ function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTag
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteClosing, setDeleteClosing] = useState(false);
   const promptText = model.activation_prompts.join(', ');
+
+  const dismissDelete = () => {
+    if (deleteBusy || deleteClosing) return;
+    setDeleteClosing(true);
+    window.setTimeout(() => {
+      setDeleteOpen(false);
+      setDeleteClosing(false);
+    }, 180);
+  };
+
+  useEffect(() => {
+    if (!deleteOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        dismissDelete();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [deleteOpen, deleteBusy, deleteClosing]);
   return <aside className="inspector hud-panel">
     <div className="inspector-header">
-      <div className="inspector-model-heading"><div><div className="eyebrow">MODEL</div><h2>{model.civitai_name || model.filename}</h2></div><button className="cover-change-btn" onClick={onChangeCover} title="Change this model's cover">CHANGE COVER</button></div>
+      <div className="inspector-model-heading"><div className="inspector-model-title"><div className="eyebrow">MODEL</div><h2>{model.civitai_name || model.filename}</h2></div></div>
       <select className="type-select" value={model.model_type} onChange={async e=>{try{await onSaveType(e.target.value);}catch{e.currentTarget.value=model.model_type;}}} aria-label="Model type">{MODEL_TYPES.map(x=><option key={x.value} value={x.value}>{x.label}</option>)}</select>
+      <button className="cover-change-btn" onClick={onChangeCover} title="Change this model's cover">CHANGE COVER</button>
     </div>
     <div className="inspector-tabs">{(['overview','examples','files'] as const).map(t=><button className={tab===t?'active':''} onClick={()=>setTab(t)} key={t}>{t.toUpperCase()}</button>)}</div>
     {tab==='overview' && <div className="inspector-scroll">
@@ -602,7 +661,7 @@ function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTag
     </div>}
     {tab==='examples' && <div className="inspector-scroll"><section><div className="section-head section-head-row"><span>CACHED CIVITAI GALLERY · {images.length}</span><span className="section-action">PICK A THUMBNAIL</span></div><Gallery model={model} images={images} onChooseThumbnail={onChooseThumbnail}/></section></div>}
     {tab==='files' && <div className="inspector-scroll"><section><div className="section-head">LOCAL FILE</div><div className="kv"><span>SIZE</span><b>{fmtBytes(model.size_bytes)}</b></div><div className="kv"><span>TYPE</span><b>{model.model_type}</b></div><div className="kv"><span>BASE</span><b>{model.base_model || '—'}</b></div><div className="kv"><span>VERSION</span><b>{model.version_name || '—'}</b></div><div className="kv"><span>CREATOR</span><b>{model.creator || '—'}</b></div><div className="kv"><span>SHA256</span><b className="wrap">{model.source_hash || 'Not computed'}</b></div></section><section className="danger-section"><div className="section-head">DANGER ZONE</div><p className="danger-copy">Permanently delete this model file from disk and remove its Raphael metadata and cached gallery entries.</p><button className="danger-btn" onClick={()=>{setDeleteError(null);setDeleteOpen(true);}} disabled={deleteBusy}>DELETE MODEL</button></section></div>}
-    {deleteOpen && <div className="modal-backdrop inspector-delete-backdrop" onClick={()=>{if(!deleteBusy)setDeleteOpen(false);}}><div className="delete-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">DESTRUCTIVE ACTION</div><h3>DELETE MODEL?</h3><p>This will permanently remove <b>{model.filename}</b> from your ComfyUI models folder. Raphael metadata and cached gallery files for this model will also be removed.</p>{deleteError ? <div className="error-box modal-error">{deleteError}</div> : null}<div className="modal-actions"><button className="text-btn" onClick={()=>setDeleteOpen(false)} disabled={deleteBusy}>CANCEL</button><button className="danger-btn confirm" disabled={deleteBusy} onClick={async()=>{setDeleteBusy(true);setDeleteError(null);try{await onDelete();setDeleteOpen(false);}catch(e){setDeleteError(String(e));}finally{setDeleteBusy(false);}}}>{deleteBusy?'DELETING…':'DELETE PERMANENTLY'}</button></div></div></div>}
+    {deleteOpen && <div className={"modal-backdrop inspector-delete-backdrop" + (deleteClosing ? " overlay-leaving" : "")} onClick={dismissDelete}><div className="delete-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">DESTRUCTIVE ACTION</div><h3>DELETE MODEL?</h3><p>This will permanently remove <b>{model.filename}</b> from your ComfyUI models folder. Raphael metadata and cached gallery files for this model will also be removed.</p>{deleteError ? <div className="error-box modal-error">{deleteError}</div> : null}<div className="modal-actions"><button className="text-btn" onClick={dismissDelete} disabled={deleteBusy}>CANCEL</button><button className="danger-btn confirm" disabled={deleteBusy} onClick={async()=>{setDeleteBusy(true);setDeleteError(null);try{await onDelete();setDeleteOpen(false);}catch(e){setDeleteError(String(e));}finally{setDeleteBusy(false);}}}>{deleteBusy?'DELETING…':'DELETE PERMANENTLY'}</button></div></div></div>}
   </aside>;
 }
 
