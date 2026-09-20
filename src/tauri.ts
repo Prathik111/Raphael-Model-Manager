@@ -20,6 +20,7 @@ export const api = {
   getLibraryCounts: () => invoke<LibraryCounts>('get_library_counts'),
   getTags: () => invoke<TagRecord[]>('get_tags'),
   setModelTags: (id: number, tags: string[]) => invoke<ModelRecord>('set_model_tags', { id, tags }),
+  setModelType: (id: number, modelType: string) => invoke<ModelRecord>('set_model_type', { id, modelType }),
   getImages: (id: number) => invoke<ModelImage[]>('get_model_images', { id }),
   syncModelGallery: (id: number) => invoke<void>('sync_model_gallery', { id }),
   importCivitai: (url: string) => invoke<CivitaiImportPreview>('preview_civitai_import', { url }),
