@@ -409,7 +409,7 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
     <div className="gallery-grid">
       {images.map((img) => {
         const imagePath = img.local_path || img.thumbnail_path;
-        const active = model.cover_path === img.thumbnail_path || model.cover_path === img.local_path;
+        const active = model.cover_source_image_id === img.id || model.cover_path === img.thumbnail_path || model.cover_path === img.local_path;
         const ready = Boolean(img.thumbnail_path || img.local_path);
         return <div className={`gallery-item ${active ? 'active-thumbnail' : ''}`} key={img.id}>
           <div className="gallery-image-wrap">
