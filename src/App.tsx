@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, fileUrl, subscribeToModelChanges } from './tauri';
 import type { AppState, CivitaiImportPreview, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
 
@@ -205,12 +205,57 @@ function Inspector({ model, images, allTags, onRefresh, onLinkCivitai, onSaveTag
 
 function App() {
   const [state,setState]=useState<AppState|null>(null); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
+  const refreshGeneration = useRef(0);
   const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
   const selected = models.find(m=>m.id===selectedId) || null;
-  async function refresh(){ const s=await api.getState(); setState(s); if(!s.models_root){return;} const [list,allCounts,tags]=await Promise.all([api.listModels({type:type==='All'?undefined:type,query:query||undefined,tags:activeTags}),api.getLibraryCounts(),api.getTags()]); list.sort((a,b)=>sort==='size'?b.size_bytes-a.size_bytes:sort==='path'?a.relative_path.localeCompare(b.relative_path):(a.civitai_name||a.filename).localeCompare(b.civitai_name||b.filename)); setModels(list); setCounts(allCounts); setAllTags(tags); setSelectedId(previous=>{ if(previous!==null && list.some(m=>m.id===previous)) return previous; return list[0]?.id ?? null; }); }
+  async function refresh(){
+    const generation=++refreshGeneration.current;
+    try {
+      const s=await api.getState();
+      if(generation!==refreshGeneration.current) return;
+      setState(s);
+      if(!s.models_root){
+        setModels([]);
+        setCounts({all:0,by_type:{}});
+        setAllTags([]);
+        setSelectedId(null);
+        return;
+      }
+      const [list,allCounts,tags]=await Promise.all([
+        api.listModels({type:type==='All'?undefined:type,query:query||undefined,tags:activeTags}),
+        api.getLibraryCounts(),
+        api.getTags()
+      ]);
+      if(generation!==refreshGeneration.current) return;
+      list.sort((a,b)=>sort==='size'?b.size_bytes-a.size_bytes:sort==='path'?a.relative_path.localeCompare(b.relative_path):(a.civitai_name||a.filename).localeCompare(b.civitai_name||b.filename));
+      setModels(list);
+      setCounts(allCounts);
+      setAllTags(tags);
+      setSelectedId(previous=>{
+        if(previous!==null && list.some(m=>m.id===previous)) return previous;
+        return list[0]?.id ?? null;
+      });
+    } catch (error) {
+      if(generation===refreshGeneration.current) console.error('Raphael refresh failed',error);
+    }
+  }
   useEffect(()=>{refresh(); api.getWebAppStatus().then(setWebStatus).catch(()=>{});},[]);
   const toggleWebApp = async () => { if (api.isWebApp || webBusy) return; setWebBusy(true); setWebError(null); try { const next=await api.setWebAppEnabled(!webStatus.enabled); setWebStatus(next); } catch (e) { setWebError(String(e)); } finally { setWebBusy(false); } };
-  useEffect(()=>{let stop:undefined|(()=>void); subscribeToModelChanges(()=>refresh()).then(x=>{stop=()=>x();}); return ()=>stop?.();},[type,query,sort,activeTags]);
+  useEffect(()=>{
+    let disposed=false;
+    let stop:undefined|(()=>void);
+    subscribeToModelChanges(()=>{void refresh()}).then(unlisten=>{
+      if(disposed){
+        unlisten();
+      }else{
+        stop=unlisten;
+      }
+    });
+    return ()=>{
+      disposed=true;
+      stop?.();
+    };
+  },[type,query,sort,activeTags]);
   useEffect(()=>{if(!selected){setImages([]);return;} api.getImages(selected.id).then(setImages).catch(()=>setImages([])); api.syncModelGallery(selected.id).catch(()=>{}); const timer=window.setInterval(()=>api.getImages(selected.id).then(setImages).catch(()=>{}),2000); return ()=>window.clearInterval(timer);},[selectedId, selected?.civitai_model_id]);
   useEffect(()=>{const t=setTimeout(()=>refresh(),180); return ()=>clearTimeout(t);},[query,type,sort,activeTags]);
   if(!state) return <div className="loading-shell"><PulseMark/></div>;
