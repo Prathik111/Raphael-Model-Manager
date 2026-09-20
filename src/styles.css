@@ -326,3 +326,16 @@ color:rgba(240,248,252,.58);border:1px solid rgba(255,255,255,.05)}
 .download-widget:hover .download-widget-clear{opacity:1}
 .download-widget-clear:hover{background:rgba(255,255,255,.08);color:#fff}
 .download-widget.failed .download-widget-clear{opacity:1}
+
+
+/* Gallery pagination, bulk link import, and parallel-download settings */
+.gallery-more-btn{width:100%;min-height:34px;margin-top:12px;border:1px solid rgba(255,255,255,.14);background:linear-gradient(135deg,rgba(255,255,255,.035),rgba(0,0,0,.22));color:rgba(240,248,252,.62);font:inherit;font-size:7px;letter-spacing:.14em;cursor:pointer;transition:border-color .15s,background .15s,color .15s}
+.gallery-more-btn:hover:not(:disabled){border-color:rgba(255,255,255,.36);background:rgba(255,255,255,.055);color:#fff}
+.gallery-more-btn:disabled{opacity:.45;cursor:wait}
+.gallery-end-note{margin-top:12px;padding:9px 10px;border:1px solid rgba(255,255,255,.07);background:rgba(0,0,0,.14);text-align:center;font-size:7px;letter-spacing:.12em;color:rgba(235,245,252,.25)}
+.settings-parallel-row{display:flex;align-items:center;gap:9px}
+.settings-parallel-select{width:110px;height:31px}
+.bulk-link-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:9px}
+.bulk-link-input{display:none}
+.bulk-link-status{font-size:7px;letter-spacing:.08em;color:rgba(215,245,230,.58);margin-top:8px}
+.settings-download-copy{max-width:560px;color:rgba(230,241,248,.42);font-size:8px;line-height:1.6;margin:7px 0 12px}
