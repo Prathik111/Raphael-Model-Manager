@@ -1225,7 +1225,7 @@ function App() {
     };
   },[type,query,sort,activeTags]);
   useEffect(()=>{
-    if(!selected){setImages([]);setGalleryHasMore(false);setGalleryFetchBusy(false);setImageViewerId(null);}
+    if(!selected){setImages([]);setGalleryHasMore(false);setGalleryFetchBusy(false);setImageViewerId(null);return;}
     const modelId=selected.id;
     setGalleryHasMore(false);
     setGalleryFetchBusy(false);
