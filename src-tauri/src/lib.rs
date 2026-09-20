@@ -690,7 +690,12 @@ async fn sync_featured_examples_inner(
 
         let images=version.get("images").and_then(Value::as_array).cloned().unwrap_or_default();
         for image in images{
-            let image_id=match image.get("id").and_then(Value::as_i64){Some(v)=>v,None=>continue};
+            let image_id=match image.get("id").and_then(|value| {
+                value.as_i64().or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
+            }) {
+                Some(v)=>v,
+                None=>continue
+            };
             let remote=match featured_remote_url(&image){Some(v)=>v,None=>continue};
             let ext=featured_extension(&remote);
             let version_dir=staging.join(version_id.to_string());
@@ -2479,6 +2484,15 @@ mod tests {
         let state = ExamplesRefreshState::default();
         assert!(!state.running);
         assert!(state.progress.is_none());
+    }
+
+    #[test]
+    fn featured_image_id_accepts_string_ids() {
+        let image = json!({"id": "123456789"});
+        let id = image.get("id").and_then(|value| {
+            value.as_i64().or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
+        });
+        assert_eq!(id, Some(123456789));
     }
 
     #[test]
