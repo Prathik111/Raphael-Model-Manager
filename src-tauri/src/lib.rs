@@ -2368,7 +2368,7 @@ async fn sync_gallery_inner(
             c.execute(
                 "INSERT INTO images(
                     model_id,civitai_image_id,local_path,thumbnail_path,width,height,
-                    prompt,negative_prompt,steps,cfg,sampler,seed,meta_json
+                    prompt,negative_prompt,steps,cfg,sampler,seed,meta_json,cached_at
                  )
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,CAST(strftime('%s','now') AS INTEGER))
                  ON CONFLICT(model_id,civitai_image_id) DO UPDATE SET
