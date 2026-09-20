@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, fileUrl, subscribeToExamplesRefresh, subscribeToModelChanges } from './tauri';
-import type { AppState, CivitaiImportPreview, DownloadProgress, ExamplesRefreshProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
+import type { AppState, CacheOperationResult, CacheStats, CivitaiImportPreview, DownloadProgress, ExamplesRefreshProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
 
 const TYPES: Array<{ key: ModelType | 'All'; label: string }> = [
   { key: 'All', label: 'ALL' }, { key: 'Checkpoint', label: 'CHECKPOINTS' }, { key: 'LoRA', label: 'LORAS' },
@@ -132,6 +132,128 @@ function SettingsOverlay({
   const [parallelDownloads, setParallelDownloads] = useState(3);
   const [parallelBusy, setParallelBusy] = useState(false);
   const [parallelMessage, setParallelMessage] = useState<string | null>(null);
+  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
+  const [cacheMaxGb, setCacheMaxGb] = useState('0');
+  const [cacheKeepPerModel, setCacheKeepPerModel] = useState('20');
+  const [cacheBusy, setCacheBusy] = useState(false);
+  const [cacheMessage, setCacheMessage] = useState<string | null>(null);
+
+
+  const showCacheResult = (result: CacheOperationResult, label: string) => {
+    setCacheMessage(`${label} · FREED ${fmtBytes(result.freed_bytes)} · ${fmtCount(result.deleted_files)} FILES REMOVED`);
+  };
+
+  const applyCacheLimit = async () => {
+    if (cacheBusy) return;
+    const gb = Number(cacheMaxGb);
+    if (!Number.isFinite(gb) || gb < 0) {
+      setSettingsError('Cache limit must be a number greater than or equal to 0.');
+      return;
+    }
+    setCacheBusy(true);
+    setSettingsError(null);
+    setCacheMessage(null);
+    try {
+      const next = await api.setCacheMaxBytes(Math.round(gb * 1024 ** 3));
+      setCacheStats(next);
+      setCacheMessage(next.max_bytes === 0 ? 'CACHE LIMIT · UNLIMITED' : `CACHE LIMIT · ${fmtBytes(next.max_bytes)}`);
+      if (next.over_limit) {
+        setCacheMessage(`CACHE LIMIT SAVED · CURRENT CACHE IS STILL ${fmtBytes(next.used_bytes - next.max_bytes)} OVER LIMIT`);
+      }
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const changeCacheLocation = async () => {
+    if (api.isWebApp || cacheBusy) return;
+    try {
+      const path = await api.chooseCacheDirectory(cacheStats?.location);
+      if (!path) return;
+      const message = cacheStats?.used_bytes
+        ? `Move ${fmtBytes(cacheStats.used_bytes)} of Raphael cache to:\n\n${path}\n\nThe destination must be empty. Raphael verifies the copy before switching and only then removes the old cache. Continue?`
+        : `Set Raphael cache location to:\n\n${path}\n\nThe destination must be empty. Continue?`;
+      if (!window.confirm(message)) return;
+      setCacheBusy(true);
+      setSettingsError(null);
+      setCacheMessage('MOVING CACHE…');
+      await api.setCacheLocation(path);
+      window.location.reload();
+    } catch (error) {
+      setSettingsError(String(error));
+      setCacheMessage(null);
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const clearImageCache = async () => {
+    if (cacheBusy || !window.confirm('Delete all cached Civitai/gallery/featured images and their thumbnails? Stable model cover files will be preserved.')) return;
+    setCacheBusy(true);
+    setSettingsError(null);
+    try {
+      await api.clearCacheImages();
+      setCacheMessage('IMAGE CACHE CLEARED');
+      window.location.reload();
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const clearCompleteCache = async () => {
+    if (cacheBusy || !window.confirm('Delete the COMPLETE Raphael cache, including images, thumbnails, model covers, and cached metadata? Your actual model files will NOT be touched.')) return;
+    setCacheBusy(true);
+    setSettingsError(null);
+    try {
+      await api.clearCompleteCache();
+      setCacheMessage('COMPLETE CACHE CLEARED');
+      window.location.reload();
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const pruneCacheImages = async () => {
+    if (cacheBusy) return;
+    const keep = Number(cacheKeepPerModel);
+    if (!Number.isInteger(keep) || keep < 0) {
+      setSettingsError('Images kept per model must be a whole number greater than or equal to 0.');
+      return;
+    }
+    if (!window.confirm(`Keep the newest ${keep} cached images for each model and delete the rest? Selected model cover images are always preserved.`)) return;
+    setCacheBusy(true);
+    setSettingsError(null);
+    try {
+      await api.pruneCacheImages(keep);
+      setCacheMessage(`RETAINED ${keep} IMAGES / MODEL`);
+      window.location.reload();
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const cleanCacheOrphans = async () => {
+    if (cacheBusy) return;
+    setCacheBusy(true);
+    setSettingsError(null);
+    try {
+      const result = await api.cleanCacheOrphans();
+      showCacheResult(result, 'ORPHANED CACHE CLEANED');
+      await refreshCacheStats();
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setCacheBusy(false);
+    }
+  };
 
   const dismiss = () => {
     if (closing) return;
@@ -139,9 +261,20 @@ function SettingsOverlay({
     window.setTimeout(onClose, 180);
   };
 
+  const refreshCacheStats = async () => {
+    const next = await api.getCacheStats();
+    setCacheStats(next);
+    setCacheMaxGb(next.max_bytes > 0 ? (next.max_bytes / (1024 ** 3)).toFixed(1).replace(/\.0$/, '') : '0');
+  };
+
   useEffect(() => {
     api.getCivitaiTokenSet().then(setTokenSet).catch(() => setTokenSet(false));
     api.getParallelDownloads().then(value => setParallelDownloads(Math.max(1, Math.min(8, value)))).catch(() => setParallelDownloads(3));
+    void refreshCacheStats().catch(error => setSettingsError(String(error)));
+    const timer = window.setInterval(() => {
+      void refreshCacheStats().catch(error => setSettingsError(String(error)));
+    }, 5000);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
