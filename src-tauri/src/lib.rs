@@ -404,6 +404,11 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
       );
       CREATE INDEX IF NOT EXISTS idx_models_type ON models(model_type);
       CREATE INDEX IF NOT EXISTS idx_models_civitai ON models(civitai_model_id, civitai_version_id);
+      CREATE TABLE IF NOT EXISTS pending_registry_file_removals (
+        registry_model_id TEXT NOT NULL,
+        registry_file_id TEXT NOT NULL,
+        PRIMARY KEY(registry_model_id, registry_file_id)
+      );
       CREATE TABLE IF NOT EXISTS images (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
@@ -1018,13 +1023,55 @@ fn prune_unseen_models(
     Ok(removed)
 }
 
+fn queue_registry_file_removal(
+    app: &AppStateInner,
+    model_id: &str,
+    file_id: &str,
+) {
+    if let Ok(c) = open_db(&app.app_data) {
+        let _ = c.execute(
+            "INSERT OR IGNORE INTO pending_registry_file_removals(registry_model_id,registry_file_id) VALUES(?1,?2)",
+            params![model_id, file_id],
+        );
+    }
+}
+
+async fn retry_pending_registry_file_removals(app: &AppStateInner) {
+    let pending: Vec<(String, String)> = match open_db(&app.app_data).and_then(|c| {
+        let mut stmt = c.prepare(
+            "SELECT registry_model_id,registry_file_id FROM pending_registry_file_removals"
+        )?;
+        let rows = stmt.query_map([], |r| Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+        )))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+
+    for (model_id, file_id) in pending {
+        if app.registry.remove_file(&model_id, &file_id).await.is_ok() {
+            if let Ok(c) = open_db(&app.app_data) {
+                let _ = c.execute(
+                    "DELETE FROM pending_registry_file_removals WHERE registry_model_id=?1 AND registry_file_id=?2",
+                    params![model_id, file_id],
+                );
+            }
+        }
+    }
+}
+
 async fn reconcile_removed_registry_files(
     app: &AppStateInner,
     removed: Vec<(String, Option<String>, Option<String>)>,
 ) {
     for (_path, model_id, file_id) in removed {
         if let (Some(model_id), Some(file_id)) = (model_id, file_id) {
-            let _ = app.registry.remove_file(&model_id, &file_id).await;
+            if app.registry.remove_file(&model_id, &file_id).await.is_err() {
+                queue_registry_file_removal(app, &model_id, &file_id);
+            }
         }
     }
 }
@@ -1537,6 +1584,10 @@ async fn apply_civitai_metadata_to_registry(
 }
 
 fn spawn_registry_sync(app: AppStateInner, handle: AppHandle) {
+    let retry_state = app.clone();
+    tauri::async_runtime::spawn(async move {
+        retry_pending_registry_file_removals(&retry_state).await;
+    });
     {
         let mut running = match app.registry_sync_running.lock() {
             Ok(guard) => guard,
