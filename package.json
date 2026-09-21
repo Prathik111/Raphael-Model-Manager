@@ -7,6 +7,7 @@
   "scripts": {
     "prepare:reference": "node scripts/prepare-reference.mjs",
     "dev": "vite",
+    "dev:supervised": "node scripts/dev-vite-supervisor.mjs",
     "build": "npm run prepare:reference && tsc && vite build",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
