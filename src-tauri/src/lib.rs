@@ -1467,6 +1467,7 @@ async fn sync_featured_examples_inner(
         let version_dir=staging.join(version_id.to_string());
         fs::create_dir_all(&version_dir)?;
 
+        let mut first_image_error: Option<String> = None;
         let mut jobs: Vec<(String,i64,Value)> = Vec::new();
 
         for (image_index,image) in images.into_iter().enumerate() {
