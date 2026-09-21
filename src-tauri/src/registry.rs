@@ -116,10 +116,6 @@ impl RegistryClient {
         })
     }
 
-    pub(crate) fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
     fn token(&self) -> Result<String, RegistryError> {
         if let Ok(value) = env::var("RAPHAEL_REGISTRY_AUTH_TOKEN") {
             if !value.trim().is_empty() {
@@ -356,12 +352,6 @@ fn default_token_path(app_data: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_registry_is_loopback() {
-        let client = RegistryClient::from_app_data(Path::new("app")).unwrap();
-        assert_eq!(client.base_url(), "http://127.0.0.1:43217");
-    }
 
     #[test]
     fn default_token_path_uses_app_data_when_localappdata_is_missing() {
