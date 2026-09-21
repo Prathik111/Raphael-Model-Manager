@@ -1235,6 +1235,7 @@ type FeaturedImageRecord = (i64, Option<String>, Option<String>, Option<i64>, Op
 const FEATURED_MODEL_CONCURRENCY: usize = 3;
 const FEATURED_IMAGE_DOWNLOAD_CONCURRENCY: usize = 8;
 
+#[allow(clippy::large_enum_variant)]
 enum FeaturedDownloadResult {
     Saved(FeaturedImageRecord),
     DownloadFailed(String),
@@ -1243,6 +1244,7 @@ enum FeaturedDownloadResult {
     InvalidImage(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_featured_image(
     client: Client,
     remote: String,
