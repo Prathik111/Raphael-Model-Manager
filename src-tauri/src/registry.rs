@@ -186,44 +186,11 @@ impl RegistryClient {
         Err(RegistryError::Api { status, message })
     }
 
-    pub(crate) async fn health(&self) -> bool {
-        self.client
-            .get(format!("{}/health", self.base_url))
-            .send()
-            .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false)
-    }
 
     pub(crate) async fn get_model(&self, id: &str) -> Result<RegistryModel, RegistryError> {
         self.send_json(self.request(Method::GET, &format!("/api/v1/models/{id}"))?).await
     }
 
-    pub(crate) async fn search(
-        &self,
-        q: Option<&str>,
-        source: Option<&str>,
-        hash: Option<&str>,
-    ) -> Result<RegistrySearchResult, RegistryError> {
-        let mut query: Vec<(&str, String)> = vec![
-            ("limit", "200".into()),
-            ("offset", "0".into()),
-        ];
-        if let Some(q) = q {
-            query.push(("q", q.to_string()));
-        }
-        if let Some(source) = source {
-            query.push(("source", source.to_string()));
-        }
-        if let Some(hash) = hash {
-            query.push(("hash", hash.to_string()));
-        }
-        self.send_json(
-            self.request(Method::GET, "/api/v1/models")?
-                .query(&query),
-        )
-        .await
-    }
 
     pub(crate) async fn create_model(
         &self,
@@ -397,17 +364,6 @@ impl RegistryClient {
         .await
     }
 
-    pub(crate) async fn add_asset(
-        &self,
-        model_id: &str,
-        payload: Value,
-    ) -> Result<Value, RegistryError> {
-        self.send_json(
-            self.request(Method::POST, &format!("/api/v1/models/{model_id}/assets"))?
-                .json(&payload),
-        )
-        .await
-    }
 }
 
 fn default_token_path(app_data: &Path) -> PathBuf {
