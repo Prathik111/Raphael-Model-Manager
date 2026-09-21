@@ -1280,22 +1280,27 @@ async fn sync_local_model_to_registry(
 
     let (registry_model, created_new) = match app.registry.get_model(&deterministic_id).await {
         Ok(model) => (model, false),
-        Err(_) => (
-            app.registry
-                .create_model(
-                    &deterministic_id,
-                    local.civitai_name.as_deref().unwrap_or(&local.filename),
-                    registry_model_type(&local.model_type),
-                    local.creator.as_deref(),
-                    local.description.as_deref(),
-                    local.base_model.as_deref(),
-                    json!({
-                        "managed_by": "raphael-model-manager"
-                    }),
-                )
-                .await?,
-            true,
-        ),
+        Err(crate::registry::RegistryError::Api { status, .. })
+            if status == reqwest::StatusCode::NOT_FOUND =>
+        {
+            (
+                app.registry
+                    .create_model(
+                        &deterministic_id,
+                        local.civitai_name.as_deref().unwrap_or(&local.filename),
+                        registry_model_type(&local.model_type),
+                        local.creator.as_deref(),
+                        local.description.as_deref(),
+                        local.base_model.as_deref(),
+                        json!({
+                            "managed_by": "raphael-model-manager"
+                        }),
+                    )
+                    .await?,
+                true,
+            )
+        }
+        Err(error) => return Err(error.into()),
     };
 
     let mut registry_version_id = existing_registry_version_id;
@@ -1721,7 +1726,9 @@ async fn download_cached_thumbnail(
         return Ok(None);
     }
 
-    let bytes = res.bytes().await?;
+    let bytes = read_remote_image_bytes(res)
+        .await
+        .map_err(AppError::Invalid)?;
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -1867,9 +1874,9 @@ async fn download_featured_image(
         );
     }
 
-    let bytes = match response.bytes().await {
+    let bytes = match read_remote_image_bytes(response).await {
         Ok(value) => value,
-        Err(error) => return (image_id, FeaturedDownloadResult::ReadFailed(error.to_string())),
+        Err(error) => return (image_id, FeaturedDownloadResult::ReadFailed(error)),
     };
 
     if bytes.is_empty() {
@@ -3379,6 +3386,25 @@ async fn install_civitai_model(
 }
 
 fn parse_meta(meta:&Value,key:&str)->Option<String>{meta.get(key).and_then(Value::as_str).map(str::to_string)}
+
+const MAX_REMOTE_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
+async fn read_remote_image_bytes(response: reqwest::Response) -> Result<Vec<u8>, String> {
+    if response.content_length().is_some_and(|length| length > MAX_REMOTE_IMAGE_BYTES as u64) {
+        return Err(format!("Remote image exceeds the {} MiB limit", MAX_REMOTE_IMAGE_BYTES / (1024 * 1024)));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_IMAGE_BYTES {
+            return Err(format!("Remote image exceeds the {} MiB limit", MAX_REMOTE_IMAGE_BYTES / (1024 * 1024)));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
 async fn download_gallery_image(
     client: Client,
     remote: String,
@@ -3397,7 +3423,7 @@ async fn download_gallery_image(
         Ok(value) => value,
         Err(_) => return (image_id, None),
     };
-    let bytes = match response.bytes().await {
+    let bytes = match read_remote_image_bytes(response).await {
         Ok(value) if !value.is_empty() => value,
         _ => return (image_id, None),
     };
