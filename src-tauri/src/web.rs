@@ -1156,3 +1156,36 @@ pub async fn toggle_web_app(
 ) -> AppResult<WebAppStatus> {
     set_web_app_enabled(handle, controller, enabled).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_access_tokens_are_256_bit_hex_values() {
+        let first = generate_access_token().expect("token generation should succeed");
+        let second = generate_access_token().expect("token generation should succeed");
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|value| value.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn bearer_and_cookie_tokens_are_parsed_without_accepting_other_schemes() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer secret-token"));
+        headers.insert(header::COOKIE, HeaderValue::from_static("foo=bar; raphael_auth=secret-token; other=value"));
+        assert_eq!(bearer_token(&headers).as_deref(), Some("secret-token"));
+        assert_eq!(cookie_token(&headers).as_deref(), Some("secret-token"));
+
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic secret-token"));
+        assert!(bearer_token(&headers).is_none());
+    }
+
+    #[test]
+    fn web_urls_keep_the_access_token_in_the_fragment() {
+        let url = web_url("abc123");
+        assert!(url.contains("#access_token=abc123"));
+        assert!(!url.contains("?access_token="));
+    }
+}
