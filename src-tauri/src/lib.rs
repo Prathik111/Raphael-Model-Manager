@@ -1149,7 +1149,6 @@ async fn hydrate_local_model_from_registry(
     let sources = app.registry.sources(registry_model_id).await.unwrap_or_default();
     let versions = app.registry.versions(registry_model_id).await.unwrap_or_default();
 
-    let civitai_source = sources.iter().find(|source| source.provider.eq_ignore_ascii_case("civitai"));
     let selected_version = registry_version_id
         .and_then(|id| versions.iter().find(|version| version.id == id))
         .or_else(|| {
@@ -1162,6 +1161,19 @@ async fn hydrate_local_model_from_registry(
             })
         })
         .or_else(|| versions.first());
+
+    let civitai_source = selected_version
+        .and_then(|version| {
+            sources.iter().find(|source| {
+                source.provider.eq_ignore_ascii_case("civitai")
+                    && version
+                        .source_version_id
+                        .as_deref()
+                        .zip(source.external_version_id.as_deref())
+                        .is_some_and(|(version_id, source_id)| version_id == source_id)
+            })
+        })
+        .or_else(|| sources.iter().find(|source| source.provider.eq_ignore_ascii_case("civitai")));
 
     let civitai_model_id = civitai_source
         .and_then(|source| source.external_model_id.as_deref())
@@ -2270,7 +2282,7 @@ fn set_models_root(app: State<AppStateInner>, handle: AppHandle, path:String)->A
     let app_clone=app.inner().clone(); let handle_clone=handle.clone();
     let mut watcher=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{ if let Ok(e)=res { match e.kind { EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => { std::thread::sleep(Duration::from_millis(120)); recursive_scan_and_emit(app_clone.clone(),handle_clone.clone()); }, _=>{} } } }).map_err(|e|AppError::Io(io::Error::other(e.to_string())))?;
     watcher.watch(&root,RecursiveMode::Recursive).map_err(|e|AppError::Io(io::Error::other(e.to_string())))?; *app.watcher.lock().unwrap()=Some(watcher);
-    let removed=scan_root(&app,&root)?; if !removed.is_empty(){let app_state=app.inner().clone();tauri::async_runtime::spawn(async move{reconcile_removed_registry_files(&app_state,removed).await;});} emit_models_changed(&handle); spawn_registry_sync(app.inner().clone(),handle.clone()); spawn_registry_event_sync(app.inner().clone()); spawn_hash_enrichment(app.inner().clone(),handle.clone()); Ok(AppStateResponse{models_root:Some(path),storage:storage_stats_inner(&app.app_data)?})
+    let removed=scan_root(&app,&root)?; if !removed.is_empty(){let app_state=app.inner().clone();tauri::async_runtime::spawn(async move{reconcile_removed_registry_files(&app_state,removed).await;});} emit_models_changed(&handle); spawn_registry_sync(app.inner().clone(),handle.clone()); spawn_registry_event_sync(app.inner().clone(), handle.clone()); spawn_hash_enrichment(app.inner().clone(),handle.clone()); Ok(AppStateResponse{models_root:Some(path),storage:storage_stats_inner(&app.app_data)?})
 }
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
@@ -4180,7 +4192,7 @@ fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
 }
 
 
-fn spawn_registry_event_sync(app: AppStateInner) {
+fn spawn_registry_event_sync(app: AppStateInner, handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             let cursor = match app.registry_event_cursor.lock() {
@@ -4191,6 +4203,7 @@ fn spawn_registry_event_sync(app: AppStateInner) {
             match app.registry.events(cursor).await {
                 Ok(events) => {
                     let mut next_cursor = cursor;
+                    let mut changed = false;
 
                     for event in events {
                         next_cursor = next_cursor.max(event.id);
@@ -4198,29 +4211,37 @@ fn spawn_registry_event_sync(app: AppStateInner) {
                             continue;
                         };
 
-                        let local_ids: Vec<i64> = match open_db(&app.app_data).and_then(|c| {
+                        let local_ids: Vec<(i64, Option<String>)> = match open_db(&app.app_data).and_then(|c| {
                             let mut stmt = c.prepare(
-                                "SELECT id FROM models WHERE registry_model_id=?1"
+                                "SELECT id,registry_version_id FROM models WHERE registry_model_id=?1"
                             )?;
-                            let rows = stmt.query_map([registry_model_id], |r| r.get::<_, i64>(0))?;
+                            let rows = stmt.query_map([registry_model_id], |r| {
+                                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+                            })?;
                             Ok(rows.filter_map(Result::ok).collect())
                         }) {
                             Ok(ids) => ids,
                             Err(_) => Vec::new(),
                         };
 
-                        for local_id in local_ids {
-                            let _ = hydrate_local_model_from_registry(
+                        for (local_id, registry_version_id) in local_ids {
+                            if hydrate_local_model_from_registry(
                                 &app,
                                 local_id,
                                 registry_model_id,
-                                None,
-                            ).await;
+                                registry_version_id.as_deref(),
+                            ).await.is_ok() {
+                                changed = true;
+                            }
                         }
                     }
 
                     if let Ok(mut value) = app.registry_event_cursor.lock() {
                         *value = next_cursor;
+                    }
+
+                    if changed {
+                        emit_models_changed(&handle);
                     }
                 }
                 Err(_) => {}
@@ -4250,7 +4271,7 @@ pub fn run() {
                 registry_sync_running: Arc::new(Mutex::new(false)),
                 registry_event_cursor: Arc::new(Mutex::new(0)),
             };app.manage(state.clone());
-            if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let removed=scan_root(&state,&root).unwrap_or_default(); if !removed.is_empty(){let app_state=state.clone();tauri::async_runtime::spawn(async move{reconcile_removed_registry_files(&app_state,removed).await;});} let handle=app.handle().clone();spawn_registry_sync(state.clone(),handle.clone());spawn_registry_event_sync(state.clone());spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
+            if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let removed=scan_root(&state,&root).unwrap_or_default(); if !removed.is_empty(){let app_state=state.clone();tauri::async_runtime::spawn(async move{reconcile_removed_registry_files(&app_state,removed).await;});} let handle=app.handle().clone();spawn_registry_sync(state.clone(),handle.clone());spawn_registry_event_sync(state.clone(), app.handle().clone());spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
