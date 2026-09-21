@@ -28,7 +28,7 @@ futures-util = "0.3"
 url = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
 image = { version = "0.25", default-features = false, features = ["avif", "jpeg", "png", "webp"] }
-keyring = { version = "3.6", features = ["windows-native"] }
+keyring = { version = "4.2", features = ["windows-native"] }
 thiserror = "2"
 urlencoding = "2.1"
 axum = "0.8"
