@@ -945,7 +945,7 @@ fn sha256_file(path: &Path) -> AppResult<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<Vec<(String, Option<String>, Option<String>)>> {
+fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<Vec<RegistryRemoval>> {
     let _guard = app.scan_lock.lock().unwrap();
     let c = open_db(&app.app_data)?;
     let mut seen = HashSet::<String>::new();
@@ -1104,6 +1104,8 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
         cover_source_image_id:r.get(21)?, cover_position_x:r.get(22)?, cover_position_y:r.get(23)?, downloaded_at:r.get(24)?
     })
 }
+type RegistryRemoval = (String, Option<String>, Option<String>);
+
 const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,thumbnail_path,updated_at,cover_path,cover_source_image_id,cover_position_x,cover_position_y,downloaded_at FROM models";
 fn model_by_id(c: &Connection, id: i64) -> AppResult<ModelRecord> {
     Ok(c.query_row(&format!("{MODEL_SELECT} WHERE id=?1"), [id], model_from_row)?)
