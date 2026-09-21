@@ -19,8 +19,10 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tauri::{AppHandle, Emitter, Manager, State};
 use thiserror::Error;
 use url::Url;
+use registry::RegistryClient;
 use walkdir::WalkDir;
 
+mod registry;
 mod web;
 
 const API_BASE: &str = "https://civitai.com/api/v1";
@@ -47,6 +49,8 @@ fn emit_models_changed(handle: &AppHandle) {
 enum AppError {
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
+    #[error("model registry error: {0}")]
+    Registry(String),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
     #[error("network error: {0}")]
@@ -59,6 +63,12 @@ enum AppError {
     Invalid(String),
     #[error("keyring error: {0}")]
     Keyring(String),
+}
+
+impl From<registry::RegistryError> for AppError {
+    fn from(error: registry::RegistryError) -> Self {
+        Self::Registry(error.to_string())
+    }
 }
 
 impl serde::Serialize for AppError {
@@ -83,6 +93,8 @@ struct AppStateInner {
     parallel_downloads: Arc<Mutex<usize>>,
     examples_refresh_state: Arc<Mutex<ExamplesRefreshState>>,
     cache_lock: Arc<AsyncMutex<()>>,
+    registry: RegistryClient,
+    registry_sync_running: Arc<Mutex<bool>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -384,7 +396,10 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
         cover_position_x REAL NOT NULL DEFAULT 50,
         cover_position_y REAL NOT NULL DEFAULT 50,
         cover_source_image_id INTEGER,
-        downloaded_at INTEGER NOT NULL DEFAULT 0
+        downloaded_at INTEGER NOT NULL DEFAULT 0,
+        registry_model_id TEXT,
+        registry_version_id TEXT,
+        registry_file_id TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_models_type ON models(model_type);
       CREATE INDEX IF NOT EXISTS idx_models_civitai ON models(civitai_model_id, civitai_version_id);
@@ -427,6 +442,14 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
         c.execute("ALTER TABLE models ADD COLUMN downloaded_at INTEGER NOT NULL DEFAULT 0",[])?;
         c.execute("UPDATE models SET downloaded_at=?1 WHERE downloaded_at=0",[now()])?;
     }
+    let has_registry_model_id:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='registry_model_id'",[],|r|r.get(0))?;
+    if has_registry_model_id==0 { c.execute("ALTER TABLE models ADD COLUMN registry_model_id TEXT",[])?; }
+    let has_registry_version_id:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='registry_version_id'",[],|r|r.get(0))?;
+    if has_registry_version_id==0 { c.execute("ALTER TABLE models ADD COLUMN registry_version_id TEXT",[])?; }
+    let has_registry_file_id:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='registry_file_id'",[],|r|r.get(0))?;
+    if has_registry_file_id==0 { c.execute("ALTER TABLE models ADD COLUMN registry_file_id TEXT",[])?; }
+    c.execute("CREATE INDEX IF NOT EXISTS idx_models_registry_model ON models(registry_model_id)",[])?;
+
     let has_cached_at:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('images') WHERE name='cached_at'",[],|r|r.get(0))?;
     if has_cached_at==0 {
         c.execute("ALTER TABLE images ADD COLUMN cached_at INTEGER NOT NULL DEFAULT 0",[])?;
@@ -497,7 +520,6 @@ fn cache_file_counts(path: &Path) -> (i64, i64) {
     }
     (files, bytes)
 }
-
 fn cache_stats_inner(app_data: &Path) -> AppResult<CacheStats> {
     let c = open_db(app_data)?;
     let root = cache_root(app_data);
@@ -3531,7 +3553,8 @@ pub fn run() {
         .manage(web::WebServerController::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let app_data=app.path().app_data_dir()?;fs::create_dir_all(&app_data)?;let c=open_db(&app_data)?;let saved=setting(&c,"models_root")?;let parallel=read_parallel_downloads(&c)?;let state=AppStateInner{app_data:app_data.clone(),models_root:Arc::new(RwLock::new(saved.map(PathBuf::from))),watcher:Arc::new(Mutex::new(None)),scan_lock:Arc::new(Mutex::new(())),
+            let app_data=app.path().app_data_dir()?;fs::create_dir_all(&app_data)?;let c=open_db(&app_data)?;let saved=setting(&c,"models_root")?;let parallel=read_parallel_downloads(&c)?;let registry=RegistryClient::from_app_data(&app_data).map_err(|e|io::Error::other(e.to_string()))?;
+            let state=AppStateInner{app_data:app_data.clone(),models_root:Arc::new(RwLock::new(saved.map(PathBuf::from))),watcher:Arc::new(Mutex::new(None)),scan_lock:Arc::new(Mutex::new(())),
                 downloads:Arc::new(Mutex::new(Vec::new())),
                 active_download_paths:Arc::new(Mutex::new(HashSet::new())),
                 active_download_versions:Arc::new(Mutex::new(HashSet::new())),
@@ -3539,8 +3562,10 @@ pub fn run() {
                 parallel_downloads:Arc::new(Mutex::new(parallel)),
                 examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
                 cache_lock: Arc::new(AsyncMutex::new(())),
+                registry,
+                registry_sync_running: Arc::new(Mutex::new(false)),
             };app.manage(state.clone());
-            if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
+            if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_registry_sync(state.clone(),handle.clone());spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
@@ -3566,6 +3591,8 @@ mod tests {
             parallel_downloads: Arc::new(Mutex::new(3)),
             examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
             cache_lock: Arc::new(AsyncMutex::new(())),
+            registry: RegistryClient::from_app_data(&app_data).unwrap(),
+            registry_sync_running: Arc::new(Mutex::new(false)),
         }
     }
 
