@@ -1145,9 +1145,9 @@ async fn hydrate_local_model_from_registry(
     registry_version_id: Option<&str>,
 ) -> AppResult<ModelRecord> {
     let model = app.registry.get_model(registry_model_id).await?;
-    let tags = app.registry.tags(registry_model_id).await.unwrap_or_default();
-    let sources = app.registry.sources(registry_model_id).await.unwrap_or_default();
-    let versions = app.registry.versions(registry_model_id).await.unwrap_or_default();
+    let tags = app.registry.tags(registry_model_id).await?;
+    let sources = app.registry.sources(registry_model_id).await?;
+    let versions = app.registry.versions(registry_model_id).await?;
 
     let selected_version = registry_version_id
         .and_then(|id| versions.iter().find(|version| version.id == id))
@@ -1528,7 +1528,7 @@ async fn apply_civitai_metadata_to_registry(
     ).await?;
 
     if !tags_user_modified {
-        let existing_tags = app.registry.tags(&registry_model_id).await.unwrap_or_default();
+        let existing_tags = app.registry.tags(&registry_model_id).await?;
         for tag in existing_tags.iter().filter(|tag| !tags.iter().any(|value| value.eq_ignore_ascii_case(tag))) {
             let _ = app.registry.remove_tag(&registry_model_id, tag).await;
         }
@@ -2422,7 +2422,7 @@ async fn set_model_tags_inner(
         )?
     };
 
-    let existing = app.registry.tags(&registry_model_id).await.unwrap_or_default();
+    let existing = app.registry.tags(&registry_model_id).await?;
     for tag in existing.iter().filter(|tag| !normalized.iter().any(|value| value.eq_ignore_ascii_case(tag))) {
         let _ = app.registry.remove_tag(&registry_model_id, tag).await;
     }
@@ -2553,20 +2553,25 @@ async fn delete_model_inner(app: &AppStateInner, handle: AppHandle, id: i64) -> 
         return Err(AppError::Invalid("Refusing to delete a model outside the configured models folder".into()));
     }
 
-    if let (Some(registry_model_id), Some(registry_file_id)) =
-        (registry_model_id.as_deref(), registry_file_id.as_deref())
-    {
-        app.registry
-            .remove_file(registry_model_id, registry_file_id)
-            .await?;
-    }
-
-    if path.exists() {
+    let physical_removed = if path.exists() {
         let meta = fs::metadata(&path)?;
         if !meta.is_file() {
             return Err(AppError::Invalid("The model path is not a regular file".into()));
         }
         fs::remove_file(&path)?;
+        true
+    } else {
+        false
+    };
+
+    if physical_removed {
+        if let (Some(registry_model_id), Some(registry_file_id)) =
+            (registry_model_id.as_deref(), registry_file_id.as_deref())
+        {
+            if app.registry.remove_file(registry_model_id, registry_file_id).await.is_err() {
+                queue_registry_file_removal(app, registry_model_id, registry_file_id);
+            }
+        }
     }
 
     for (local_path, thumb_path) in image_paths {
