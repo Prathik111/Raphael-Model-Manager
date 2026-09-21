@@ -497,7 +497,6 @@ fn read_parallel_downloads(c: &Connection) -> AppResult<usize> {
     Ok(setting(c, "parallel_downloads")?.and_then(|value| value.parse::<i64>().ok()).map(clamp_parallel_downloads).unwrap_or(3) as usize)
 }
 
-
 fn read_example_load_amount(c: &Connection) -> AppResult<i64> {
     Ok(setting(c, "example_load_amount")?
         .and_then(|value| value.parse::<i64>().ok())
@@ -1224,25 +1223,24 @@ async fn sync_local_model_to_registry(
     app: &AppStateInner,
     local_id: i64,
 ) -> AppResult<ModelRecord> {
-    let (local, registry_model_id, registry_version_id, registry_file_id): (
-        ModelRecord,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = {
+    let (local, existing_registry_model_id, existing_registry_version_id, existing_registry_file_id) = {
         let c = open_db(&app.app_data)?;
         let local = model_by_id(&c, local_id)?;
         let ids = c.query_row(
             "SELECT registry_model_id,registry_version_id,registry_file_id FROM models WHERE id=?1",
             [local_id],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)),
+            |r| Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            )),
         )?;
         (local, ids.0, ids.1, ids.2)
     };
 
-    let source_hash = match local.source_hash.clone() {
-        Some(hash) if !hash.trim().is_empty() => hash,
-        _ => {
+    let source_hash = match local.source_hash.clone().filter(|value| !value.trim().is_empty()) {
+        Some(hash) => hash,
+        None => {
             let hash = sha256_file(Path::new(&local.path))?;
             let c = open_db(&app.app_data)?;
             c.execute(
@@ -1253,20 +1251,19 @@ async fn sync_local_model_to_registry(
         }
     };
 
-    let deterministic_id = registry_model_id.clone().unwrap_or_else(|| {
+    let deterministic_id = existing_registry_model_id.clone().unwrap_or_else(|| {
         if let Some(civitai_id) = local.civitai_model_id {
             format!("civitai_model_{civitai_id}")
         } else {
-            format!("sha256_{}", source_hash)
+            format!("sha256_{source_hash}")
         }
     });
 
-    let mut model = match app.registry.get_model(&deterministic_id).await {
-        Ok(model) => model,
-        Err(_) => match app.registry.get_model(&deterministic_id).await {
-            Ok(existing) => existing,
-            Err(_) => {
-                let created = app.registry.create_model(
+    let (registry_model, created_new) = match app.registry.get_model(&deterministic_id).await {
+        Ok(model) => (model, false),
+        Err(_) => (
+            app.registry
+                .create_model(
                     &deterministic_id,
                     local.civitai_name.as_deref().unwrap_or(&local.filename),
                     registry_model_type(&local.model_type),
@@ -1277,100 +1274,107 @@ async fn sync_local_model_to_registry(
                         "managed_by": "raphael-model-manager",
                         "local_model_id": local_id
                     }),
-                ).await?;
-                if created.id.is_empty() {
-                    return Err(AppError::Registry("Registry created an invalid model id".into()));
-                }
-                created
-            }
-        },
+                )
+                .await?,
+            true,
+        ),
     };
 
-    let created_model_id = model.id.clone();
+    let mut registry_version_id = existing_registry_version_id;
 
     if let (Some(civitai_model_id), Some(civitai_version_id)) =
         (local.civitai_model_id, local.civitai_version_id)
     {
-        let version_id = format!("civitai_version_{civitai_version_id}");
-        let versions = app.registry.versions(&created_model_id).await.unwrap_or_default();
-        let external_version_text = civitai_version_id.to_string();
-        let existing = versions
-            .iter()
-            .find(|version| {
-                version.id == version_id
-                    || version.source_version_id.as_deref() == Some(external_version_text.as_str())
-            })
-            .cloned();
-
-        let version = if let Some(existing) = existing {
-            app.registry.update_version(
-                &created_model_id,
-                &existing.id,
-                existing.revision,
-                json!({
-                    "version_name": local.version_name,
-                    "base_model": local.base_model,
-                    "source": "civitai",
-                    "source_model_id": civitai_model_id.to_string(),
-                    "source_version_id": civitai_version_id.to_string(),
-                    "source_url": local.civitai_url,
-                    "activation_prompts": local.activation_prompts,
-                    "metadata": {}
-                }),
-            ).await.unwrap_or(existing)
+        let external_version = civitai_version_id.to_string();
+        let versions = app.registry.versions(&registry_model.id).await?;
+        if let Some(version) = versions.iter().find(|item| {
+            item.source_version_id.as_deref() == Some(external_version.as_str())
+        }) {
+            registry_version_id = Some(version.id.clone());
         } else {
-            app.registry.create_version(
-                &created_model_id,
+            let version = app.registry.create_version(
+                &registry_model.id,
                 json!({
-                    "id": version_id,
                     "version_name": local.version_name,
                     "base_model": local.base_model,
                     "source": "civitai",
                     "source_model_id": civitai_model_id.to_string(),
-                    "source_version_id": civitai_version_id.to_string(),
+                    "source_version_id": external_version,
                     "source_url": local.civitai_url,
                     "activation_prompts": local.activation_prompts,
                     "metadata": {}
                 }),
-            ).await?
-        };
-
-        app.registry.add_source(
-            &created_model_id,
-            json!({
-                "provider": "civitai",
-                "external_model_id": civitai_model_id.to_string(),
-                "external_version_id": civitai_version_id.to_string(),
-                "url": local.civitai_url,
-                "metadata": {}
-            }),
-        ).await?;
-
-        let mut registry_version_id = version.id.clone();
-        let files = app.registry.files(&created_model_id).await.unwrap_or_default();
-
-        if let Some(existing_file) = files.iter().find(|file| file.id == registry_file_id.clone().unwrap_or_default()).cloned() {
-            if existing_file.path != local.path || existing_file.sha256.as_deref() != Some(source_hash.as_str()) {
-                let _ = app.registry.remove_file(&created_model_id, &existing_file.id).await;
-                registry_version_id = version.id.clone();
-            } else {
-                registry_version_id = existing_file.version_id.unwrap_or(version.id.clone());
-            }
+            ).await?;
+            registry_version_id = Some(version.id);
         }
 
-        let files = app.registry.files(&created_model_id).await.unwrap_or_default();
-        let matching = files.iter().find(|file| {
-            file.path == local.path || file.sha256.as_deref() == Some(source_hash.as_str())
-        }).cloned();
+        let sources = app.registry.sources(&registry_model.id).await?;
+        let already_linked = sources.iter().any(|source| {
+            source.provider.eq_ignore_ascii_case("civitai")
+                && source.external_model_id.as_deref() == Some(civitai_model_id.to_string().as_str())
+                && source.external_version_id.as_deref() == Some(civitai_version_id.to_string().as_str())
+        });
+        if !already_linked {
+            app.registry
+                .add_source(
+                    &registry_model.id,
+                    json!({
+                        "provider": "civitai",
+                        "external_model_id": civitai_model_id.to_string(),
+                        "external_version_id": civitai_version_id.to_string(),
+                        "url": local.civitai_url,
+                        "metadata": {}
+                    }),
+                )
+                .await?;
+        }
+    }
 
-        let file = if let Some(file) = matching {
-            file
+    if created_new {
+        for tag in normalize_tags(local.tags.clone()) {
+            let _ = app.registry.add_tag(&registry_model.id, &tag).await;
+        }
+    }
+
+    let files = app.registry.files(&registry_model.id).await?;
+    let mut registry_file_id = existing_registry_file_id;
+
+    let exact = |file: &registry::RegistryFile| {
+        file.path == local.path
+            && file.sha256.as_deref() == Some(source_hash.as_str())
+            && file.size_bytes == local.size_bytes
+            && file.modified_at == local.modified_at
+    };
+
+    if let Some(id) = registry_file_id.clone() {
+        if let Some(file) = files.iter().find(|file| file.id == id) {
+            if !exact(file) {
+                app.registry.remove_file(&registry_model.id, &id).await?;
+                registry_file_id = None;
+            }
         } else {
-            app.registry.add_file(
-                &created_model_id,
+            registry_file_id = None;
+        }
+    }
+
+    for file in &files {
+        if registry_file_id.as_deref() == Some(file.id.as_str()) {
+            continue;
+        }
+        if file.path == local.path && !exact(file) {
+            let _ = app.registry.remove_file(&registry_model.id, &file.id).await;
+        }
+    }
+
+    if registry_file_id.is_none() {
+        let refreshed_files = app.registry.files(&registry_model.id).await?;
+        if let Some(file) = refreshed_files.iter().find(|file| exact(file)).cloned() {
+            registry_file_id = Some(file.id);
+        } else {
+            let file = app.registry.add_file(
+                &registry_model.id,
                 json!({
-                    "id": format!("file_{}", source_hash),
-                    "version_id": Some(registry_version_id.clone()),
+                    "version_id": registry_version_id,
                     "path": local.path,
                     "relative_path": local.relative_path,
                     "filename": local.filename,
@@ -1379,82 +1383,33 @@ async fn sync_local_model_to_registry(
                     "sha256": source_hash,
                     "status": "available"
                 }),
-            ).await?
-        };
-
-        {
-            let tags = local.tags.clone();
-            for tag in tags {
-                let _ = app.registry.add_tag(&created_model_id, &tag).await;
-            }
+            ).await?;
+            registry_file_id = Some(file.id);
         }
+    }
 
-        model = app.registry.get_model(&created_model_id).await?;
-        let _ = hydrate_local_model_from_registry(app, local_id, &model.id, Some(&version.id)).await?;
+    {
         let c = open_db(&app.app_data)?;
         c.execute(
             "UPDATE models SET registry_model_id=?2,registry_version_id=?3,registry_file_id=?4,source_hash=?5,updated_at=?6 WHERE id=?1",
-            params![local_id, model.id, version.id, file.id, source_hash, now()],
-        )?;
-    } else {
-        let files = app.registry.files(&created_model_id).await.unwrap_or_default();
-
-        if let Some(existing_file_id) = registry_file_id.clone() {
-            if let Some(existing_file) = files.iter().find(|file| file.id == existing_file_id) {
-                if existing_file.path != local.path
-                    || existing_file.sha256.as_deref() != Some(source_hash.as_str())
-                    || existing_file.size_bytes != local.size_bytes
-                    || existing_file.modified_at != local.modified_at
-                {
-                    let _ = app.registry.remove_file(&created_model_id, &existing_file.id).await;
-                }
-            }
-        }
-
-        let files = app.registry.files(&created_model_id).await.unwrap_or_default();
-        let matching = files.iter().find(|file| {
-            file.path == local.path
-                && file.sha256.as_deref() == Some(source_hash.as_str())
-                && file.size_bytes == local.size_bytes
-                && file.modified_at == local.modified_at
-        }).cloned();
-
-        let file = if let Some(file) = matching {
-            file
-        } else {
-            app.registry.add_file(
-                &created_model_id,
-                json!({
-                    "id": format!("file_{}", source_hash),
-                    "path": local.path,
-                    "relative_path": local.relative_path,
-                    "filename": local.filename,
-                    "size_bytes": local.size_bytes,
-                    "modified_at": local.modified_at,
-                    "sha256": source_hash,
-                    "status": "available"
-                }),
-            ).await?
-        };
-
-        let existing_tags = app.registry.tags(&created_model_id).await.unwrap_or_default();
-        if existing_tags.is_empty() {
-            for tag in local.tags.clone() {
-                let _ = app.registry.add_tag(&created_model_id, &tag).await;
-            }
-        }
-
-        let _ = hydrate_local_model_from_registry(app, local_id, &created_model_id, None).await?;
-        let c = open_db(&app.app_data)?;
-        c.execute(
-            "UPDATE models SET registry_model_id=?2,registry_file_id=?3,source_hash=?4,updated_at=?5 WHERE id=?1",
-            params![local_id, created_model_id, file.id, source_hash, now()],
+            params![
+                local_id,
+                registry_model.id,
+                registry_version_id,
+                registry_file_id,
+                source_hash,
+                now()
+            ],
         )?;
     }
 
-    hydrate_local_model_from_registry(app, local_id, &created_model_id, registry_version_id.as_deref()).await
+    hydrate_local_model_from_registry(
+        app,
+        local_id,
+        &registry_model.id,
+        registry_version_id.as_deref(),
+    ).await
 }
-
 
 async fn apply_civitai_metadata_to_registry(
     app: &AppStateInner,
@@ -1997,7 +1952,6 @@ fn featured_image_key(image: &Value, version_id: i64, index: usize) -> Option<i6
     if url.is_empty() {
         return None;
     }
-
     // modelVersions[].images does not reliably expose an image ID.
     // Use a deterministic negative key derived from the actual image URL
     // and version instead of requiring an optional/absent JSON field.
