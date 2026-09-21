@@ -2496,6 +2496,7 @@ fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
 #[tauri::command]
 fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult<i64> {
     let updated = add_subfolder_tags_inner(&app)?;
+    spawn_registry_sync(app.inner().clone(), handle.clone());
     emit_models_changed(&handle);
     Ok(updated)
 }
@@ -2517,10 +2518,31 @@ async fn delete_model_inner(app: &AppStateInner, handle: AppHandle, id: i64) -> 
         (PathBuf::from(model.path), model.thumbnail_path, model.cover_path, image_paths)
     };
 
+    let _ = sync_local_model_to_registry(app, id).await?;
+    let (registry_model_id, registry_file_id) = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id,registry_file_id FROM models WHERE id=?1",
+            [id],
+            |r| Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            )),
+        )?
+    };
+
     let root_canonical = root.canonicalize()?;
     let path_canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
     if !path_canonical.starts_with(&root_canonical) {
         return Err(AppError::Invalid("Refusing to delete a model outside the configured models folder".into()));
+    }
+
+    if let (Some(registry_model_id), Some(registry_file_id)) =
+        (registry_model_id.as_deref(), registry_file_id.as_deref())
+    {
+        app.registry
+            .remove_file(registry_model_id, registry_file_id)
+            .await?;
     }
 
     if path.exists() {
