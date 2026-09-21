@@ -2242,19 +2242,54 @@ fn get_tags(app:State<AppStateInner>)->AppResult<Vec<TagRecord>>{
 }
 
 #[tauri::command]
-fn set_model_tags(app:State<AppStateInner>, handle:AppHandle, id:i64, tags:Vec<String>)->AppResult<ModelRecord>{
-    let normalized=normalize_tags(tags);
-    let c=open_db(&app.app_data)?;
-    let changed = c.execute(
-        "UPDATE models SET tags_json=?2,tags_user_modified=1,updated_at=?3 WHERE id=?1",
-        params![id,serde_json::to_string(&normalized).unwrap_or_else(|_|"[]".into()),now()],
-    )?;
-    if changed == 0 {
-        return Err(AppError::Invalid("Model no longer exists".into()));
+async fn set_model_tags_inner(
+    app: &AppStateInner,
+    handle: AppHandle,
+    id: i64,
+    tags: Vec<String>,
+) -> AppResult<ModelRecord> {
+    let normalized = normalize_tags(tags);
+    let _ = sync_local_model_to_registry(app, id).await?;
+
+    let registry_model_id: String = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id FROM models WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?
+    };
+
+    let existing = app.registry.tags(&registry_model_id).await.unwrap_or_default();
+    for tag in existing.iter().filter(|tag| !normalized.iter().any(|value| value.eq_ignore_ascii_case(tag))) {
+        let _ = app.registry.remove_tag(&registry_model_id, tag).await;
     }
-    let rec=model_by_id(&c,id)?;
+    for tag in &normalized {
+        if !existing.iter().any(|value| value.eq_ignore_ascii_case(tag)) {
+            app.registry.add_tag(&registry_model_id, tag).await?;
+        }
+    }
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET tags_user_modified=1,updated_at=?2 WHERE id=?1",
+        params![id, now()],
+    )?;
+    drop(c);
+
+    let rec = hydrate_local_model_from_registry(app, id, &registry_model_id, None).await?;
     emit_models_changed(&handle);
     Ok(rec)
+}
+
+#[tauri::command]
+async fn set_model_tags(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    tags: Vec<String>,
+) -> AppResult<ModelRecord> {
+    set_model_tags_inner(app.inner(), handle, id, tags).await
 }
 
 fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
@@ -2391,22 +2426,56 @@ async fn delete_model(
     delete_model_inner(app.inner(), handle, id).await
 }
 #[tauri::command]
-fn set_model_type(app:State<AppStateInner>, handle:AppHandle, id:i64, model_type:String)->AppResult<ModelRecord>{
-    let requested=model_type.trim();
-    let c=open_db(&app.app_data)?;
-    let current_path:String=c.query_row("SELECT path FROM models WHERE id=?1",[id],|r|r.get(0))?;
-    let next_type=if requested.eq_ignore_ascii_case("auto") {
-        let root=app.models_root.read().unwrap().clone().ok_or_else(||AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
-        file_type_from_path(Path::new(&current_path),&root)
+async fn set_model_type(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    model_type: String,
+) -> AppResult<ModelRecord> {
+    let requested = model_type.trim();
+    let current = {
+        let c = open_db(&app.app_data)?;
+        model_by_id(&c, id)?
+    };
+    let next_type = if requested.eq_ignore_ascii_case("auto") {
+        let root = app.models_root.read().unwrap().clone().ok_or_else(|| {
+            AppError::Invalid("Choose your ComfyUI models folder first".into())
+        })?;
+        file_type_from_path(Path::new(&current.path), &root)
     } else {
         match requested {
-            "Checkpoint"|"LoRA"|"VAE"|"ControlNet"|"Embedding"|"Upscaler"|"Text Encoder"|"CLIP Vision"|"IP-Adapter"|"Other" => requested.to_string(),
+            "Checkpoint" | "LoRA" | "VAE" | "ControlNet" | "Embedding" | "Upscaler"
+            | "Text Encoder" | "CLIP Vision" | "IP-Adapter" | "Other" => requested.to_string(),
             _ => return Err(AppError::Invalid("Unsupported model type".into())),
         }
     };
-    let locked=if requested.eq_ignore_ascii_case("auto"){0}else{1};
-    c.execute("UPDATE models SET model_type=?2,model_type_user_modified=?3,updated_at=?4 WHERE id=?1",params![id,next_type,locked,now()])?;
-    let rec=model_by_id(&c,id)?;
+
+    let _ = sync_local_model_to_registry(&app, id).await?;
+    let registry_model_id = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id FROM models WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?
+    };
+    let registry_model = app.registry.get_model(&registry_model_id).await?;
+    app.registry
+        .update_model(
+            &registry_model_id,
+            registry_model.revision,
+            json!({"model_type": registry_model_type(&next_type)}),
+        )
+        .await?;
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET model_type_user_modified=?2,updated_at=?3 WHERE id=?1",
+        params![id, if requested.eq_ignore_ascii_case("auto") { 0 } else { 1 }, now()],
+    )?;
+    drop(c);
+
+    let rec = hydrate_local_model_from_registry(app.inner(), id, &registry_model_id, None).await?;
     emit_models_changed(&handle);
     Ok(rec)
 }
