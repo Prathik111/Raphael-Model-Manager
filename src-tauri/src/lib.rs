@@ -1205,20 +1205,17 @@ async fn sync_local_model_to_registry(
         }
     };
 
-    let candidate_id = registry_model_id
-        .or_else(|| Some(format!("legacy_model_{local_id}")))
-        .unwrap();
+    let deterministic_id = registry_model_id.clone().unwrap_or_else(|| {
+        if let Some(civitai_id) = local.civitai_model_id {
+            format!("civitai_model_{civitai_id}")
+        } else {
+            format!("sha256_{}", source_hash)
+        }
+    });
 
-    let mut model = match app.registry.get_model(&candidate_id).await {
+    let mut model = match app.registry.get_model(&deterministic_id).await {
         Ok(model) => model,
         Err(_) => {
-            let deterministic_id = if let Some(civitai_id) = local.civitai_model_id {
-                format!("civitai_model_{civitai_id}")
-            } else {
-                format!("sha256_{}", source_hash)
-            };
-
-            match app.registry.get_model(&deterministic_id).await {
                 Ok(existing) => existing,
                 Err(_) => {
                     let created = app.registry.create_model(
@@ -1251,7 +1248,10 @@ async fn sync_local_model_to_registry(
         let versions = app.registry.versions(&created_model_id).await.unwrap_or_default();
         let existing = versions
             .iter()
-            .find(|version| version.id == version_id || version.source_version_id.as_deref() == Some(civitai_version_id.to_string().as_str()))
+            .find(|version| {
+                version.id == version_id
+                    || version.source_version_id.as_deref() == Some(&civitai_version_id.to_string())
+            })
             .cloned();
 
         let version = if let Some(existing) = existing {
@@ -1388,6 +1388,133 @@ async fn sync_local_model_to_registry(
     }
 
     hydrate_local_model_from_registry(app, local_id, &created_model_id, registry_version_id.as_deref()).await
+}
+
+
+async fn apply_civitai_metadata_to_registry(
+    app: &AppStateInner,
+    local_id: i64,
+    model: &Value,
+    version: &Value,
+    canonical_url: &str,
+    tags: &[String],
+    activation_prompts: &[String],
+    description: Option<&str>,
+    creator: Option<&str>,
+) -> AppResult<(String, String)> {
+    let _ = sync_local_model_to_registry(app, local_id).await?;
+    let (registry_model_id, tags_user_modified) = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id,tags_user_modified FROM models WHERE id=?1",
+            [local_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+        )?
+    };
+
+    let registry_model = app.registry.get_model(&registry_model_id).await?;
+    let model_type = {
+        let c = open_db(&app.app_data)?;
+        let local_type: String = c.query_row(
+            "SELECT model_type FROM models WHERE id=?1",
+            [local_id],
+            |r| r.get(0),
+        )?;
+        registry_model_type(&local_type).to_string()
+    };
+
+    app.registry.update_model(
+        &registry_model_id,
+        registry_model.revision,
+        json!({
+            "name": model.get("name").and_then(Value::as_str),
+            "model_type": model_type,
+            "creator": creator,
+            "description": description,
+            "base_model": version.get("baseModel").and_then(Value::as_str)
+        }),
+    ).await?;
+
+    let external_version_id = version
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| AppError::Invalid("Civitai response did not include a model version ID".into()))?;
+    let external_model_id = model
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| AppError::Invalid("Civitai response did not include a model ID".into()))?;
+    let desired_version_id = format!("civitai_version_{external_version_id}");
+
+    let versions = app.registry.versions(&registry_model_id).await?;
+    let version_payload = json!({
+        "version_name": version.get("name").and_then(Value::as_str),
+        "base_model": version.get("baseModel").and_then(Value::as_str),
+        "source": "civitai",
+        "source_model_id": external_model_id.to_string(),
+        "source_version_id": external_version_id.to_string(),
+        "source_url": canonical_url,
+        "activation_prompts": activation_prompts,
+        "metadata": {}
+    });
+
+    let registry_version_id = if let Some(existing) = versions.iter().find(|item| {
+        item.id == desired_version_id
+            || item.source_version_id.as_deref() == Some(&external_version_id.to_string())
+    }) {
+        app.registry.update_version(
+            &registry_model_id,
+            &existing.id,
+            existing.revision,
+            version_payload,
+        ).await?.id
+    } else {
+        app.registry.create_version(
+            &registry_model_id,
+            json!({
+                "id": desired_version_id,
+                "version_name": version.get("name").and_then(Value::as_str),
+                "base_model": version.get("baseModel").and_then(Value::as_str),
+                "source": "civitai",
+                "source_model_id": external_model_id.to_string(),
+                "source_version_id": external_version_id.to_string(),
+                "source_url": canonical_url,
+                "activation_prompts": activation_prompts,
+                "metadata": {}
+            }),
+        ).await?.id
+    };
+
+    app.registry.add_source(
+        &registry_model_id,
+        json!({
+            "provider": "civitai",
+            "external_model_id": external_model_id.to_string(),
+            "external_version_id": external_version_id.to_string(),
+            "url": canonical_url,
+            "metadata": {}
+        }),
+    ).await?;
+
+    if !tags_user_modified {
+        let existing_tags = app.registry.tags(&registry_model_id).await.unwrap_or_default();
+        for tag in existing_tags.iter().filter(|tag| !tags.iter().any(|value| value.eq_ignore_ascii_case(tag))) {
+            let _ = app.registry.remove_tag(&registry_model_id, tag).await;
+        }
+        for tag in tags {
+            if !existing_tags.iter().any(|value| value.eq_ignore_ascii_case(tag)) {
+                app.registry.add_tag(&registry_model_id, tag).await?;
+            }
+        }
+    }
+
+    let _ = hydrate_local_model_from_registry(
+        app,
+        local_id,
+        &registry_model_id,
+        Some(&registry_version_id),
+    ).await?;
+
+    Ok((registry_model_id, registry_version_id))
 }
 
 fn spawn_registry_sync(app: AppStateInner, handle: AppHandle) {
