@@ -996,6 +996,7 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<Vec<RegistryRemoval>
 
 type RemovedRegistryFile = (String, Option<String>, Option<String>);
 
+#[allow(clippy::type_complexity)]
 fn prune_unseen_models(
     c: &Connection,
     seen: &HashSet<String>,
