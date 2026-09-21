@@ -232,5 +232,3 @@ pub(crate) fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -
     emit_models_changed(&handle);
     Ok(updated)
 }
-
-#[tauri::command]
