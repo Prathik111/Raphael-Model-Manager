@@ -2548,7 +2548,6 @@ fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult
 
 #[tauri::command]
 async fn delete_model_inner(app: &AppStateInner, handle: AppHandle, id: i64) -> AppResult<()> {
-    let _guard=app.cache_lock.lock().await;
     let root = app.models_root.read().unwrap().clone()
         .ok_or_else(|| AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
 
@@ -2597,6 +2596,8 @@ async fn delete_model_inner(app: &AppStateInner, handle: AppHandle, id: i64) -> 
             queue_registry_file_removal(app, registry_model_id, registry_file_id);
         }
     }
+
+    let _guard = app.cache_lock.lock().await;
 
     for (local_path, thumb_path) in image_paths {
         for cached in [local_path, thumb_path].into_iter().flatten() {
@@ -3784,7 +3785,6 @@ async fn link_model_civitai_inner(
     id:i64,
     url:String,
 )->AppResult<ModelRecord>{
-    let _guard=app.cache_lock.lock().await;
     let trimmed=url.trim();
     let (_mid,_vid)=model_id_and_version(trimmed)?;
     let (model,version)=fetch_model_and_version(app,trimmed).await?;
@@ -3797,6 +3797,7 @@ async fn link_model_civitai_inner(
     let canonical=canonical_civitai_url(trimmed,mid,vid)?;
     let thumbnail_path=match mid {
         Some(model_id)=>{
+            let _cache_guard = app.cache_lock.lock().await;
             let result=ensure_model_thumbnail(app,model_id,&model,&version,trimmed).await?;
             let _=enforce_cache_limit_inner(&app.app_data);
             result
@@ -3824,7 +3825,6 @@ async fn link_model_civitai_inner(
     drop(c);
 
     emit_models_changed(&handle);
-    drop(_guard);
     Ok(rec)
 }
 
@@ -3843,7 +3843,6 @@ async fn refresh_model_civitai_inner(
     handle: AppHandle,
     id: i64,
 ) -> AppResult<ModelRecord> {
-    let _guard=app.cache_lock.lock().await;
     let current = {
         let c = open_db(&app.app_data)?;
         model_by_id(&c, id)?
@@ -3868,6 +3867,7 @@ async fn refresh_model_civitai_inner(
         .map(str::to_string);
     let thumbnail_path=match model.get("id").and_then(Value::as_i64) {
         Some(mid)=>{
+            let _cache_guard = app.cache_lock.lock().await;
             let result=ensure_model_thumbnail(app,mid,&model,&version,&url).await?;
             let _=enforce_cache_limit_inner(&app.app_data);
             result
@@ -3902,7 +3902,6 @@ async fn refresh_model_civitai_inner(
     drop(c);
 
     emit_models_changed(&handle);
-    drop(_guard);
     Ok(rec)
 }
 #[tauri::command]
