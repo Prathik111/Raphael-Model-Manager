@@ -29,7 +29,7 @@ use tokio::{
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
 use crate::{
-    add_subfolder_tags, add_subfolder_tags_inner, clear_download_progress, delete_model, delete_model_inner, get_app_state, get_download_progress, get_library_counts, get_model_images, get_storage_stats,
+    add_subfolder_tags, clear_download_progress, delete_model, delete_model_inner, get_app_state, get_download_progress, get_library_counts, get_model_images, get_storage_stats,
     get_parallel_downloads, set_parallel_downloads,
     get_cache_stats, set_cache_max_bytes, set_cache_location, clear_cache_images, clear_complete_cache, prune_cache_images, clean_cache_orphans,
     get_tags, install_civitai_model, link_model_civitai, link_model_civitai_inner, list_models, preview_civitai_import, preview_civitai_import_inner,
@@ -102,7 +102,7 @@ impl WebTaskStore {
                 }
             }
 
-            let result = operation().await;
+            let result = operation.await;
 
             if let Ok(mut guard) = store.inner.lock() {
                 if let Some(record) = guard.get_mut(&id) {
@@ -963,7 +963,7 @@ pub async fn set_web_app_enabled(
     let task_controller = controller.clone();
     let task_handle = handle.clone();
     tauri::async_runtime::spawn(async move {
-        let mut listener = listener;
+        let mut listener = Some(listener);
         let mut shutdown_rx = Some(shutdown_rx);
 
         loop {
@@ -982,7 +982,15 @@ pub async fn set_web_app_enabled(
                 }
             };
 
-            match axum::serve(listener, router)
+            let current_listener = match listener.take() {
+                Some(listener) => listener,
+                None => {
+                    eprintln!("Raphael web server supervisor has no listener to serve; stopping safely");
+                    break;
+                }
+            };
+
+            match axum::serve(current_listener, router)
                 .with_graceful_shutdown(async move {
                     let _ = current_shutdown.await;
                 })
@@ -1017,7 +1025,7 @@ pub async fn set_web_app_enabled(
 
                 match TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], WEB_PORT))).await {
                     Ok(next_listener) => {
-                        listener = next_listener;
+                        listener = Some(next_listener);
                         *task_controller.inner.url.write().unwrap() = Some(web_url());
                         let (next_shutdown_tx, next_shutdown_rx) = oneshot::channel();
                         *task_controller.inner.shutdown.lock().unwrap() = Some(next_shutdown_tx);
