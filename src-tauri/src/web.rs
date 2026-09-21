@@ -623,11 +623,15 @@ async fn task_start_handler(
                         .map_err(|error| AppError::Invalid(error.to_string()))
                 })
             }
-            "add_subfolder_tags" => Box::pin(async move {
-                let value = crate::add_subfolder_tags_inner(&app)?;
-                serde_json::to_value(value)
-                    .map_err(|error| AppError::Invalid(error.to_string()))
-            }),
+            "add_subfolder_tags" => {
+                let task_handle = handle.clone();
+                Box::pin(async move {
+                    let value = crate::add_subfolder_tags_inner(&app)?;
+                    crate::spawn_registry_sync(app.clone(), task_handle.clone());
+                    serde_json::to_value(value)
+                        .map_err(|error| AppError::Invalid(error.to_string()))
+                })
+            },
             "delete_model" => {
                 let args: IdArgs = match arg(request.args) {
                     Ok(value) => value,
@@ -747,11 +751,11 @@ async fn command_handler(
         "add_subfolder_tags" => add_subfolder_tags(handle.state(), handle.clone()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "set_model_tags" => {
             let args: TagsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            set_model_tags(handle.state(), handle.clone(), args.id, args.tags).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+            set_model_tags(handle.state(), handle.clone(), args.id, args.tags).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "set_model_type" => {
             let args: TypeArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
-            set_model_type(handle.state(), handle.clone(), args.id, args.model_type).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+            set_model_type(handle.state(), handle.clone(), args.id, args.model_type).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "set_model_cover_position" => {
             let args: CoverPositionArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };

@@ -19,8 +19,10 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tauri::{AppHandle, Emitter, Manager, State};
 use thiserror::Error;
 use url::Url;
+use registry::RegistryClient;
 use walkdir::WalkDir;
 
+mod registry;
 mod web;
 
 const API_BASE: &str = "https://civitai.com/api/v1";
@@ -47,6 +49,8 @@ fn emit_models_changed(handle: &AppHandle) {
 enum AppError {
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
+    #[error("model registry error: {0}")]
+    Registry(String),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
     #[error("network error: {0}")]
@@ -59,6 +63,12 @@ enum AppError {
     Invalid(String),
     #[error("keyring error: {0}")]
     Keyring(String),
+}
+
+impl From<registry::RegistryError> for AppError {
+    fn from(error: registry::RegistryError) -> Self {
+        Self::Registry(error.to_string())
+    }
 }
 
 impl serde::Serialize for AppError {
@@ -83,6 +93,9 @@ struct AppStateInner {
     parallel_downloads: Arc<Mutex<usize>>,
     examples_refresh_state: Arc<Mutex<ExamplesRefreshState>>,
     cache_lock: Arc<AsyncMutex<()>>,
+    registry: RegistryClient,
+    registry_sync_running: Arc<Mutex<bool>>,
+    registry_event_cursor: Arc<Mutex<i64>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -384,10 +397,18 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
         cover_position_x REAL NOT NULL DEFAULT 50,
         cover_position_y REAL NOT NULL DEFAULT 50,
         cover_source_image_id INTEGER,
-        downloaded_at INTEGER NOT NULL DEFAULT 0
+        downloaded_at INTEGER NOT NULL DEFAULT 0,
+        registry_model_id TEXT,
+        registry_version_id TEXT,
+        registry_file_id TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_models_type ON models(model_type);
       CREATE INDEX IF NOT EXISTS idx_models_civitai ON models(civitai_model_id, civitai_version_id);
+      CREATE TABLE IF NOT EXISTS pending_registry_file_removals (
+        registry_model_id TEXT NOT NULL,
+        registry_file_id TEXT NOT NULL,
+        PRIMARY KEY(registry_model_id, registry_file_id)
+      );
       CREATE TABLE IF NOT EXISTS images (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
@@ -427,6 +448,14 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
         c.execute("ALTER TABLE models ADD COLUMN downloaded_at INTEGER NOT NULL DEFAULT 0",[])?;
         c.execute("UPDATE models SET downloaded_at=?1 WHERE downloaded_at=0",[now()])?;
     }
+    let has_registry_model_id:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='registry_model_id'",[],|r|r.get(0))?;
+    if has_registry_model_id==0 { c.execute("ALTER TABLE models ADD COLUMN registry_model_id TEXT",[])?; }
+    let has_registry_version_id:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='registry_version_id'",[],|r|r.get(0))?;
+    if has_registry_version_id==0 { c.execute("ALTER TABLE models ADD COLUMN registry_version_id TEXT",[])?; }
+    let has_registry_file_id:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='registry_file_id'",[],|r|r.get(0))?;
+    if has_registry_file_id==0 { c.execute("ALTER TABLE models ADD COLUMN registry_file_id TEXT",[])?; }
+    c.execute("CREATE INDEX IF NOT EXISTS idx_models_registry_model ON models(registry_model_id)",[])?;
+
     let has_cached_at:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('images') WHERE name='cached_at'",[],|r|r.get(0))?;
     if has_cached_at==0 {
         c.execute("ALTER TABLE images ADD COLUMN cached_at INTEGER NOT NULL DEFAULT 0",[])?;
@@ -468,7 +497,6 @@ fn read_parallel_downloads(c: &Connection) -> AppResult<usize> {
     Ok(setting(c, "parallel_downloads")?.and_then(|value| value.parse::<i64>().ok()).map(clamp_parallel_downloads).unwrap_or(3) as usize)
 }
 
-
 fn read_example_load_amount(c: &Connection) -> AppResult<i64> {
     Ok(setting(c, "example_load_amount")?
         .and_then(|value| value.parse::<i64>().ok())
@@ -497,7 +525,6 @@ fn cache_file_counts(path: &Path) -> (i64, i64) {
     }
     (files, bytes)
 }
-
 fn cache_stats_inner(app_data: &Path) -> AppResult<CacheStats> {
     let c = open_db(app_data)?;
     let root = cache_root(app_data);
@@ -918,7 +945,7 @@ fn sha256_file(path: &Path) -> AppResult<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
+fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<Vec<RegistryRemoval>> {
     let _guard = app.scan_lock.lock().unwrap();
     let c = open_db(&app.app_data)?;
     let mut seen = HashSet::<String>::new();
@@ -963,29 +990,106 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<()> {
         }
     }
 
-    prune_unseen_models(&c, &seen, scan_complete)?;
-
-    Ok(())
+    let removed = prune_unseen_models(&c, &seen, scan_complete)?;
+    Ok(removed)
 }
 
-fn prune_unseen_models(c: &Connection, seen: &HashSet<String>, scan_complete: bool) -> AppResult<()> {
+type RemovedRegistryFile = (String, Option<String>, Option<String>);
+
+#[allow(clippy::type_complexity)]
+fn prune_unseen_models(
+    c: &Connection,
+    seen: &HashSet<String>,
+    scan_complete: bool,
+) -> AppResult<Vec<RemovedRegistryFile>> {
     if !scan_complete {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let mut stmt = c.prepare("SELECT path FROM models")?;
-    let existing: Vec<String> = stmt.query_map([], |r| r.get(0))?.filter_map(Result::ok).collect();
+    let mut stmt = c.prepare("SELECT path,registry_model_id,registry_file_id FROM models")?;
+    let existing: Vec<RemovedRegistryFile> = stmt
+        .query_map([], |r| Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        )))?
+        .filter_map(Result::ok)
+        .collect();
     drop(stmt);
-    for path in existing {
+    let mut removed = Vec::new();
+    for (path, registry_model_id, registry_file_id) in existing {
         if !seen.contains(&path) {
+            removed.push((path.clone(), registry_model_id, registry_file_id));
             c.execute("DELETE FROM models WHERE path=?1", [&path])?;
         }
     }
-    Ok(())
+    Ok(removed)
+}
+
+fn queue_registry_file_removal(
+    app: &AppStateInner,
+    model_id: &str,
+    file_id: &str,
+) {
+    if let Ok(c) = open_db(&app.app_data) {
+        let _ = c.execute(
+            "INSERT OR IGNORE INTO pending_registry_file_removals(registry_model_id,registry_file_id) VALUES(?1,?2)",
+            params![model_id, file_id],
+        );
+    }
+}
+
+async fn retry_pending_registry_file_removals(app: &AppStateInner) {
+    let pending: Vec<(String, String)> = match open_db(&app.app_data).and_then(|c| {
+        let mut stmt = c.prepare(
+            "SELECT registry_model_id,registry_file_id FROM pending_registry_file_removals"
+        )?;
+        let rows = stmt.query_map([], |r| Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+        )))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+
+    for (model_id, file_id) in pending {
+        if app.registry.remove_file(&model_id, &file_id).await.is_ok() {
+            if let Ok(c) = open_db(&app.app_data) {
+                let _ = c.execute(
+                    "DELETE FROM pending_registry_file_removals WHERE registry_model_id=?1 AND registry_file_id=?2",
+                    params![model_id, file_id],
+                );
+            }
+        }
+    }
+}
+
+async fn reconcile_removed_registry_files(
+    app: &AppStateInner,
+    removed: Vec<RemovedRegistryFile>,
+) {
+    for (_path, model_id, file_id) in removed {
+        if let (Some(model_id), Some(file_id)) = (model_id, file_id) {
+            if app.registry.remove_file(&model_id, &file_id).await.is_err() {
+                queue_registry_file_removal(app, &model_id, &file_id);
+            }
+        }
+    }
 }
 
 fn recursive_scan_and_emit(app: AppStateInner, handle: AppHandle) {
     if let Some(root) = app.models_root.read().unwrap().clone() {
-        if scan_root(&app, &root).is_ok() { emit_models_changed(&handle); }
+        if let Ok(removed) = scan_root(&app, &root) {
+            if !removed.is_empty() {
+                let app_state = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    reconcile_removed_registry_files(&app_state, removed).await;
+                });
+            }
+            spawn_registry_sync(app.clone(), handle.clone());
+            emit_models_changed(&handle);
+        }
     }
 }
 
@@ -1001,10 +1105,506 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
         cover_source_image_id:r.get(21)?, cover_position_x:r.get(22)?, cover_position_y:r.get(23)?, downloaded_at:r.get(24)?
     })
 }
+type RegistryRemoval = (String, Option<String>, Option<String>);
+
 const MODEL_SELECT: &str = "SELECT id,path,relative_path,filename,model_type,size_bytes,modified_at,civitai_model_id,civitai_version_id,civitai_url,civitai_name,version_name,base_model,creator,description,tags_json,activation_json,source_hash,thumbnail_path,updated_at,cover_path,cover_source_image_id,cover_position_x,cover_position_y,downloaded_at FROM models";
 fn model_by_id(c: &Connection, id: i64) -> AppResult<ModelRecord> {
     Ok(c.query_row(&format!("{MODEL_SELECT} WHERE id=?1"), [id], model_from_row)?)
 }
+
+
+fn registry_model_type(model_type: &str) -> &'static str {
+    match model_type {
+        "Checkpoint" => "checkpoint",
+        "LoRA" => "lora",
+        "VAE" => "vae",
+        "ControlNet" => "controlnet",
+        "Embedding" => "embedding",
+        "Upscaler" => "upscaler",
+        "Text Encoder" => "text_encoder",
+        "CLIP Vision" => "clip_vision",
+        "IP-Adapter" => "ip_adapter",
+        _ => "other",
+    }
+}
+
+fn local_model_type(model_type: &str) -> String {
+    match model_type {
+        "checkpoint" => "Checkpoint",
+        "lora" => "LoRA",
+        "vae" => "VAE",
+        "controlnet" => "ControlNet",
+        "embedding" => "Embedding",
+        "upscaler" => "Upscaler",
+        "text_encoder" => "Text Encoder",
+        "clip_vision" => "CLIP Vision",
+        "ip_adapter" => "IP-Adapter",
+        _ => "Other",
+    }.to_string()
+}
+
+async fn hydrate_local_model_from_registry(
+    app: &AppStateInner,
+    local_id: i64,
+    registry_model_id: &str,
+    registry_version_id: Option<&str>,
+) -> AppResult<ModelRecord> {
+    let model = app.registry.get_model(registry_model_id).await?;
+    let tags = app.registry.tags(registry_model_id).await?;
+    let sources = app.registry.sources(registry_model_id).await?;
+    let versions = app.registry.versions(registry_model_id).await?;
+
+    let selected_version = registry_version_id
+        .and_then(|id| versions.iter().find(|version| version.id == id))
+        .or_else(|| {
+            sources
+                .iter()
+                .find(|source| source.provider.eq_ignore_ascii_case("civitai"))
+                .and_then(|source| source.external_version_id.as_ref())
+                .and_then(|external| {
+                    versions.iter().find(|version| {
+                        version.source_version_id.as_deref() == Some(external.as_str())
+                    })
+                })
+        })
+        .or_else(|| versions.first());
+
+    let civitai_source = selected_version
+        .and_then(|version| {
+            sources.iter().find(|source| {
+                source.provider.eq_ignore_ascii_case("civitai")
+                    && version
+                        .source_version_id
+                        .as_deref()
+                        .zip(source.external_version_id.as_deref())
+                        .is_some_and(|(version_id, source_id)| version_id == source_id)
+            })
+        })
+        .or_else(|| sources.iter().find(|source| source.provider.eq_ignore_ascii_case("civitai")));
+
+    let civitai_model_id = civitai_source
+        .and_then(|source| source.external_model_id.as_deref())
+        .and_then(|value| value.parse::<i64>().ok());
+    let civitai_version_id = civitai_source
+        .and_then(|source| source.external_version_id.as_deref())
+        .and_then(|value| value.parse::<i64>().ok())
+        .or_else(|| selected_version.and_then(|version| version.source_version_id.as_deref()).and_then(|value| value.parse::<i64>().ok()));
+    let civitai_url = civitai_source.and_then(|source| source.url.clone());
+
+    let version_name = selected_version.and_then(|version| version.version_name.clone());
+    let base_model = selected_version
+        .and_then(|version| version.base_model.clone())
+        .or_else(|| model.base_model.clone());
+    let activation = selected_version
+        .map(|version| version.activation_prompts.clone())
+        .unwrap_or_default();
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models
+         SET registry_model_id=?2,
+             registry_version_id=?3,
+             model_type=?4,
+             civitai_model_id=?5,
+             civitai_version_id=?6,
+             civitai_url=?7,
+             civitai_name=?8,
+             version_name=?9,
+             base_model=?10,
+             creator=?11,
+             description=?12,
+             tags_json=?13,
+             activation_json=?14,
+             updated_at=?15
+         WHERE id=?1",
+        params![
+            local_id,
+            registry_model_id,
+            selected_version.map(|version| version.id.as_str()),
+            local_model_type(&model.model_type),
+            civitai_model_id,
+            civitai_version_id,
+            civitai_url,
+            model.name,
+            version_name,
+            base_model,
+            model.creator,
+            model.description,
+            serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
+            now()
+        ],
+    )?;
+    model_by_id(&c, local_id)
+}
+
+async fn sync_local_model_to_registry(
+    app: &AppStateInner,
+    local_id: i64,
+) -> AppResult<ModelRecord> {
+    let (local, existing_registry_model_id, existing_registry_version_id, existing_registry_file_id) = {
+        let c = open_db(&app.app_data)?;
+        let local = model_by_id(&c, local_id)?;
+        let ids = c.query_row(
+            "SELECT registry_model_id,registry_version_id,registry_file_id FROM models WHERE id=?1",
+            [local_id],
+            |r| Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            )),
+        )?;
+        (local, ids.0, ids.1, ids.2)
+    };
+
+    let source_hash = match local.source_hash.clone().filter(|value| !value.trim().is_empty()) {
+        Some(hash) => hash,
+        None => {
+            let hash = sha256_file(Path::new(&local.path))?;
+            let c = open_db(&app.app_data)?;
+            c.execute(
+                "UPDATE models SET source_hash=?2,updated_at=?3 WHERE id=?1",
+                params![local_id, hash, now()],
+            )?;
+            hash
+        }
+    };
+
+    let deterministic_id = existing_registry_model_id.clone().unwrap_or_else(|| {
+        if let Some(civitai_id) = local.civitai_model_id {
+            format!("civitai_model_{civitai_id}")
+        } else {
+            format!("sha256_{source_hash}")
+        }
+    });
+
+    let (registry_model, created_new) = match app.registry.get_model(&deterministic_id).await {
+        Ok(model) => (model, false),
+        Err(_) => (
+            app.registry
+                .create_model(
+                    &deterministic_id,
+                    local.civitai_name.as_deref().unwrap_or(&local.filename),
+                    registry_model_type(&local.model_type),
+                    local.creator.as_deref(),
+                    local.description.as_deref(),
+                    local.base_model.as_deref(),
+                    json!({
+                        "managed_by": "raphael-model-manager"
+                    }),
+                )
+                .await?,
+            true,
+        ),
+    };
+
+    let mut registry_version_id = existing_registry_version_id;
+
+    if let (Some(civitai_model_id), Some(civitai_version_id)) =
+        (local.civitai_model_id, local.civitai_version_id)
+    {
+        let external_version = civitai_version_id.to_string();
+        let versions = app.registry.versions(&registry_model.id).await?;
+        if let Some(version) = versions.iter().find(|item| {
+            item.source_version_id.as_deref() == Some(external_version.as_str())
+        }) {
+            registry_version_id = Some(version.id.clone());
+        } else {
+            let version = app.registry.create_version(
+                &registry_model.id,
+                json!({
+                    "version_name": local.version_name.clone(),
+                    "base_model": local.base_model.clone(),
+                    "source": "civitai",
+                    "source_model_id": civitai_model_id.to_string(),
+                    "source_version_id": external_version,
+                    "source_url": local.civitai_url.clone(),
+                    "activation_prompts": local.activation_prompts.clone(),
+                    "metadata": {}
+                }),
+            ).await?;
+            registry_version_id = Some(version.id);
+        }
+
+        let sources = app.registry.sources(&registry_model.id).await?;
+        let already_linked = sources.iter().any(|source| {
+            source.provider.eq_ignore_ascii_case("civitai")
+                && source.external_model_id.as_deref() == Some(civitai_model_id.to_string().as_str())
+                && source.external_version_id.as_deref() == Some(civitai_version_id.to_string().as_str())
+        });
+        if !already_linked {
+            app.registry
+                .add_source(
+                    &registry_model.id,
+                    json!({
+                        "provider": "civitai",
+                        "external_model_id": civitai_model_id.to_string(),
+                        "external_version_id": civitai_version_id.to_string(),
+                        "url": local.civitai_url.clone(),
+                        "metadata": {}
+                    }),
+                )
+                .await?;
+        }
+    }
+
+    if created_new {
+        for tag in normalize_tags(local.tags.clone()) {
+            let _ = app.registry.add_tag(&registry_model.id, &tag).await;
+        }
+    }
+
+    let files = app.registry.files(&registry_model.id).await?;
+    let mut registry_file_id = existing_registry_file_id;
+
+    let exact = |file: &registry::RegistryFile| {
+        file.path == local.path
+            && file.sha256.as_deref() == Some(source_hash.as_str())
+            && file.size_bytes == local.size_bytes
+            && file.modified_at == local.modified_at
+    };
+
+    if let Some(id) = registry_file_id.clone() {
+        if let Some(file) = files.iter().find(|file| file.id == id) {
+            if !exact(file) {
+                app.registry.remove_file(&registry_model.id, &id).await?;
+                registry_file_id = None;
+            }
+        } else {
+            registry_file_id = None;
+        }
+    }
+
+    for file in &files {
+        if registry_file_id.as_deref() == Some(file.id.as_str()) {
+            continue;
+        }
+        if file.path == local.path && !exact(file) {
+            let _ = app.registry.remove_file(&registry_model.id, &file.id).await;
+        }
+    }
+
+    if registry_file_id.is_none() {
+        let refreshed_files = app.registry.files(&registry_model.id).await?;
+        if let Some(file) = refreshed_files.iter().find(|file| exact(file)).cloned() {
+            registry_file_id = Some(file.id);
+        } else {
+            let file = app.registry.add_file(
+                &registry_model.id,
+                json!({
+                    "version_id": registry_version_id.clone(),
+                    "path": local.path.clone(),
+                    "relative_path": local.relative_path.clone(),
+                    "filename": local.filename.clone(),
+                    "size_bytes": local.size_bytes,
+                    "modified_at": local.modified_at,
+                    "sha256": source_hash.clone(),
+                    "status": "available"
+                }),
+            ).await?;
+            registry_file_id = Some(file.id);
+        }
+    }
+
+    {
+        let c = open_db(&app.app_data)?;
+        c.execute(
+            "UPDATE models SET registry_model_id=?2,registry_version_id=?3,registry_file_id=?4,source_hash=?5,updated_at=?6 WHERE id=?1",
+            params![
+                local_id,
+                registry_model.id,
+                registry_version_id,
+                registry_file_id,
+                source_hash,
+                now()
+            ],
+        )?;
+    }
+
+    hydrate_local_model_from_registry(
+        app,
+        local_id,
+        &registry_model.id,
+        registry_version_id.as_deref(),
+    ).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_civitai_metadata_to_registry(
+    app: &AppStateInner,
+    local_id: i64,
+    model: &Value,
+    version: &Value,
+    canonical_url: &str,
+    tags: &[String],
+    activation_prompts: &[String],
+    description: Option<&str>,
+    creator: Option<&str>,
+) -> AppResult<(String, String)> {
+    let _ = sync_local_model_to_registry(app, local_id).await?;
+    let (registry_model_id, tags_user_modified) = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id,tags_user_modified FROM models WHERE id=?1",
+            [local_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+        )?
+    };
+
+    let registry_model = app.registry.get_model(&registry_model_id).await?;
+    let model_type = {
+        let c = open_db(&app.app_data)?;
+        let local_type: String = c.query_row(
+            "SELECT model_type FROM models WHERE id=?1",
+            [local_id],
+            |r| r.get(0),
+        )?;
+        registry_model_type(&local_type).to_string()
+    };
+
+    app.registry.update_model(
+        &registry_model_id,
+        registry_model.revision,
+        json!({
+            "name": model.get("name").and_then(Value::as_str),
+            "model_type": model_type,
+            "creator": creator,
+            "description": description,
+            "base_model": version.get("baseModel").and_then(Value::as_str)
+        }),
+    ).await?;
+
+    let external_version_id = version
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| AppError::Invalid("Civitai response did not include a model version ID".into()))?;
+    let external_model_id = model
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| AppError::Invalid("Civitai response did not include a model ID".into()))?;
+    let desired_version_id = format!("civitai_version_{external_version_id}");
+    let external_version_text = external_version_id.to_string();
+
+    let versions = app.registry.versions(&registry_model_id).await?;
+    let version_payload = json!({
+        "version_name": version.get("name").and_then(Value::as_str),
+        "base_model": version.get("baseModel").and_then(Value::as_str),
+        "source": "civitai",
+        "source_model_id": external_model_id.to_string(),
+        "source_version_id": external_version_id.to_string(),
+        "source_url": canonical_url,
+        "activation_prompts": activation_prompts,
+        "metadata": {}
+    });
+
+    let registry_version_id = if let Some(existing) = versions.iter().find(|item| {
+        item.id == desired_version_id
+            || item.source_version_id.as_deref() == Some(external_version_text.as_str())
+    }) {
+        app.registry.update_version(
+            &registry_model_id,
+            &existing.id,
+            existing.revision,
+            version_payload,
+        ).await?.id
+    } else {
+        app.registry.create_version(
+            &registry_model_id,
+            json!({
+                "id": desired_version_id,
+                "version_name": version.get("name").and_then(Value::as_str),
+                "base_model": version.get("baseModel").and_then(Value::as_str),
+                "source": "civitai",
+                "source_model_id": external_model_id.to_string(),
+                "source_version_id": external_version_id.to_string(),
+                "source_url": canonical_url,
+                "activation_prompts": activation_prompts,
+                "metadata": {}
+            }),
+        ).await?.id
+    };
+
+    app.registry.add_source(
+        &registry_model_id,
+        json!({
+            "provider": "civitai",
+            "external_model_id": external_model_id.to_string(),
+            "external_version_id": external_version_id.to_string(),
+            "url": canonical_url,
+            "metadata": {}
+        }),
+    ).await?;
+
+    if !tags_user_modified {
+        let existing_tags = app.registry.tags(&registry_model_id).await?;
+        for tag in existing_tags.iter().filter(|tag| !tags.iter().any(|value| value.eq_ignore_ascii_case(tag))) {
+            let _ = app.registry.remove_tag(&registry_model_id, tag).await;
+        }
+        for tag in tags {
+            if !existing_tags.iter().any(|value| value.eq_ignore_ascii_case(tag)) {
+                app.registry.add_tag(&registry_model_id, tag).await?;
+            }
+        }
+    }
+
+    let _ = hydrate_local_model_from_registry(
+        app,
+        local_id,
+        &registry_model_id,
+        Some(&registry_version_id),
+    ).await?;
+
+    Ok((registry_model_id, registry_version_id))
+}
+
+fn spawn_registry_sync(app: AppStateInner, handle: AppHandle) {
+    let retry_state = app.clone();
+    tauri::async_runtime::spawn(async move {
+        retry_pending_registry_file_removals(&retry_state).await;
+    });
+    {
+        let mut running = match app.registry_sync_running.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if *running {
+            return;
+        }
+        *running = true;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let ids: Vec<i64> = match open_db(&app.app_data).and_then(|c| {
+            let mut stmt = c.prepare("SELECT id FROM models ORDER BY id")?;
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+            Ok(rows.filter_map(Result::ok).collect())
+        }) {
+            Ok(ids) => ids,
+            Err(_) => {
+                if let Ok(mut running) = app.registry_sync_running.lock() {
+                    *running = false;
+                }
+                return;
+            }
+        };
+
+        let mut changed = false;
+        for id in ids {
+            if sync_local_model_to_registry(&app, id).await.is_ok() {
+                changed = true;
+            }
+        }
+
+        if changed {
+            emit_models_changed(&handle);
+        }
+
+        if let Ok(mut running) = app.registry_sync_running.lock() {
+            *running = false;
+        }
+    });
+}
+
 
 fn civitai_client(_app: &AppStateInner) -> AppResult<Client> {
     let mut b=Client::builder().user_agent(USER_AGENT).timeout(Duration::from_secs(30));
@@ -1371,7 +1971,6 @@ fn featured_image_key(image: &Value, version_id: i64, index: usize) -> Option<i6
     if url.is_empty() {
         return None;
     }
-
     // modelVersions[].images does not reliably expose an image ID.
     // Use a deterministic negative key derived from the actual image URL
     // and version instead of requiring an optional/absent JSON field.
@@ -1691,7 +2290,7 @@ fn set_models_root(app: State<AppStateInner>, handle: AppHandle, path:String)->A
     let app_clone=app.inner().clone(); let handle_clone=handle.clone();
     let mut watcher=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{ if let Ok(e)=res { match e.kind { EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => { std::thread::sleep(Duration::from_millis(120)); recursive_scan_and_emit(app_clone.clone(),handle_clone.clone()); }, _=>{} } } }).map_err(|e|AppError::Io(io::Error::other(e.to_string())))?;
     watcher.watch(&root,RecursiveMode::Recursive).map_err(|e|AppError::Io(io::Error::other(e.to_string())))?; *app.watcher.lock().unwrap()=Some(watcher);
-    scan_root(&app,&root)?; emit_models_changed(&handle); spawn_hash_enrichment(app.inner().clone(),handle.clone()); Ok(AppStateResponse{models_root:Some(path),storage:storage_stats_inner(&app.app_data)?})
+    let removed=scan_root(&app,&root)?; if !removed.is_empty(){let app_state=app.inner().clone();tauri::async_runtime::spawn(async move{reconcile_removed_registry_files(&app_state,removed).await;});} emit_models_changed(&handle); spawn_registry_sync(app.inner().clone(),handle.clone()); spawn_registry_event_sync(app.inner().clone(), handle.clone()); spawn_hash_enrichment(app.inner().clone(),handle.clone()); Ok(AppStateResponse{models_root:Some(path),storage:storage_stats_inner(&app.app_data)?})
 }
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
@@ -1813,19 +2412,54 @@ fn get_tags(app:State<AppStateInner>)->AppResult<Vec<TagRecord>>{
 }
 
 #[tauri::command]
-fn set_model_tags(app:State<AppStateInner>, handle:AppHandle, id:i64, tags:Vec<String>)->AppResult<ModelRecord>{
-    let normalized=normalize_tags(tags);
-    let c=open_db(&app.app_data)?;
-    let changed = c.execute(
-        "UPDATE models SET tags_json=?2,tags_user_modified=1,updated_at=?3 WHERE id=?1",
-        params![id,serde_json::to_string(&normalized).unwrap_or_else(|_|"[]".into()),now()],
-    )?;
-    if changed == 0 {
-        return Err(AppError::Invalid("Model no longer exists".into()));
+async fn set_model_tags_inner(
+    app: &AppStateInner,
+    handle: AppHandle,
+    id: i64,
+    tags: Vec<String>,
+) -> AppResult<ModelRecord> {
+    let normalized = normalize_tags(tags);
+    let _ = sync_local_model_to_registry(app, id).await?;
+
+    let registry_model_id: String = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id FROM models WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?
+    };
+
+    let existing = app.registry.tags(&registry_model_id).await?;
+    for tag in existing.iter().filter(|tag| !normalized.iter().any(|value| value.eq_ignore_ascii_case(tag))) {
+        let _ = app.registry.remove_tag(&registry_model_id, tag).await;
     }
-    let rec=model_by_id(&c,id)?;
+    for tag in &normalized {
+        if !existing.iter().any(|value| value.eq_ignore_ascii_case(tag)) {
+            app.registry.add_tag(&registry_model_id, tag).await?;
+        }
+    }
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET tags_user_modified=1,updated_at=?2 WHERE id=?1",
+        params![id, now()],
+    )?;
+    drop(c);
+
+    let rec = hydrate_local_model_from_registry(app, id, &registry_model_id, None).await?;
     emit_models_changed(&handle);
     Ok(rec)
+}
+
+#[tauri::command]
+async fn set_model_tags(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    tags: Vec<String>,
+) -> AppResult<ModelRecord> {
+    set_model_tags_inner(app.inner(), handle, id, tags).await
 }
 
 fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
@@ -1886,6 +2520,7 @@ fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
 #[tauri::command]
 fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult<i64> {
     let updated = add_subfolder_tags_inner(&app)?;
+    spawn_registry_sync(app.inner().clone(), handle.clone());
     emit_models_changed(&handle);
     Ok(updated)
 }
@@ -1907,6 +2542,19 @@ async fn delete_model_inner(app: &AppStateInner, handle: AppHandle, id: i64) -> 
         (PathBuf::from(model.path), model.thumbnail_path, model.cover_path, image_paths)
     };
 
+    let _ = sync_local_model_to_registry(app, id).await?;
+    let (registry_model_id, registry_file_id) = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id,registry_file_id FROM models WHERE id=?1",
+            [id],
+            |r| Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            )),
+        )?
+    };
+
     let root_canonical = root.canonicalize()?;
     let path_canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
     if !path_canonical.starts_with(&root_canonical) {
@@ -1919,6 +2567,14 @@ async fn delete_model_inner(app: &AppStateInner, handle: AppHandle, id: i64) -> 
             return Err(AppError::Invalid("The model path is not a regular file".into()));
         }
         fs::remove_file(&path)?;
+    }
+
+    if let (Some(registry_model_id), Some(registry_file_id)) =
+        (registry_model_id.as_deref(), registry_file_id.as_deref())
+    {
+        if app.registry.remove_file(registry_model_id, registry_file_id).await.is_err() {
+            queue_registry_file_removal(app, registry_model_id, registry_file_id);
+        }
     }
 
     for (local_path, thumb_path) in image_paths {
@@ -1962,22 +2618,56 @@ async fn delete_model(
     delete_model_inner(app.inner(), handle, id).await
 }
 #[tauri::command]
-fn set_model_type(app:State<AppStateInner>, handle:AppHandle, id:i64, model_type:String)->AppResult<ModelRecord>{
-    let requested=model_type.trim();
-    let c=open_db(&app.app_data)?;
-    let current_path:String=c.query_row("SELECT path FROM models WHERE id=?1",[id],|r|r.get(0))?;
-    let next_type=if requested.eq_ignore_ascii_case("auto") {
-        let root=app.models_root.read().unwrap().clone().ok_or_else(||AppError::Invalid("Choose your ComfyUI models folder first".into()))?;
-        file_type_from_path(Path::new(&current_path),&root)
+async fn set_model_type(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    model_type: String,
+) -> AppResult<ModelRecord> {
+    let requested = model_type.trim();
+    let current = {
+        let c = open_db(&app.app_data)?;
+        model_by_id(&c, id)?
+    };
+    let next_type = if requested.eq_ignore_ascii_case("auto") {
+        let root = app.models_root.read().unwrap().clone().ok_or_else(|| {
+            AppError::Invalid("Choose your ComfyUI models folder first".into())
+        })?;
+        file_type_from_path(Path::new(&current.path), &root)
     } else {
         match requested {
-            "Checkpoint"|"LoRA"|"VAE"|"ControlNet"|"Embedding"|"Upscaler"|"Text Encoder"|"CLIP Vision"|"IP-Adapter"|"Other" => requested.to_string(),
+            "Checkpoint" | "LoRA" | "VAE" | "ControlNet" | "Embedding" | "Upscaler"
+            | "Text Encoder" | "CLIP Vision" | "IP-Adapter" | "Other" => requested.to_string(),
             _ => return Err(AppError::Invalid("Unsupported model type".into())),
         }
     };
-    let locked=if requested.eq_ignore_ascii_case("auto"){0}else{1};
-    c.execute("UPDATE models SET model_type=?2,model_type_user_modified=?3,updated_at=?4 WHERE id=?1",params![id,next_type,locked,now()])?;
-    let rec=model_by_id(&c,id)?;
+
+    let _ = sync_local_model_to_registry(&app, id).await?;
+    let registry_model_id = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id FROM models WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?
+    };
+    let registry_model = app.registry.get_model(&registry_model_id).await?;
+    app.registry
+        .update_model(
+            &registry_model_id,
+            registry_model.revision,
+            json!({"model_type": registry_model_type(&next_type)}),
+        )
+        .await?;
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET model_type_user_modified=?2,updated_at=?3 WHERE id=?1",
+        params![id, if requested.eq_ignore_ascii_case("auto") { 0 } else { 1 }, now()],
+    )?;
+    drop(c);
+
+    let rec = hydrate_local_model_from_registry(app.inner(), id, &registry_model_id, None).await?;
     emit_models_changed(&handle);
     Ok(rec)
 }
@@ -2640,6 +3330,10 @@ async fn install_civitai_model(
                 model_by_id(&c, id)?
             };
 
+            // The Registry is authoritative. The local SQLite row above is only
+            // the physical-file projection needed by the Manager.
+            let rec = sync_local_model_to_registry(&state, rec.id).await?;
+
             emit_models_changed(&task_handle);
             set_download_progress(&task_progress, &task_id, |p| {
                 p.phase = "SYNCING GALLERY".into();
@@ -3069,41 +3763,26 @@ async fn link_model_civitai_inner(
         },
         None=>None
     };
-    let rec={
-        let c=open_db(&app.app_data)?;
-        c.execute(
-            "UPDATE models
-             SET civitai_model_id=?2,
-                 civitai_version_id=?3,
-                 civitai_url=?4,
-                 civitai_name=?5,
-                 version_name=?6,
-                 base_model=?7,
-                 creator=?8,
-                 description=?9,
-                 tags_json=CASE WHEN tags_user_modified=0 THEN ?10 ELSE tags_json END,
-                 activation_json=?11,
-                 thumbnail_path=?12,
-                 updated_at=?13
-             WHERE id=?1",
-            params![
-                id,
-                mid,
-                vid,
-                canonical,
-                model.get("name").and_then(Value::as_str),
-                version.get("name").and_then(Value::as_str),
-                version.get("baseModel").and_then(Value::as_str),
-                creator,
-                desc,
-                serde_json::to_string(&tags).unwrap_or_else(|_|"[]".into()),
-                serde_json::to_string(&activation).unwrap_or_else(|_|"[]".into()),
-                thumbnail_path,
-                now()
-            ],
-        )?;
-        model_by_id(&c,id)?
-    };
+    let (_registry_model_id, _registry_version_id) = apply_civitai_metadata_to_registry(
+        app,
+        id,
+        &model,
+        &version,
+        &canonical,
+        &tags,
+        &activation,
+        desc.as_deref(),
+        creator.as_deref(),
+    ).await?;
+
+    let c=open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET civitai_model_id=?2,civitai_version_id=?3,civitai_url=?4,thumbnail_path=?5,updated_at=?6 WHERE id=?1",
+        params![id,mid,vid,canonical,thumbnail_path,now()],
+    )?;
+    let rec=model_by_id(&c,id)?;
+    drop(c);
+
     emit_models_changed(&handle);
     drop(_guard);
     Ok(rec)
@@ -3156,39 +3835,31 @@ async fn refresh_model_civitai_inner(
         None=>None
     };
 
-    let rec = {
-        let c = open_db(&app.app_data)?;
-        c.execute(
-            "UPDATE models
-             SET civitai_model_id=?2,
-                 civitai_version_id=?3,
-                 civitai_name=?4,
-                 version_name=?5,
-                 base_model=?6,
-                 creator=?7,
-                 description=?8,
-                 tags_json=CASE WHEN tags_user_modified=0 THEN ?9 ELSE tags_json END,
-                 activation_json=?10,
-                 thumbnail_path=?11,
-                 updated_at=?12
-             WHERE id=?1",
-            params![
-                id,
-                model.get("id").and_then(Value::as_i64),
-                version.get("id").and_then(Value::as_i64),
-                model.get("name").and_then(Value::as_str),
-                version.get("name").and_then(Value::as_str),
-                version.get("baseModel").and_then(Value::as_str),
-                creator,
-                desc,
-                serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
-                serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
-                thumbnail_path,
-                now()
-            ],
-        )?;
-        model_by_id(&c, id)?
-    };
+    let canonical = canonical_civitai_url(
+        &url,
+        model.get("id").and_then(Value::as_i64),
+        version.get("id").and_then(Value::as_i64),
+    )?;
+
+    let (_registry_model_id, _registry_version_id) = apply_civitai_metadata_to_registry(
+        app,
+        id,
+        &model,
+        &version,
+        &canonical,
+        &tags,
+        &activation,
+        desc.as_deref(),
+        creator.as_deref(),
+    ).await?;
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET thumbnail_path=?2,updated_at=?3 WHERE id=?1",
+        params![id,thumbnail_path,now()],
+    )?;
+    let rec = model_by_id(&c,id)?;
+    drop(c);
 
     emit_models_changed(&handle);
     drop(_guard);
@@ -3520,7 +4191,70 @@ fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
                 );
             }
 
+            // Hash enrichment is a discovery step; the Registry still receives
+            // the authoritative model/version/file update through the same API.
+            let _ = sync_local_model_to_registry(&app, id).await;
             emit_models_changed(&handle);
+        }
+    });
+}
+
+
+fn spawn_registry_event_sync(app: AppStateInner, handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let cursor = match app.registry_event_cursor.lock() {
+                Ok(value) => *value,
+                Err(_) => 0,
+            };
+
+            if let Ok(events) = app.registry.events(cursor).await {
+                let mut next_cursor = cursor;
+                let mut changed = false;
+
+                for event in events {
+                    next_cursor = next_cursor.max(event.id);
+                    let Some(registry_model_id) = event.model_id.as_deref() else {
+                        continue;
+                    };
+
+                    let local_ids: Vec<(i64, Option<String>)> = open_db(&app.app_data)
+                        .and_then(|c| {
+                            let mut stmt = c.prepare(
+                                "SELECT id,registry_version_id FROM models WHERE registry_model_id=?1",
+                            )?;
+                            let rows = stmt.query_map([registry_model_id], |r| {
+                                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+                            })?;
+                            Ok(rows.filter_map(Result::ok).collect())
+                        })
+                        .unwrap_or_default();
+
+                    for (local_id, registry_version_id) in local_ids {
+                        if hydrate_local_model_from_registry(
+                            &app,
+                            local_id,
+                            registry_model_id,
+                            registry_version_id.as_deref(),
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+
+                if let Ok(mut value) = app.registry_event_cursor.lock() {
+                    *value = next_cursor;
+                }
+
+                if changed {
+                    emit_models_changed(&handle);
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 }
@@ -3531,7 +4265,8 @@ pub fn run() {
         .manage(web::WebServerController::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let app_data=app.path().app_data_dir()?;fs::create_dir_all(&app_data)?;let c=open_db(&app_data)?;let saved=setting(&c,"models_root")?;let parallel=read_parallel_downloads(&c)?;let state=AppStateInner{app_data:app_data.clone(),models_root:Arc::new(RwLock::new(saved.map(PathBuf::from))),watcher:Arc::new(Mutex::new(None)),scan_lock:Arc::new(Mutex::new(())),
+            let app_data=app.path().app_data_dir()?;fs::create_dir_all(&app_data)?;let c=open_db(&app_data)?;let saved=setting(&c,"models_root")?;let parallel=read_parallel_downloads(&c)?;let registry=RegistryClient::from_app_data(&app_data).map_err(|e|io::Error::other(e.to_string()))?;
+            let state=AppStateInner{app_data:app_data.clone(),models_root:Arc::new(RwLock::new(saved.map(PathBuf::from))),watcher:Arc::new(Mutex::new(None)),scan_lock:Arc::new(Mutex::new(())),
                 downloads:Arc::new(Mutex::new(Vec::new())),
                 active_download_paths:Arc::new(Mutex::new(HashSet::new())),
                 active_download_versions:Arc::new(Mutex::new(HashSet::new())),
@@ -3539,8 +4274,12 @@ pub fn run() {
                 parallel_downloads:Arc::new(Mutex::new(parallel)),
                 examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
                 cache_lock: Arc::new(AsyncMutex::new(())),
+                registry,
+                registry_sync_running: Arc::new(Mutex::new(false)),
+                registry_event_cursor: Arc::new(Mutex::new(0)),
             };app.manage(state.clone());
-            if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let _=scan_root(&state,&root);let handle=app.handle().clone();spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
+            if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let removed=scan_root(&state,&root).unwrap_or_default(); if !removed.is_empty(){let app_state=state.clone();tauri::async_runtime::spawn(async move{reconcile_removed_registry_files(&app_state,removed).await;});} let handle=app.handle().clone();spawn_registry_sync(state.clone(),handle.clone());spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
+            spawn_registry_event_sync(state.clone(),app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,web::get_web_app_status,web::toggle_web_app])
@@ -3555,7 +4294,7 @@ mod tests {
 
     fn test_state(app_data: PathBuf, models_root: PathBuf) -> AppStateInner {
         AppStateInner {
-            app_data,
+            app_data: app_data.clone(),
             models_root: Arc::new(RwLock::new(Some(models_root))),
             watcher: Arc::new(Mutex::new(None)),
             scan_lock: Arc::new(Mutex::new(())),
@@ -3566,6 +4305,9 @@ mod tests {
             parallel_downloads: Arc::new(Mutex::new(3)),
             examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
             cache_lock: Arc::new(AsyncMutex::new(())),
+            registry: RegistryClient::from_app_data(&app_data).unwrap(),
+            registry_sync_running: Arc::new(Mutex::new(false)),
+            registry_event_cursor: Arc::new(Mutex::new(0)),
         }
     }
 
