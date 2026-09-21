@@ -32,7 +32,7 @@ keyring = { version = "3.6", features = ["windows-native"] }
 thiserror = "2"
 urlencoding = "2.1"
 axum = "0.8"
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.7", features = ["fs"] }
 getrandom = "0.3"
 
 [dev-dependencies]
