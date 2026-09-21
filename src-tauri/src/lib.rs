@@ -994,16 +994,18 @@ fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<Vec<(String, Option<
     Ok(removed)
 }
 
+type RemovedRegistryFile = (String, Option<String>, Option<String>);
+
 fn prune_unseen_models(
     c: &Connection,
     seen: &HashSet<String>,
     scan_complete: bool,
-) -> AppResult<Vec<(String, Option<String>, Option<String>)>> {
+) -> AppResult<Vec<RemovedRegistryFile>> {
     if !scan_complete {
         return Ok(Vec::new());
     }
     let mut stmt = c.prepare("SELECT path,registry_model_id,registry_file_id FROM models")?;
-    let existing: Vec<(String, Option<String>, Option<String>)> = stmt
+    let existing: Vec<RemovedRegistryFile> = stmt
         .query_map([], |r| Ok((
             r.get::<_, String>(0)?,
             r.get::<_, Option<String>>(1)?,
@@ -1064,7 +1066,7 @@ async fn retry_pending_registry_file_removals(app: &AppStateInner) {
 
 async fn reconcile_removed_registry_files(
     app: &AppStateInner,
-    removed: Vec<(String, Option<String>, Option<String>)>,
+    removed: Vec<RemovedRegistryFile>,
 ) {
     for (_path, model_id, file_id) in removed {
         if let (Some(model_id), Some(file_id)) = (model_id, file_id) {
@@ -1424,6 +1426,7 @@ async fn sync_local_model_to_registry(
     ).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_civitai_metadata_to_registry(
     app: &AppStateInner,
     local_id: i64,
@@ -4202,51 +4205,50 @@ fn spawn_registry_event_sync(app: AppStateInner, handle: AppHandle) {
                 Err(_) => 0,
             };
 
-            match app.registry.events(cursor).await {
-                Ok(events) => {
-                    let mut next_cursor = cursor;
-                    let mut changed = false;
+            if let Ok(events) = app.registry.events(cursor).await {
+                let mut next_cursor = cursor;
+                let mut changed = false;
 
-                    for event in events {
-                        next_cursor = next_cursor.max(event.id);
-                        let Some(registry_model_id) = event.model_id.as_deref() else {
-                            continue;
-                        };
+                for event in events {
+                    next_cursor = next_cursor.max(event.id);
+                    let Some(registry_model_id) = event.model_id.as_deref() else {
+                        continue;
+                    };
 
-                        let local_ids: Vec<(i64, Option<String>)> = match open_db(&app.app_data).and_then(|c| {
+                    let local_ids: Vec<(i64, Option<String>)> = open_db(&app.app_data)
+                        .and_then(|c| {
                             let mut stmt = c.prepare(
-                                "SELECT id,registry_version_id FROM models WHERE registry_model_id=?1"
+                                "SELECT id,registry_version_id FROM models WHERE registry_model_id=?1",
                             )?;
                             let rows = stmt.query_map([registry_model_id], |r| {
                                 Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
                             })?;
                             Ok(rows.filter_map(Result::ok).collect())
-                        }) {
-                            Ok(ids) => ids,
-                            Err(_) => Vec::new(),
-                        };
+                        })
+                        .unwrap_or_default();
 
-                        for (local_id, registry_version_id) in local_ids {
-                            if hydrate_local_model_from_registry(
-                                &app,
-                                local_id,
-                                registry_model_id,
-                                registry_version_id.as_deref(),
-                            ).await.is_ok() {
-                                changed = true;
-                            }
+                    for (local_id, registry_version_id) in local_ids {
+                        if hydrate_local_model_from_registry(
+                            &app,
+                            local_id,
+                            registry_model_id,
+                            registry_version_id.as_deref(),
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            changed = true;
                         }
                     }
-
-                    if let Ok(mut value) = app.registry_event_cursor.lock() {
-                        *value = next_cursor;
-                    }
-
-                    if changed {
-                        emit_models_changed(&handle);
-                    }
                 }
-                Err(_) => {}
+
+                if let Ok(mut value) = app.registry_event_cursor.lock() {
+                    *value = next_cursor;
+                }
+
+                if changed {
+                    emit_models_changed(&handle);
+                }
             }
 
             tokio::time::sleep(Duration::from_secs(2)).await;
