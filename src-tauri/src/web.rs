@@ -37,7 +37,7 @@ use crate::{
     get_tags, install_civitai_model, link_model_civitai, link_model_civitai_inner, list_models, preview_civitai_import, preview_civitai_import_inner,
     refresh_all_examples, get_examples_refresh_status, load_more_model_examples, get_example_load_amount, set_example_load_amount, refresh_model_civitai, refresh_model_civitai_inner, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
     set_model_tags, set_model_type, sync_model_gallery, sync_gallery_inner,
-    is_civitai_token_set, AppError, AppResult, CivitaiImportPreview, ModelRecord,
+    is_civitai_token_set, open_db, read_example_load_amount, AppError, AppResult, CivitaiImportPreview, ModelRecord,
 };
 
 pub const WEB_PORT: u16 = 1421;
