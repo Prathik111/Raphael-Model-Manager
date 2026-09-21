@@ -1263,28 +1263,27 @@ async fn sync_local_model_to_registry(
 
     let mut model = match app.registry.get_model(&deterministic_id).await {
         Ok(model) => model,
-        Err(_) => {
-                Ok(existing) => existing,
-                Err(_) => {
-                    let created = app.registry.create_model(
-                        &deterministic_id,
-                        local.civitai_name.as_deref().unwrap_or(&local.filename),
-                        registry_model_type(&local.model_type),
-                        local.creator.as_deref(),
-                        local.description.as_deref(),
-                        local.base_model.as_deref(),
-                        json!({
-                            "managed_by": "raphael-model-manager",
-                            "local_model_id": local_id
-                        }),
-                    ).await?;
-                    if created.id.is_empty() {
-                        return Err(AppError::Registry("Registry created an invalid model id".into()));
-                    }
-                    created
+        Err(_) => match app.registry.get_model(&deterministic_id).await {
+            Ok(existing) => existing,
+            Err(_) => {
+                let created = app.registry.create_model(
+                    &deterministic_id,
+                    local.civitai_name.as_deref().unwrap_or(&local.filename),
+                    registry_model_type(&local.model_type),
+                    local.creator.as_deref(),
+                    local.description.as_deref(),
+                    local.base_model.as_deref(),
+                    json!({
+                        "managed_by": "raphael-model-manager",
+                        "local_model_id": local_id
+                    }),
+                ).await?;
+                if created.id.is_empty() {
+                    return Err(AppError::Registry("Registry created an invalid model id".into()));
                 }
+                created
             }
-        }
+        },
     };
 
     let created_model_id = model.id.clone();
