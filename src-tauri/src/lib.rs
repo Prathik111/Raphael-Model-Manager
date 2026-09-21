@@ -1295,13 +1295,13 @@ async fn sync_local_model_to_registry(
             let version = app.registry.create_version(
                 &registry_model.id,
                 json!({
-                    "version_name": local.version_name,
-                    "base_model": local.base_model,
+                    "version_name": local.version_name.clone(),
+                    "base_model": local.base_model.clone(),
                     "source": "civitai",
                     "source_model_id": civitai_model_id.to_string(),
                     "source_version_id": external_version,
-                    "source_url": local.civitai_url,
-                    "activation_prompts": local.activation_prompts,
+                    source_url": local.civitai_url.clone(),
+                    "activation_prompts": local.activation_prompts.clone(),
                     "metadata": {}
                 }),
             ).await?;
@@ -1374,13 +1374,13 @@ async fn sync_local_model_to_registry(
             let file = app.registry.add_file(
                 &registry_model.id,
                 json!({
-                    "version_id": registry_version_id,
-                    "path": local.path,
-                    "relative_path": local.relative_path,
-                    "filename": local.filename,
+                    "version_id": registry_version_id.clone(),
+                    "path": local.path.clone(),
+                    "relative_path": local.relative_path.clone(),
+                    "filename": local.filename.clone(),
                     "size_bytes": local.size_bytes,
                     "modified_at": local.modified_at,
-                    "sha256": source_hash,
+                    "sha256": source_hash.clone(),
                     "status": "available"
                 }),
             ).await?;
