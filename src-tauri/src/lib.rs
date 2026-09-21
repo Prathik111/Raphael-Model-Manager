@@ -1271,8 +1271,7 @@ async fn sync_local_model_to_registry(
                     local.description.as_deref(),
                     local.base_model.as_deref(),
                     json!({
-                        "managed_by": "raphael-model-manager",
-                        "local_model_id": local_id
+                        "managed_by": "raphael-model-manager"
                     }),
                 )
                 .await?,
