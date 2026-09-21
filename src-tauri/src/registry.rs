@@ -179,7 +179,6 @@ impl RegistryClient {
 
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_model(
         &self,
         id: &str,
