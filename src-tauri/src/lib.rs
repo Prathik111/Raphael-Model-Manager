@@ -2266,7 +2266,7 @@ fn set_models_root(app: State<AppStateInner>, handle: AppHandle, path:String)->A
     let app_clone=app.inner().clone(); let handle_clone=handle.clone();
     let mut watcher=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{ if let Ok(e)=res { match e.kind { EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => { std::thread::sleep(Duration::from_millis(120)); recursive_scan_and_emit(app_clone.clone(),handle_clone.clone()); }, _=>{} } } }).map_err(|e|AppError::Io(io::Error::other(e.to_string())))?;
     watcher.watch(&root,RecursiveMode::Recursive).map_err(|e|AppError::Io(io::Error::other(e.to_string())))?; *app.watcher.lock().unwrap()=Some(watcher);
-    let removed=scan_root(&app,&root)?; if !removed.is_empty(){let app_state=app.inner().clone();tauri::async_runtime::spawn(async move{reconcile_removed_registry_files(&app_state,removed).await;});} emit_models_changed(&handle); spawn_registry_sync(app.inner().clone(),handle.clone()); spawn_hash_enrichment(app.inner().clone(),handle.clone()); Ok(AppStateResponse{models_root:Some(path),storage:storage_stats_inner(&app.app_data)?})
+    let removed=scan_root(&app,&root)?; if !removed.is_empty(){let app_state=app.inner().clone();tauri::async_runtime::spawn(async move{reconcile_removed_registry_files(&app_state,removed).await;});} emit_models_changed(&handle); spawn_registry_sync(app.inner().clone(),handle.clone()); spawn_registry_event_sync(app.inner().clone()); spawn_hash_enrichment(app.inner().clone(),handle.clone()); Ok(AppStateResponse{models_root:Some(path),storage:storage_stats_inner(&app.app_data)?})
 }
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
