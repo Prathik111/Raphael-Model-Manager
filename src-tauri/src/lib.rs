@@ -3265,6 +3265,10 @@ async fn install_civitai_model(
                 model_by_id(&c, id)?
             };
 
+            // The Registry is authoritative. The local SQLite row above is only
+            // the physical-file projection needed by the Manager.
+            let rec = sync_local_model_to_registry(&state, rec.id).await?;
+
             emit_models_changed(&task_handle);
             set_download_progress(&task_progress, &task_id, |p| {
                 p.phase = "SYNCING GALLERY".into();
