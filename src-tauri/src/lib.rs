@@ -1299,7 +1299,7 @@ async fn sync_local_model_to_registry(
                     "source": "civitai",
                     "source_model_id": civitai_model_id.to_string(),
                     "source_version_id": external_version,
-                    source_url": local.civitai_url.clone(),
+                    "source_url": local.civitai_url.clone(),
                     "activation_prompts": local.activation_prompts.clone(),
                     "metadata": {}
                 }),
@@ -1321,7 +1321,7 @@ async fn sync_local_model_to_registry(
                         "provider": "civitai",
                         "external_model_id": civitai_model_id.to_string(),
                         "external_version_id": civitai_version_id.to_string(),
-                        "url": local.civitai_url,
+                        "url": local.civitai_url.clone(),
                         "metadata": {}
                     }),
                 )
