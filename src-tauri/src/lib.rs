@@ -1510,7 +1510,7 @@ async fn sync_featured_examples_inner(
                 Some((image_id,(image_id,Some(final_local),final_thumbnail,width,height,prompt,negative_prompt,steps,cfg,sampler,seed,serde_json::to_string(&meta).unwrap_or_else(|_|"{}".into()))))
             });
 
-            if let Some((image_id,record)) = reused {
+            if let Some((_image_id,record)) = reused {
                 records.push(record);
                 saved_count+=1;
 
@@ -1534,7 +1534,7 @@ async fn sync_featured_examples_inner(
         .collect::<Vec<_>>()
         .await;
 
-        for (image_id,result) in results {
+        for (_image_id,result) in results {
             match result {
                 FeaturedDownloadResult::Saved(record) => {
                     records.push(record);
