@@ -3778,7 +3778,7 @@ mod tests {
         let count_before: i64 = db.query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0)).unwrap();
         assert_eq!(count_before, 1);
 
-        prune_unseen_models(&db, &[], false).unwrap();
+        prune_unseen_models(&db, &HashSet::new(), false).unwrap();
 
         let count_after: i64 = db.query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0)).unwrap();
         assert_eq!(count_after, 1);
