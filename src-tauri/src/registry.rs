@@ -90,6 +90,13 @@ pub(crate) struct RegistrySource {
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub(crate) struct RegistryEvent {
+    pub id: i64,
+    #[serde(default)]
+    pub model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub(crate) struct RegistrySearchResult {
     #[serde(default)]
     pub items: Vec<RegistryModel>,
@@ -378,6 +385,14 @@ impl RegistryClient {
         self.send_json(
             self.request(Method::POST, &format!("/api/v1/models/{model_id}/sources"))?
                 .json(&payload),
+        )
+        .await
+    }
+
+    pub(crate) async fn events(&self, after_id: i64) -> Result<Vec<RegistryEvent>, RegistryError> {
+        self.send_json(
+            self.request(Method::GET, "/api/v1/events/snapshot")?
+                .query(&[("after_id", after_id)]),
         )
         .await
     }
