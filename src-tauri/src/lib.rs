@@ -1152,13 +1152,15 @@ async fn hydrate_local_model_from_registry(
     let selected_version = registry_version_id
         .and_then(|id| versions.iter().find(|version| version.id == id))
         .or_else(|| {
-            civitai_source.and_then(|source| {
-                source.external_version_id.as_ref().and_then(|external| {
+            sources
+                .iter()
+                .find(|source| source.provider.eq_ignore_ascii_case("civitai"))
+                .and_then(|source| source.external_version_id.as_ref())
+                .and_then(|external| {
                     versions.iter().find(|version| {
                         version.source_version_id.as_deref() == Some(external.as_str())
                     })
                 })
-            })
         })
         .or_else(|| versions.first());
 
