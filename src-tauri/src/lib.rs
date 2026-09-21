@@ -1246,11 +1246,12 @@ async fn sync_local_model_to_registry(
     {
         let version_id = format!("civitai_version_{civitai_version_id}");
         let versions = app.registry.versions(&created_model_id).await.unwrap_or_default();
+        let external_version_text = civitai_version_id.to_string();
         let existing = versions
             .iter()
             .find(|version| {
                 version.id == version_id
-                    || version.source_version_id.as_deref() == Some(&civitai_version_id.to_string())
+                    || version.source_version_id.as_deref() == Some(external_version_text.as_str())
             })
             .cloned();
 
@@ -1350,8 +1351,25 @@ async fn sync_local_model_to_registry(
         )?;
     } else {
         let files = app.registry.files(&created_model_id).await.unwrap_or_default();
+
+        if let Some(existing_file_id) = registry_file_id.clone() {
+            if let Some(existing_file) = files.iter().find(|file| file.id == existing_file_id) {
+                if existing_file.path != local.path
+                    || existing_file.sha256.as_deref() != Some(source_hash.as_str())
+                    || existing_file.size_bytes != local.size_bytes
+                    || existing_file.modified_at != local.modified_at
+                {
+                    let _ = app.registry.remove_file(&created_model_id, &existing_file.id).await;
+                }
+            }
+        }
+
+        let files = app.registry.files(&created_model_id).await.unwrap_or_default();
         let matching = files.iter().find(|file| {
-            file.path == local.path || file.sha256.as_deref() == Some(source_hash.as_str())
+            file.path == local.path
+                && file.sha256.as_deref() == Some(source_hash.as_str())
+                && file.size_bytes == local.size_bytes
+                && file.modified_at == local.modified_at
         }).cloned();
 
         let file = if let Some(file) = matching {
