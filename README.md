@@ -1,6 +1,6 @@
 # Raphael Model Manager
 
-A local-first Windows desktop model manager for ComfyUI with Civitai integration, recursive model discovery, offline example-image caching, and a Raphael-themed interface. Raphael Model Manager is a Registry consumer: the separate Raphael Model Registry is the authoritative source for logical model identity, versions, files, tags, sources, and metadata.
+A local-first Windows desktop model manager for ComfyUI with Civitai integration, recursive model discovery, offline example-image caching, and a Raphael-themed interface. Logical model metadata is owned by the separate Raphael Model Registry service; Model Manager communicates with it only through the Registry HTTP API. Raphael Model Manager is a Registry consumer: the separate Raphael Model Registry is the authoritative source for logical model identity, versions, files, tags, sources, and metadata.
 
 ## Features
 
@@ -8,7 +8,7 @@ A local-first Windows desktop model manager for ComfyUI with Civitai integration
 - Watches the folder recursively so new, changed, and removed models appear automatically.
 - Preserves nested folders under `checkpoints/`, `loras/`, `vae/`, `controlnet/`, `embeddings/`, and other ComfyUI model roots.
 - Paste a Civitai model URL to preview, download, and install the correct model file.
-- Stores Civitai descriptions, tags, activation prompts, version metadata, and example generation parameters.
+- Reads and writes canonical model metadata, versions, tags, sources, and physical-file records through the Raphael Model Registry API.
 - Downloads Civitai gallery images and thumbnails into a local cache so model pages remain useful offline.
 - Keeps model files in their original ComfyUI location; local SQLite is only a runtime/projection cache and is never the authoritative model registry.
 - Synchronizes installed physical files with the Raphael Model Registry over its versioned HTTP API.
