@@ -4167,6 +4167,9 @@ fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
                 );
             }
 
+            // Hash enrichment is a discovery step; the Registry still receives
+            // the authoritative model/version/file update through the same API.
+            let _ = sync_local_model_to_registry(&app, id).await;
             emit_models_changed(&handle);
         }
     });
