@@ -623,11 +623,15 @@ async fn task_start_handler(
                         .map_err(|error| AppError::Invalid(error.to_string()))
                 })
             }
-            "add_subfolder_tags" => Box::pin(async move {
-                let value = crate::add_subfolder_tags_inner(&app)?;
-                serde_json::to_value(value)
-                    .map_err(|error| AppError::Invalid(error.to_string()))
-            }),
+            "add_subfolder_tags" => {
+                let task_handle = handle.clone();
+                Box::pin(async move {
+                    let value = crate::add_subfolder_tags_inner(&app)?;
+                    crate::spawn_registry_sync(app.clone(), task_handle.clone());
+                    serde_json::to_value(value)
+                        .map_err(|error| AppError::Invalid(error.to_string()))
+                })
+            },
             "delete_model" => {
                 let args: IdArgs = match arg(request.args) {
                     Ok(value) => value,
