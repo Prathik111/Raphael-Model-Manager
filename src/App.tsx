@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, fileUrl, subscribeToExamplesRefresh, subscribeToModelChanges } from './tauri';
 import type { AppState, CacheOperationResult, CacheStats, CivitaiImportPreview, DownloadProgress, ExamplesRefreshProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
+import { civitaiTypeToModelType, defaultImportDirectory, folderForModelType, fmtBytes, fmtCount, fmtDateTime, initials } from './utils/model';
 
 const TYPES: Array<{ key: ModelType | 'All'; label: string }> = [
   { key: 'All', label: 'ALL' }, { key: 'Checkpoint', label: 'CHECKPOINTS' }, { key: 'LoRA', label: 'LORAS' },
@@ -26,45 +27,6 @@ const MODEL_TYPES: Array<{value:string; label:string}> = [
   { value: 'Other', label: 'OTHER' }
 ];
 
-function civitaiTypeToModelType(type?: string | null): ModelType {
-  switch ((type || '').toLowerCase().replace(/[-_\s]/g, '')) {
-    case 'checkpoint': return 'Checkpoint';
-    case 'lora':
-    case 'locon':
-    case 'lycoris': return 'LoRA';
-    case 'vae': return 'VAE';
-    case 'controlnet': return 'ControlNet';
-    case 'textualinversion':
-    case 'embedding': return 'Embedding';
-    case 'upscaler': return 'Upscaler';
-    case 'clip':
-    case 'clipvision':
-    case 'ipadapter': return 'Other';
-    default: return 'Other';
-  }
-}
-
-function folderForModelType(type: ModelType): string {
-  switch (type) {
-    case 'Checkpoint': return 'checkpoints';
-    case 'LoRA': return 'loras';
-    case 'VAE': return 'vae';
-    case 'ControlNet': return 'controlnet';
-    case 'Embedding': return 'embeddings';
-    case 'Upscaler': return 'upscale_models';
-    case 'Text Encoder': return 'text_encoders';
-    case 'CLIP Vision': return 'clip_vision';
-    case 'IP-Adapter': return 'ipadapter';
-    default: return 'other';
-  }
-}
-
-function defaultImportDirectory(root: string | null, type: ModelType): string {
-  if (!root) return '';
-  const cleanRoot = root.replace(/[\\/]+$/, '');
-  return cleanRoot + '\\' + folderForModelType(type);
-}
-
 type ThumbnailFit = 'cover' | 'contain' | 'fill';
 const THUMBNAIL_FIT_KEY = 'raphael.thumbnailFit';
 
@@ -73,11 +35,6 @@ function initialThumbnailFit(): ThumbnailFit {
   const saved = window.localStorage.getItem(THUMBNAIL_FIT_KEY);
   return saved === 'contain' || saved === 'fill' || saved === 'cover' ? saved : 'cover';
 }
-
-function fmtBytes(n: number) { if (n < 1024) return `${n} B`; const u=['KB','MB','GB','TB']; let i=-1,v=n; do { v/=1024; i++; } while(v>=1024 && i<u.length-1); return `${v.toFixed(v>=100?0:v>=10?1:2)} ${u[i]}`; }
-function fmtCount(n: number) { return new Intl.NumberFormat().format(Math.max(0, n)); }
-function fmtDateTime(seconds: number) { if (!seconds) return '—'; return new Date(seconds * 1000).toLocaleString(); }
-function initials(s: string) { return s.split(/\s+/).filter(Boolean).slice(0,2).map(x=>x[0]).join('').toUpperCase(); }
 
 function PulseMark() {
   return <div className="raphael-core" aria-label="Raphael">

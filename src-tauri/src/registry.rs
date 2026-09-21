@@ -108,6 +108,7 @@ impl RegistryClient {
             .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
             .trim_end_matches('/')
             .to_string();
+        validate_registry_base_url(&base_url)?;
 
         let token_file = env::var_os("RAPHAEL_REGISTRY_TOKEN_FILE")
             .map(PathBuf::from)
@@ -210,16 +211,31 @@ impl RegistryClient {
         expected_revision: i64,
         patch: Value,
     ) -> Result<RegistryModel, RegistryError> {
-        let mut body = match patch {
-            Value::Object(map) => map,
-            _ => serde_json::Map::new(),
-        };
-        body.insert("expected_revision".into(), json!(expected_revision));
-        self.send_json(
-            self.request(Method::PATCH, &format!("/api/v1/models/{id}"))?
-                .json(&Value::Object(body)),
-        )
-        .await
+        let mut revision = expected_revision;
+        for attempt in 0..=2 {
+            let mut body = match patch.clone() {
+                Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
+            body.insert("expected_revision".into(), json!(revision));
+
+            match self
+                .send_json(
+                    self.request(Method::PATCH, &format!("/api/v1/models/{id}"))?
+                        .json(&Value::Object(body)),
+                )
+                .await
+            {
+                Ok(model) => return Ok(model),
+                Err(RegistryError::Api { status, .. })
+                    if is_revision_conflict(status) && attempt < 2 =>
+                {
+                    revision = self.get_model(id).await?.revision;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("registry model update retry loop always returns")
     }
 
     pub(crate) async fn versions(&self, id: &str) -> Result<Vec<RegistryVersion>, RegistryError> {
@@ -246,19 +262,41 @@ impl RegistryClient {
         expected_revision: i64,
         patch: Value,
     ) -> Result<RegistryVersion, RegistryError> {
-        let mut body = match patch {
-            Value::Object(map) => map,
-            _ => serde_json::Map::new(),
-        };
-        body.insert("expected_revision".into(), json!(expected_revision));
-        self.send_json(
-            self.request(
-                Method::PATCH,
-                &format!("/api/v1/models/{model_id}/versions/{version_id}"),
-            )?
-            .json(&Value::Object(body)),
-        )
-        .await
+        let mut revision = expected_revision;
+        for attempt in 0..=2 {
+            let mut body = match patch.clone() {
+                Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
+            body.insert("expected_revision".into(), json!(revision));
+
+            match self
+                .send_json(
+                    self.request(
+                        Method::PATCH,
+                        &format!("/api/v1/models/{model_id}/versions/{version_id}"),
+                    )?
+                    .json(&Value::Object(body)),
+                )
+                .await
+            {
+                Ok(version) => return Ok(version),
+                Err(RegistryError::Api { status, .. })
+                    if is_revision_conflict(status) && attempt < 2 =>
+                {
+                    revision = self.versions(model_id).await?
+                        .into_iter()
+                        .find(|version| version.id == version_id)
+                        .ok_or_else(|| RegistryError::Api {
+                            status: StatusCode::NOT_FOUND,
+                            message: format!("Registry version {version_id} disappeared during conflict retry"),
+                        })?
+                        .revision;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("registry version update retry loop always returns")
     }
 
     pub(crate) async fn files(&self, model_id: &str) -> Result<Vec<RegistryFile>, RegistryError> {
@@ -353,6 +391,32 @@ impl RegistryClient {
 
 }
 
+fn is_revision_conflict(status: StatusCode) -> bool {
+    matches!(status, StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED)
+}
+
+fn validate_registry_base_url(base_url: &str) -> Result<(), RegistryError> {
+    let parsed = url::Url::parse(base_url).map_err(|error| RegistryError::Api {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("Invalid registry URL: {error}"),
+    })?;
+
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+
+    let host = parsed.host_str().unwrap_or_default();
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
+    if parsed.scheme() == "http" && loopback {
+        return Ok(());
+    }
+
+    Err(RegistryError::Api {
+        status: StatusCode::BAD_REQUEST,
+        message: "Registry URL must use HTTPS unless it points to the local machine".into(),
+    })
+}
+
 fn default_token_path(app_data: &Path) -> PathBuf {
     if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
         return PathBuf::from(local_app_data)
@@ -372,5 +436,20 @@ mod tests {
     fn default_token_path_uses_app_data_when_localappdata_is_missing() {
         std::env::remove_var("LOCALAPPDATA");
         assert!(default_token_path(Path::new("app")).ends_with("registry.token"));
+    }
+
+    #[test]
+    fn registry_url_requires_https_for_remote_endpoints() {
+        assert!(validate_registry_base_url("http://127.0.0.1:43217").is_ok());
+        assert!(validate_registry_base_url("http://localhost:43217").is_ok());
+        assert!(validate_registry_base_url("https://registry.example.com").is_ok());
+        assert!(validate_registry_base_url("http://registry.example.com").is_err());
+    }
+
+    #[test]
+    fn revision_conflicts_include_precondition_failures() {
+        assert!(is_revision_conflict(StatusCode::CONFLICT));
+        assert!(is_revision_conflict(StatusCode::PRECONDITION_FAILED));
+        assert!(!is_revision_conflict(StatusCode::NOT_FOUND));
     }
 }
