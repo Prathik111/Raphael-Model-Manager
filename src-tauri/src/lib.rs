@@ -2553,24 +2553,19 @@ async fn delete_model_inner(app: &AppStateInner, handle: AppHandle, id: i64) -> 
         return Err(AppError::Invalid("Refusing to delete a model outside the configured models folder".into()));
     }
 
-    let physical_removed = if path.exists() {
+    if path.exists() {
         let meta = fs::metadata(&path)?;
         if !meta.is_file() {
             return Err(AppError::Invalid("The model path is not a regular file".into()));
         }
         fs::remove_file(&path)?;
-        true
-    } else {
-        false
-    };
+    }
 
-    if physical_removed {
-        if let (Some(registry_model_id), Some(registry_file_id)) =
-            (registry_model_id.as_deref(), registry_file_id.as_deref())
-        {
-            if app.registry.remove_file(registry_model_id, registry_file_id).await.is_err() {
-                queue_registry_file_removal(app, registry_model_id, registry_file_id);
-            }
+    if let (Some(registry_model_id), Some(registry_file_id)) =
+        (registry_model_id.as_deref(), registry_file_id.as_deref())
+    {
+        if app.registry.remove_file(registry_model_id, registry_file_id).await.is_err() {
+            queue_registry_file_removal(app, registry_model_id, registry_file_id);
         }
     }
 
