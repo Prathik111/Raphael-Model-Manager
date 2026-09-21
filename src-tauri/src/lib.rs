@@ -3694,41 +3694,26 @@ async fn link_model_civitai_inner(
         },
         None=>None
     };
-    let rec={
-        let c=open_db(&app.app_data)?;
-        c.execute(
-            "UPDATE models
-             SET civitai_model_id=?2,
-                 civitai_version_id=?3,
-                 civitai_url=?4,
-                 civitai_name=?5,
-                 version_name=?6,
-                 base_model=?7,
-                 creator=?8,
-                 description=?9,
-                 tags_json=CASE WHEN tags_user_modified=0 THEN ?10 ELSE tags_json END,
-                 activation_json=?11,
-                 thumbnail_path=?12,
-                 updated_at=?13
-             WHERE id=?1",
-            params![
-                id,
-                mid,
-                vid,
-                canonical,
-                model.get("name").and_then(Value::as_str),
-                version.get("name").and_then(Value::as_str),
-                version.get("baseModel").and_then(Value::as_str),
-                creator,
-                desc,
-                serde_json::to_string(&tags).unwrap_or_else(|_|"[]".into()),
-                serde_json::to_string(&activation).unwrap_or_else(|_|"[]".into()),
-                thumbnail_path,
-                now()
-            ],
-        )?;
-        model_by_id(&c,id)?
-    };
+    let (_registry_model_id, _registry_version_id) = apply_civitai_metadata_to_registry(
+        app,
+        id,
+        &model,
+        &version,
+        &canonical,
+        &tags,
+        &activation,
+        desc.as_deref(),
+        creator.as_deref(),
+    ).await?;
+
+    let c=open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET civitai_model_id=?2,civitai_version_id=?3,civitai_url=?4,thumbnail_path=?5,updated_at=?6 WHERE id=?1",
+        params![id,mid,vid,canonical,thumbnail_path,now()],
+    )?;
+    let rec=model_by_id(&c,id)?;
+    drop(c);
+
     emit_models_changed(&handle);
     drop(_guard);
     Ok(rec)
@@ -3781,39 +3766,31 @@ async fn refresh_model_civitai_inner(
         None=>None
     };
 
-    let rec = {
-        let c = open_db(&app.app_data)?;
-        c.execute(
-            "UPDATE models
-             SET civitai_model_id=?2,
-                 civitai_version_id=?3,
-                 civitai_name=?4,
-                 version_name=?5,
-                 base_model=?6,
-                 creator=?7,
-                 description=?8,
-                 tags_json=CASE WHEN tags_user_modified=0 THEN ?9 ELSE tags_json END,
-                 activation_json=?10,
-                 thumbnail_path=?11,
-                 updated_at=?12
-             WHERE id=?1",
-            params![
-                id,
-                model.get("id").and_then(Value::as_i64),
-                version.get("id").and_then(Value::as_i64),
-                model.get("name").and_then(Value::as_str),
-                version.get("name").and_then(Value::as_str),
-                version.get("baseModel").and_then(Value::as_str),
-                creator,
-                desc,
-                serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
-                serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
-                thumbnail_path,
-                now()
-            ],
-        )?;
-        model_by_id(&c, id)?
-    };
+    let canonical = canonical_civitai_url(
+        &url,
+        model.get("id").and_then(Value::as_i64),
+        version.get("id").and_then(Value::as_i64),
+    )?;
+
+    let (_registry_model_id, _registry_version_id) = apply_civitai_metadata_to_registry(
+        app,
+        id,
+        &model,
+        &version,
+        &canonical,
+        &tags,
+        &activation,
+        desc.as_deref(),
+        creator.as_deref(),
+    ).await?;
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET thumbnail_path=?2,updated_at=?3 WHERE id=?1",
+        params![id,thumbnail_path,now()],
+    )?;
+    let rec = model_by_id(&c,id)?;
+    drop(c);
 
     emit_models_changed(&handle);
     drop(_guard);
