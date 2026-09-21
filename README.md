@@ -68,6 +68,12 @@ Public model metadata and public downloads work without a token when Civitai per
 
 The Manager communicates with the separate Raphael Model Registry through its HTTP API. The Registry owns logical model identity, model metadata, versions, file records, tags, sources, assets, compatibility, search, revisions, and durable events. Raphael Model Manager owns the physical ComfyUI files, filesystem watching, downloads, local image cache, and UI.
 
+### LAN web app security
+
+The optional LAN web app binds to the host's LAN address and protects every `/api/*` endpoint with an installation-specific 256-bit access token. The token is delivered in the URL fragment (`#access_token=...`) so it is not sent as part of the HTTP request URL, and the web client exchanges it for a same-origin, HttpOnly session cookie after startup.
+
+The web API is intentionally not CORS-open. Do not share the generated web-app URL with untrusted users because it grants access to the Manager's API for as long as the web app remains enabled.
+
 By default Raphael connects to:
 
 ```text
