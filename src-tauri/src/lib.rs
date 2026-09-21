@@ -4265,7 +4265,7 @@ mod tests {
 
     fn test_state(app_data: PathBuf, models_root: PathBuf) -> AppStateInner {
         AppStateInner {
-            app_data,
+            app_data: app_data.clone(),
             models_root: Arc::new(RwLock::new(Some(models_root))),
             watcher: Arc::new(Mutex::new(None)),
             scan_lock: Arc::new(Mutex::new(())),
