@@ -1510,6 +1510,7 @@ async fn apply_civitai_metadata_to_registry(
         .and_then(Value::as_i64)
         .ok_or_else(|| AppError::Invalid("Civitai response did not include a model ID".into()))?;
     let desired_version_id = format!("civitai_version_{external_version_id}");
+    let external_version_text = external_version_id.to_string();
 
     let versions = app.registry.versions(&registry_model_id).await?;
     let version_payload = json!({
@@ -1525,7 +1526,7 @@ async fn apply_civitai_metadata_to_registry(
 
     let registry_version_id = if let Some(existing) = versions.iter().find(|item| {
         item.id == desired_version_id
-            || item.source_version_id.as_deref() == Some(&external_version_id.to_string())
+            || item.source_version_id.as_deref() == Some(external_version_text.as_str())
     }) {
         app.registry.update_version(
             &registry_model_id,
