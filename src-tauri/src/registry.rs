@@ -92,12 +92,7 @@ pub(crate) struct RegistrySource {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct RegistryEvent {
     pub id: i64,
-    pub event_type: String,
-    pub actor: String,
     pub model_id: Option<String>,
-    #[serde(default)]
-    pub payload: Value,
-    pub created_at: i64,
 }
 
 #[derive(Clone)]
@@ -183,6 +178,7 @@ impl RegistryClient {
     }
 
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_model(
         &self,
         id: &str,
