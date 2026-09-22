@@ -14,6 +14,7 @@ import type {
   ModelImagesResponse,
   CacheStats,
   CacheOperationResult,
+  TagRefreshResult,
 } from './types';
 
 export const isWebApp = typeof window !== 'undefined' && !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
@@ -207,8 +208,12 @@ export const api = {
   getLibraryCounts: () => command<LibraryCounts>('get_library_counts'),
   getTags: () => command<TagRecord[]>('get_tags'),
   addSubfolderTags: () => isWebApp ? webTaskCommand<number>('add_subfolder_tags') : command<number>('add_subfolder_tags'),
+  refetchAllModelTags: () =>
+    isWebApp ? webTaskCommand<TagRefreshResult>('refetch_all_model_tags') : command<TagRefreshResult>('refetch_all_model_tags'),
   setModelTags: (id: number, tags: string[]) =>
     command<ModelRecord>('set_model_tags', { id, tags }),
+  setModelName: (id: number, name: string) =>
+    command<ModelRecord>('set_model_name', { id, name }),
   setModelDescription: (id: number, description: string) =>
     command<ModelRecord>('set_model_description', { id, description }),
   setModelType: (id: number, modelType: string) =>
