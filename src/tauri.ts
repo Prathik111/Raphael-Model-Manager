@@ -19,7 +19,6 @@ import type {
 
 const WEB_REQUEST_TIMEOUT_MS = 10_000;
 const WEB_STATUS_TIMEOUT_MS = 4_000;
-const WEB_TOKEN_STORAGE_KEY = 'raphael.webToken';
 
 function isTauriRuntime(): boolean {
   if (typeof window === 'undefined') return false;
@@ -35,46 +34,10 @@ function isTauriDevWindow(): boolean {
   }
 }
 
-function hasWebAccessToken(): boolean {
-  if (typeof window === 'undefined' || isTauriDevWindow()) return false;
-  try {
-    if (window.sessionStorage.getItem(WEB_TOKEN_STORAGE_KEY)) return true;
-
-    const rawHash = window.location.hash.startsWith('#')
-      ? window.location.hash.slice(1)
-      : window.location.hash;
-    return Boolean(new URLSearchParams(rawHash).get('access_token'));
-  } catch {
-    return false;
-  }
-}
-
 export const isWebApp = !isTauriRuntime();
 
 function useWebTransport(): boolean {
   return isWebApp;
-}
-
-function getWebAccessToken(): string | null {
-  if (!isWebApp) return null;
-  try {
-    const stored = window.sessionStorage.getItem(WEB_TOKEN_STORAGE_KEY);
-    if (stored) return stored;
-
-    const rawHash = window.location.hash.startsWith('#')
-      ? window.location.hash.slice(1)
-      : window.location.hash;
-    const params = new URLSearchParams(rawHash);
-    const token = params.get('access_token');
-    if (!token) return null;
-
-    window.sessionStorage.setItem(WEB_TOKEN_STORAGE_KEY, token);
-    const cleanUrl = window.location.pathname + window.location.search;
-    window.history.replaceState(null, document.title, cleanUrl);
-    return token;
-  } catch {
-    return null;
-  }
 }
 
 async function webFetch(
@@ -86,10 +49,6 @@ async function webFetch(
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     const headers = new Headers(init.headers);
-    const token = getWebAccessToken();
-    if (token && !headers.has('Authorization')) {
-      headers.set('Authorization', `Bearer ${token}`);
-    }
     return await fetch(url, {
       ...init,
       headers,
