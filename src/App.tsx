@@ -674,6 +674,39 @@ type GalleryLoadJob = {
 };
 
 const galleryLoadQueue: GalleryLoadJob[] = [];
+const galleryImageUrlCache = new Map<string, string>();
+const galleryImagePreloadCache = new Map<string, Promise<void>>();
+
+function preloadGalleryImage(src: string): Promise<void> {
+  const cached = galleryImageUrlCache.get(src);
+  if (cached) return Promise.resolve();
+
+  const existing = galleryImagePreloadCache.get(src);
+  if (existing) return existing;
+
+  const resolvedUrl = fileUrl(src);
+  const promise = new Promise<void>((resolve, reject) => {
+    const image = new Image();
+    image.decoding = 'async';
+    image.onload = async () => {
+      try {
+        if (typeof image.decode === 'function') await image.decode();
+      } catch {
+        // The image is still usable when decode() is unavailable or fails.
+      }
+      galleryImageUrlCache.set(src, resolvedUrl);
+      resolve();
+    };
+    image.onerror = () => reject(new Error('Failed to load gallery image'));
+    image.src = resolvedUrl;
+  });
+
+  galleryImagePreloadCache.set(src, promise);
+  void promise.catch(() => {}).finally(() => {
+    galleryImagePreloadCache.delete(src);
+  });
+  return promise;
+}
 
 function drainGalleryImageQueue() {
   while (activeGalleryImageLoads < GALLERY_LOAD_CONCURRENCY && galleryLoadQueue.length) {
@@ -719,7 +752,9 @@ function enqueueGalleryImageLoad(begin: (release: () => void) => void) {
 function GalleryImage({ src, alt }: { src: string; alt: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [nearViewport, setNearViewport] = useState(false);
-  const [loadedSrc, setLoadedSrc] = useState<string | null>(null);
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(() => (
+    galleryImageUrlCache.has(src) ? src : null
+  ));
   const releaseRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
@@ -742,32 +777,44 @@ function GalleryImage({ src, alt }: { src: string; alt: string }) {
   }, []);
 
   useEffect(() => {
-    setLoadedSrc(null);
     releaseRef.current?.();
     releaseRef.current = null;
-    if (!nearViewport || !src) return;
 
+    if (!nearViewport || !src) {
+      setLoadedSrc(galleryImageUrlCache.has(src) ? src : null);
+      return;
+    }
+
+    if (galleryImageUrlCache.has(src)) {
+      setLoadedSrc(src);
+      return;
+    }
+
+    setLoadedSrc(null);
     return enqueueGalleryImageLoad((release) => {
       releaseRef.current = release;
-      setLoadedSrc(src);
+      void preloadGalleryImage(src)
+        .then(() => {
+          setLoadedSrc(src);
+        })
+        .catch(() => {
+          setLoadedSrc(null);
+        })
+        .finally(() => {
+          releaseRef.current?.();
+          releaseRef.current = null;
+        });
     });
   }, [nearViewport, src]);
-
-  const finishLoad = () => {
-    releaseRef.current?.();
-    releaseRef.current = null;
-  };
 
   return (
     <div ref={containerRef} className="gallery-image-loader">
       {loadedSrc ? (
         <img
-          src={fileUrl(loadedSrc)}
+          src={galleryImageUrlCache.get(loadedSrc) || fileUrl(loadedSrc)}
           alt={alt}
-          loading="lazy"
           decoding="async"
-          onLoad={finishLoad}
-          onError={finishLoad}
+          fetchPriority="low"
         />
       ) : (
         <div className="thumb placeholder" aria-hidden="true">IMAGE</div>
@@ -775,6 +822,7 @@ function GalleryImage({ src, alt }: { src: string; alt: string }) {
     </div>
   );
 }
+
 
 function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetchMore, onOpenImage }: {
   model: ModelRecord;
