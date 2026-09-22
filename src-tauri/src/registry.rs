@@ -16,7 +16,7 @@ use tokio::{
 use url::Url;
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:43217";
-const REGISTRY_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const REGISTRY_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
 const REGISTRY_STARTUP_POLL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Error)]
