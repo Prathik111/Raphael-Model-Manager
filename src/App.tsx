@@ -1425,11 +1425,7 @@ function App() {
       window.setTimeout(() => loader.remove(), 260);
 
       const revealBackground = () => setShowBackground(true);
-      if ('requestIdleCallback' in window) {
-        window.requestIdleCallback(revealBackground, { timeout: 1500 });
-      } else {
-        window.setTimeout(revealBackground, 350);
-      }
+      window.setTimeout(revealBackground, 350);
     };
 
     const timer = window.setTimeout(reveal, remaining);
@@ -1437,7 +1433,7 @@ function App() {
   }, [startupReady]);
   const refreshGeneration = useRef(0);
   const modelGridRef = useRef<HTMLDivElement>(null);
-  const [renderModelCount, setRenderModelCount] = useState(72);
+  const [renderModelCount, setRenderModelCount] = useState(36);
   const [type,setType]=useState<ModelType|'All'>('All'); const [query,setQuery]=useState(''); const [activeTags,setActiveTags]=useState<string[]>([]); const [tagPanelOpen,setTagPanelOpen]=useState(false); const [allTags,setAllTags]=useState<TagRecord[]>([]); const [images,setImages]=useState<ModelImage[]>([]); const [galleryHasMore,setGalleryHasMore]=useState(true); const [galleryFetchBusy,setGalleryFetchBusy]=useState(false); const [imageViewerId,setImageViewerId]=useState<number|null>(null); const bulkFileInputRef=useRef<HTMLInputElement>(null); const [bulkBusy,setBulkBusy]=useState(false); const [bulkMessage,setBulkMessage]=useState<string|null>(null); const [importUrl,setImportUrl]=useState(''); const [preview,setPreview]=useState<CivitaiImportPreview|null>(null); const [busy,setBusy]=useState(false); const [sort,setSort]=useState('name'); const [counts,setCounts]=useState<LibraryCounts>({all:0,by_type:{}}); const [importError,setImportError]=useState<string|null>(null); const [downloadPath,setDownloadPath]=useState(''); const [importType,setImportType]=useState<ModelType>('Other'); const [customDownloadPath,setCustomDownloadPath]=useState(false); const [webStatus,setWebStatus]=useState<{enabled:boolean;url:string|null;port:number}>({enabled:false,url:null,port:1421}); const [webConnected,setWebConnected]=useState(!api.isWebApp); const [webBusy,setWebBusy]=useState(false); const [webError,setWebError]=useState<string|null>(null);
   const [settingsOpen,setSettingsOpen]=useState(false);
   const [coverEditorOpen,setCoverEditorOpen]=useState(false);
