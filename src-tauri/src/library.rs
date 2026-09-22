@@ -85,7 +85,10 @@ pub(crate) fn list_models(app:State<AppStateInner>, r#type:Option<String>, query
     let c=open_db(&app.app_data)?;
     let mut sql=format!("{MODEL_SELECT} WHERE 1=1");
     let mut args:Vec<String>=vec![];
-    if let Some(t)=r#type { sql.push_str(" AND model_type=?"); args.push(t); }
+    if let Some(t)=r#type {
+        sql.push_str(" AND LOWER(TRIM(model_type))=LOWER(TRIM(?))");
+        args.push(t);
+    }
     sql.push_str(" ORDER BY COALESCE(civitai_name,filename) COLLATE NOCASE");
     let mut stmt=c.prepare(&sql)?;
     let rows=stmt.query_map(rusqlite::params_from_iter(args.iter()),model_from_row)?;
