@@ -55,6 +55,10 @@ function hasWebAccessToken(): boolean {
 
 export const isWebApp = !isDesktopOrigin() && hasWebAccessToken();
 
+function useWebTransport(): boolean {
+  return !isDesktopOrigin() && isWebApp;
+}
+
 function getWebAccessToken(): string | null {
   if (!isWebApp) return null;
   try {
@@ -198,10 +202,10 @@ async function webTaskCommand<T>(commandName: string, args: Record<string, unkno
 }
 
 const command = <T,>(name: string, args: Record<string, unknown> = {}) =>
-  isWebApp ? webCommand<T>(name, args) : invoke<T>(name, args);
+  useWebTransport() ? webCommand<T>(name, args) : invoke<T>(name, args);
 
 export const fileUrl = (path: string) =>
-  isWebApp
+  useWebTransport()
     ? '/api/file?path=' + encodeURIComponent(path)
     : convertFileSrc(path);
 
@@ -239,7 +243,7 @@ export const api = {
     command<ModelRecord[]>('list_models', { ...params }),
   getLibraryCounts: () => command<LibraryCounts>('get_library_counts'),
   getTags: () => command<TagRecord[]>('get_tags'),
-  addSubfolderTags: () => isWebApp ? webTaskCommand<number>('add_subfolder_tags') : command<number>('add_subfolder_tags'),
+  addSubfolderTags: () => useWebTransport() ? webTaskCommand<number>('add_subfolder_tags') : command<number>('add_subfolder_tags'),
   setModelTags: (id: number, tags: string[]) =>
     command<ModelRecord>('set_model_tags', { id, tags }),
   setModelType: (id: number, modelType: string) =>
@@ -253,13 +257,13 @@ export const api = {
   resetModelCover: (id: number) =>
     command<ModelRecord>('reset_model_cover', { id }),
   deleteModel: (id: number) =>
-    isWebApp ? webTaskCommand<void>('delete_model', { id }) : command<void>('delete_model', { id }),
+    useWebTransport() ? webTaskCommand<void>('delete_model', { id }) : command<void>('delete_model', { id }),
   getImages: (id: number, limit = 20) =>
     command<ModelImagesResponse>('get_model_images', { id, limit }),
   syncModelGallery: (id: number, targetCount = 20) =>
-    isWebApp ? webTaskCommand<boolean>('sync_model_gallery', { id, targetCount }) : command<boolean>('sync_model_gallery', { id, targetCount }),
+    useWebTransport() ? webTaskCommand<boolean>('sync_model_gallery', { id, targetCount }) : command<boolean>('sync_model_gallery', { id, targetCount }),
   loadMoreModelExamples: (id: number, amount?: number) =>
-    isWebApp ? webTaskCommand<boolean>('load_more_model_examples', { id, amount }) : command<boolean>('load_more_model_examples', { id, amount }),
+    useWebTransport() ? webTaskCommand<boolean>('load_more_model_examples', { id, amount }) : command<boolean>('load_more_model_examples', { id, amount }),
   getExampleLoadAmount: () =>
     command<number>('get_example_load_amount'),
   setExampleLoadAmount: (amount: number) =>
@@ -273,7 +277,7 @@ export const api = {
   getModelTagsRefreshStatus: () =>
     command<ModelTagsRefreshProgress | null>('get_model_tags_refresh_status'),
   importCivitai: (url: string) =>
-    isWebApp ? webTaskCommand<CivitaiImportPreview>('preview_civitai_import', { url }) : command<CivitaiImportPreview>('preview_civitai_import', { url }),
+    useWebTransport() ? webTaskCommand<CivitaiImportPreview>('preview_civitai_import', { url }) : command<CivitaiImportPreview>('preview_civitai_import', { url }),
   installCivitai: (
     url: string,
     targetDirectory?: string,
@@ -293,9 +297,9 @@ export const api = {
   clearDownloadProgress: (taskId: string) =>
     command<void>('clear_download_progress', { taskId }),
   refreshModel: (id: number) =>
-    isWebApp ? webTaskCommand<ModelRecord>('refresh_model_civitai', { id }) : command<ModelRecord>('refresh_model_civitai', { id }),
+    useWebTransport() ? webTaskCommand<ModelRecord>('refresh_model_civitai', { id }) : command<ModelRecord>('refresh_model_civitai', { id }),
   linkModelCivitai: (id: number, url: string) =>
-    isWebApp ? webTaskCommand<ModelRecord>('link_model_civitai', { id, url }) : command<ModelRecord>('link_model_civitai', { id, url }),
+    useWebTransport() ? webTaskCommand<ModelRecord>('link_model_civitai', { id, url }) : command<ModelRecord>('link_model_civitai', { id, url }),
   openFolder: (path: string) =>
     command<void>('open_in_file_manager', { path }),
   setCivitaiToken: (token: string) =>
@@ -307,39 +311,39 @@ export const api = {
   getCacheStats: () =>
     command<CacheStats>('get_cache_stats'),
   setCacheMaxBytes: (maxBytes: number) =>
-    isWebApp ? webTaskCommand<CacheStats>('set_cache_max_bytes', { maxBytes }) : command<CacheStats>('set_cache_max_bytes', { maxBytes }),
+    useWebTransport() ? webTaskCommand<CacheStats>('set_cache_max_bytes', { maxBytes }) : command<CacheStats>('set_cache_max_bytes', { maxBytes }),
   setCacheLocation: (path: string) =>
-    isWebApp ? webTaskCommand<CacheStats>('set_cache_location', { path }) : command<CacheStats>('set_cache_location', { path }),
+    useWebTransport() ? webTaskCommand<CacheStats>('set_cache_location', { path }) : command<CacheStats>('set_cache_location', { path }),
   clearCacheImages: () =>
-    isWebApp ? webTaskCommand<CacheOperationResult>('clear_cache_images') : command<CacheOperationResult>('clear_cache_images'),
+    useWebTransport() ? webTaskCommand<CacheOperationResult>('clear_cache_images') : command<CacheOperationResult>('clear_cache_images'),
   clearCompleteCache: () =>
-    isWebApp ? webTaskCommand<CacheOperationResult>('clear_complete_cache') : command<CacheOperationResult>('clear_complete_cache'),
+    useWebTransport() ? webTaskCommand<CacheOperationResult>('clear_complete_cache') : command<CacheOperationResult>('clear_complete_cache'),
   pruneCacheImages: (keepPerModel: number) =>
-    isWebApp ? webTaskCommand<CacheOperationResult>('prune_cache_images', { keepPerModel }) : command<CacheOperationResult>('prune_cache_images', { keepPerModel }),
+    useWebTransport() ? webTaskCommand<CacheOperationResult>('prune_cache_images', { keepPerModel }) : command<CacheOperationResult>('prune_cache_images', { keepPerModel }),
   cleanCacheOrphans: () =>
-    isWebApp ? webTaskCommand<CacheOperationResult>('clean_cache_orphans') : command<CacheOperationResult>('clean_cache_orphans'),
+    useWebTransport() ? webTaskCommand<CacheOperationResult>('clean_cache_orphans') : command<CacheOperationResult>('clean_cache_orphans'),
   getWebAppStatus: async () => {
-    if (!isWebApp) return invoke<WebAppStatus>('get_web_app_status');
+    if (!useWebTransport()) return invoke<WebAppStatus>('get_web_app_status');
     const response = await webFetch('/api/status', {}, WEB_STATUS_TIMEOUT_MS);
     const payload = await response.json().catch(() => null);
     if (!response.ok) throw new Error(payload?.error || `Web API status failed: ${response.status}`);
     return payload as WebAppStatus;
   },
   checkWebHealth: async () => {
-    if (!isWebApp) return { latencyMs: 0 };
+    if (!useWebTransport()) return { latencyMs: 0 };
     const started = performance.now();
     const response = await webFetch('/api/health', {}, 2500);
     if (!response.ok) throw new Error(`Web API health check failed: ${response.status}`);
     return { latencyMs: Math.round(performance.now() - started) };
   },
   setWebAppEnabled: (enabled: boolean) =>
-    isWebApp
+    useWebTransport()
       ? Promise.reject(new Error('Web app controls are available from the desktop host only.'))
       : invoke<WebAppStatus>('toggle_web_app', { enabled }),
 };
 
 export async function subscribeToModelChanges(cb: () => void) {
-  if (isWebApp) {
+  if (useWebTransport()) {
     let disposed = false;
     let revision = 0;
 
@@ -379,7 +383,7 @@ export async function subscribeToModelChanges(cb: () => void) {
 }
 
 export async function subscribeToExamplesRefresh(cb: (progress: ExamplesRefreshProgress) => void) {
-  if (isWebApp) {
+  if (useWebTransport()) {
     let disposed = false;
     let inFlight = false;
     const poll = async () => {
@@ -411,7 +415,7 @@ export async function subscribeToExamplesRefresh(cb: (progress: ExamplesRefreshP
 }
 
 export async function subscribeToModelTagsRefresh(cb: (progress: ModelTagsRefreshProgress) => void) {
-  if (isWebApp) {
+  if (useWebTransport()) {
     let disposed = false;
     let inFlight = false;
     const poll = async () => {
