@@ -946,6 +946,10 @@ async fn command_handler(
             set_civitai_token(args.token).map(|_| json!(null))
         }
         "is_civitai_token_set" => Ok(json!(is_civitai_token_set())),
+        "check_registry_health" => {
+            let app = handle.state::<crate::AppStateInner>();
+            Ok(json!(app.registry.is_healthy().await))
+        }
         "open_in_file_manager" => {
             let _ = arg::<serde_json::Map<String, Value>>(args);
             Err(AppError::Invalid("Opening the Windows file manager is only available in the desktop app".into()))
