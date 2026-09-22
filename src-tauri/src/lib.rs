@@ -92,6 +92,7 @@ struct AppStateInner {
     active_downloads: Arc<Mutex<usize>>,
     parallel_downloads: Arc<Mutex<usize>>,
     examples_refresh_state: Arc<Mutex<ExamplesRefreshState>>,
+    model_tags_refresh_state: Arc<Mutex<ModelTagsRefreshState>>,
     cache_lock: Arc<AsyncMutex<()>>,
     registry: RegistryClient,
     registry_sync_running: Arc<Mutex<bool>>,
@@ -220,6 +221,26 @@ struct ExamplesRefreshProgress {
 #[derive(Clone, Default)]
 struct ExamplesRefreshState {
     progress: Option<ExamplesRefreshProgress>,
+    running: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ModelTagsRefreshProgress {
+    current: usize,
+    total: usize,
+    model_id: Option<i64>,
+    model_name: Option<String>,
+    updated_models: usize,
+    protected_models: usize,
+    failed_models: usize,
+    status: String,
+    done: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct ModelTagsRefreshState {
+    progress: Option<ModelTagsRefreshProgress>,
     running: bool,
 }
 
@@ -1434,6 +1455,28 @@ fn store_examples_refresh_state(
 fn get_examples_refresh_state(
     state: &Arc<Mutex<ExamplesRefreshState>>,
 ) -> Option<ExamplesRefreshProgress> {
+    state.lock().ok().and_then(|guard| guard.progress.clone())
+}
+
+fn emit_model_tags_refresh_progress(handle: &AppHandle, progress: ModelTagsRefreshProgress) {
+    let _ = handle.emit("model-tags-refresh-progress", progress);
+}
+
+fn store_model_tags_refresh_state(
+    state: &Arc<Mutex<ModelTagsRefreshState>>,
+    handle: &AppHandle,
+    progress: ModelTagsRefreshProgress,
+) {
+    if let Ok(mut guard) = state.lock() {
+        guard.progress = Some(progress.clone());
+        guard.running = !progress.done;
+    }
+    emit_model_tags_refresh_progress(handle, progress);
+}
+
+fn get_model_tags_refresh_state(
+    state: &Arc<Mutex<ModelTagsRefreshState>>,
+) -> Option<ModelTagsRefreshProgress> {
     state.lock().ok().and_then(|guard| guard.progress.clone())
 }
 
@@ -3394,6 +3437,203 @@ fn refresh_all_examples(app: State<AppStateInner>, handle: AppHandle) -> AppResu
     Ok(initial)
 }
 
+async fn refresh_model_tags_only(app: &AppStateInner, id: i64) -> AppResult<bool> {
+    let current = {
+        let c = open_db(&app.app_data)?;
+        model_by_id(&c, id)?
+    };
+
+    let url = current
+        .civitai_url
+        .clone()
+        .ok_or_else(|| AppError::Invalid("This model is not linked to Civitai".into()))?;
+
+    let (model, _version) = fetch_model_and_version(app, &url).await?;
+    let tags = json_strings(model.get("tags"));
+
+    let (registry_model_id, tags_user_modified) = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id,tags_user_modified FROM models WHERE id=?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+        )?
+    };
+
+    if tags_user_modified {
+        return Ok(false);
+    }
+
+    let existing_tags = app.registry.tags(&registry_model_id).await?;
+    for tag in existing_tags.iter().filter(|tag| !tags.iter().any(|value| value.eq_ignore_ascii_case(tag))) {
+        let _ = app.registry.remove_tag(&registry_model_id, tag).await;
+    }
+    for tag in &tags {
+        if !existing_tags.iter().any(|value| value.eq_ignore_ascii_case(tag)) {
+            app.registry.add_tag(&registry_model_id, tag).await?;
+        }
+    }
+
+    let _ = hydrate_local_model_from_registry(app, id, &registry_model_id, None).await?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn refresh_all_model_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult<ModelTagsRefreshProgress> {
+    let initial = ModelTagsRefreshProgress {
+        current: 0,
+        total: 0,
+        model_id: None,
+        model_name: None,
+        updated_models: 0,
+        protected_models: 0,
+        failed_models: 0,
+        status: "Starting model tag refresh".into(),
+        done: false,
+        error: None,
+    };
+
+    {
+        let mut guard = app.model_tags_refresh_state.lock()
+            .map_err(|_| AppError::Invalid("Model tag refresh state is unavailable".into()))?;
+        if guard.running {
+            return Err(AppError::Invalid("Model tag refresh is already running".into()));
+        }
+        guard.running = true;
+        guard.progress = Some(initial.clone());
+    }
+    emit_model_tags_refresh_progress(&handle, initial.clone());
+
+    let state = app.inner().clone();
+    let refresh_state = state.model_tags_refresh_state.clone();
+    tauri::async_runtime::spawn(async move {
+        let models: Vec<(i64, String)> = match open_db(&state.app_data).and_then(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id,COALESCE(civitai_name,filename) FROM models WHERE civitai_model_id IS NOT NULL ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.filter_map(Result::ok).collect())
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                store_model_tags_refresh_state(&refresh_state, &handle, ModelTagsRefreshProgress {
+                    current: 0,
+                    total: 0,
+                    model_id: None,
+                    model_name: None,
+                    updated_models: 0,
+                    protected_models: 0,
+                    failed_models: 0,
+                    status: "Could not read linked models".into(),
+                    done: true,
+                    error: Some(e.to_string()),
+                });
+                return;
+            }
+        };
+
+        let total = models.len();
+        if total == 0 {
+            store_model_tags_refresh_state(&refresh_state, &handle, ModelTagsRefreshProgress {
+                current: 0,
+                total: 0,
+                model_id: None,
+                model_name: None,
+                updated_models: 0,
+                protected_models: 0,
+                failed_models: 0,
+                status: "No Civitai-linked models found".into(),
+                done: true,
+                error: None,
+            });
+            return;
+        }
+
+        let mut updated_models = 0usize;
+        let mut protected_models = 0usize;
+        let mut failed_models = 0usize;
+        let mut first_error: Option<String> = None;
+
+        for (index, (model_id, model_name)) in models.into_iter().enumerate() {
+            let current = index + 1;
+            match refresh_model_tags_only(&state, model_id).await {
+                Ok(true) => {
+                    updated_models += 1;
+                    store_model_tags_refresh_state(&refresh_state, &handle, ModelTagsRefreshProgress {
+                        current,
+                        total,
+                        model_id: Some(model_id),
+                        model_name: Some(model_name.clone()),
+                        updated_models,
+                        protected_models,
+                        failed_models,
+                        status: format!("Updated tags for {model_name}"),
+                        done: false,
+                        error: None,
+                    });
+                }
+                Ok(false) => {
+                    protected_models += 1;
+                    store_model_tags_refresh_state(&refresh_state, &handle, ModelTagsRefreshProgress {
+                        current,
+                        total,
+                        model_id: Some(model_id),
+                        model_name: Some(model_name.clone()),
+                        updated_models,
+                        protected_models,
+                        failed_models,
+                        status: format!("Preserved user-edited tags for {model_name}"),
+                        done: false,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    failed_models += 1;
+                    if first_error.is_none() {
+                        first_error = Some(error.to_string());
+                    }
+                    store_model_tags_refresh_state(&refresh_state, &handle, ModelTagsRefreshProgress {
+                        current,
+                        total,
+                        model_id: Some(model_id),
+                        model_name: Some(model_name.clone()),
+                        updated_models,
+                        protected_models,
+                        failed_models,
+                        status: format!("Failed to refresh {model_name}"),
+                        done: false,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+
+        store_model_tags_refresh_state(&refresh_state, &handle, ModelTagsRefreshProgress {
+            current: total,
+            total,
+            model_id: None,
+            model_name: None,
+            updated_models,
+            protected_models,
+            failed_models,
+            status: if failed_models == 0 {
+                format!("Finished · {updated_models} models updated · {protected_models} user-edited models preserved")
+            } else {
+                format!("Finished · {updated_models} updated · {protected_models} protected · {failed_models} failed")
+            },
+            done: true,
+            error: first_error,
+        });
+    });
+
+    Ok(initial)
+}
+
+#[tauri::command]
+fn get_model_tags_refresh_status(app: State<AppStateInner>) -> Option<ModelTagsRefreshProgress> {
+    get_model_tags_refresh_state(&app.model_tags_refresh_state)
+}
+
 #[tauri::command]
 fn get_examples_refresh_status(app: State<AppStateInner>) -> Option<ExamplesRefreshProgress> {
     get_examples_refresh_state(&app.examples_refresh_state)
@@ -3702,6 +3942,7 @@ pub fn run() {
                 active_downloads:Arc::new(Mutex::new(0)),
                 parallel_downloads:Arc::new(Mutex::new(parallel)),
                 examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
+                model_tags_refresh_state: Arc::new(Mutex::new(ModelTagsRefreshState::default())),
                 cache_lock: Arc::new(AsyncMutex::new(())),
                 registry,
                 registry_sync_running: Arc::new(Mutex::new(false)),
@@ -3712,7 +3953,7 @@ pub fn run() {
             spawn_registry_event_sync(state.clone(),app.handle().clone());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,check_registry_health,web::get_web_app_status,web::toggle_web_app])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,refresh_all_model_tags,get_model_tags_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,check_registry_health,web::get_web_app_status,web::toggle_web_app])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
@@ -3734,6 +3975,7 @@ mod tests {
             active_downloads: Arc::new(Mutex::new(0)),
             parallel_downloads: Arc::new(Mutex::new(3)),
             examples_refresh_state: Arc::new(Mutex::new(ExamplesRefreshState::default())),
+            model_tags_refresh_state: Arc::new(Mutex::new(ModelTagsRefreshState::default())),
             cache_lock: Arc::new(AsyncMutex::new(())),
             registry: RegistryClient::from_app_data(&app_data).unwrap(),
             registry_sync_running: Arc::new(Mutex::new(false)),
