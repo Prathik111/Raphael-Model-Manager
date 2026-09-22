@@ -613,13 +613,26 @@ function ImageViewerOverlay({ images, imageId, direction, onClose, onNavigate }:
 }) {
   const index = images.findIndex(image => image.id === imageId);
   const image = index >= 0 ? images[index] : null;
+  const [closing, setClosing] = useState(false);
+
+  useEffect(() => {
+    const preload = (candidate: ModelImage | undefined) => {
+      const path = candidate?.local_path || candidate?.thumbnail_path;
+      if (!path) return;
+      const preloadImage = new Image();
+      preloadImage.decoding = 'async';
+      preloadImage.src = fileUrl(path);
+    };
+    preload(images[index - 1]);
+    preload(images[index + 1]);
+  }, [image?.id, index, images]);
 
   useEffect(() => {
     if (!image) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
-        onClose();
+        requestClose();
       } else if (event.key === 'ArrowLeft') {
         event.preventDefault();
         onNavigate(-1);
@@ -632,30 +645,24 @@ function ImageViewerOverlay({ images, imageId, direction, onClose, onNavigate }:
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [image?.id, onClose, onNavigate]);
 
+  const requestClose = () => {
+    if (closing) return;
+    setClosing(true);
+    window.setTimeout(onClose, 150);
+  };
+
   if (!image) return null;
   const imagePath = image.local_path || image.thumbnail_path;
   if (!imagePath) return null;
 
-  useEffect(() => {
-    const preload = (candidate: ModelImage | undefined) => {
-      const path = candidate?.local_path || candidate?.thumbnail_path;
-      if (!path) return;
-      const image = new Image();
-      image.decoding = 'async';
-      image.src = fileUrl(path);
-    };
-    preload(images[index - 1]);
-    preload(images[index + 1]);
-  }, [image.id, index, images]);
-
-  return <div className="image-viewer-backdrop" onClick={onClose}>
+  return <div className={`image-viewer-backdrop${closing ? ' viewer-closing' : ''}`} onClick={requestClose}>
     <div className="image-viewer hud-panel" onClick={event => event.stopPropagation()}>
       <header className="image-viewer-header">
         <div>
           <div className="eyebrow">CIVITAI EXAMPLE VIEWER</div>
           <div className="image-viewer-count">{index + 1} / {images.length}</div>
         </div>
-        <button className="image-viewer-close" onClick={onClose} aria-label="Close image viewer">×</button>
+        <button className="image-viewer-close" onClick={requestClose} aria-label="Close image viewer">×</button>
       </header>
       <div className="image-viewer-stage">
         <button className="image-viewer-nav left" onClick={() => onNavigate(-1)} aria-label="Previous image">‹</button>
