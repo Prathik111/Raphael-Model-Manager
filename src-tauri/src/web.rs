@@ -715,6 +715,17 @@ async fn task_start_handler(
                     serde_json::to_value(value)
                         .map_err(|error| AppError::Invalid(error.to_string()))
                 })
+            }
+            "refetch_all_model_tags" => {
+                let task_handle = handle.clone();
+                Box::pin(async move {
+                    let value = refetch_all_model_tags(
+                        tauri::State::from(&app),
+                        task_handle,
+                    ).await?;
+                    serde_json::to_value(value)
+                        .map_err(|error| AppError::Invalid(error.to_string()))
+                })
             },
             "delete_model" => {
                 let args: IdArgs = match arg(request.args) {
