@@ -1101,7 +1101,6 @@ pub async fn set_web_app_enabled(
             *task_controller.inner.shutdown.lock().unwrap() = None;
             *task_controller.inner.enabled.write().unwrap() = false;
             *task_controller.inner.url.write().unwrap() = None;
-            *task_controller.inner.auth_token.write().unwrap() = None;
         }
     });
     Ok(controller.status())
