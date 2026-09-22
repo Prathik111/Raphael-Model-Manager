@@ -366,16 +366,25 @@ function SettingsOverlay({
 
       <div className="settings-scroll">
         <section className="settings-section">
-          <div className="section-head">LIBRARY LOCATION</div>
+          <div className="section-head">LIBRARY & DOWNLOADS</div>
           <div className="settings-path" title={window.location.href}>
             {api.isWebApp ? 'HOST FOLDER IS CONTROLLED BY THE DESKTOP APP' : 'CHANGE THE COMFYUI MODELS ROOT FOLDER'}
           </div>
           <button className="primary-btn" onClick={changeFolder} disabled={api.isWebApp || folderBusy}>
             {api.isWebApp ? 'DESKTOP ONLY' : folderBusy ? 'OPENING…' : 'CHANGE FOLDER'}
           </button>
-        </section>
 
-        <section className="settings-section">
+          <p className="settings-download-copy">Controls how many model files Raphael downloads at the same time. Additional installs stay queued and start automatically as slots open.</p>
+          <div className="settings-parallel-row">
+            <select className="type-select settings-parallel-select" value={parallelDownloads} onChange={e => void changeParallelDownloads(Number(e.target.value))} disabled={parallelBusy} aria-label="Parallel downloads">
+              {[1,2,3,4,5,6,7,8].map(value => <option key={value} value={value}>{value} {value === 1 ? 'DOWNLOAD' : 'DOWNLOADS'}</option>)}
+            </select>
+            <span className="tag-save-state">{parallelBusy ? 'SAVING…' : parallelMessage || 'DEFAULT · 3'}</span>
+          </div>
+
+
+
+<section className="settings-section">
           <div className="section-head">CIVITAI</div>
           <p className="settings-copy">Paste an optional Civitai API token here. Raphael stores it in the host credential store and uses it for authenticated model downloads and API requests.</p>
           <div className="settings-token-status">
@@ -438,7 +447,7 @@ function SettingsOverlay({
           {exampleLoadMessage ? <div className="settings-success">{exampleLoadMessage}</div> : null}
         </section>
 
-        <section className="settings-section">
+<section className="settings-section">
           <div className="section-head">CACHE MANAGEMENT</div>
           <p className="settings-copy">Live filesystem accounting for the configured Raphael cache. Limits cover Civitai images, featured examples, thumbnails, stable covers, and temporary cache files.</p>
 
@@ -507,16 +516,8 @@ function SettingsOverlay({
           {cacheMessage ? <div className="settings-success">{cacheMessage}</div> : null}
         </section>
 
-        <section className="settings-section">
-          <div className="section-head">PERFORMANCE & DISPLAY</div>
-          <p className="settings-download-copy">Controls how many model files Raphael downloads at the same time. Additional installs stay queued and start automatically as slots open.</p>
-          <div className="settings-parallel-row">
-            <select className="type-select settings-parallel-select" value={parallelDownloads} onChange={e => void changeParallelDownloads(Number(e.target.value))} disabled={parallelBusy} aria-label="Parallel downloads">
-              {[1,2,3,4,5,6,7,8].map(value => <option key={value} value={value}>{value} {value === 1 ? 'DOWNLOAD' : 'DOWNLOADS'}</option>)}
-            </select>
-            <span className="tag-save-state">{parallelBusy ? 'SAVING…' : parallelMessage || 'DEFAULT · 3'}</span>
-          </div>
-
+<section className="settings-section">
+          <div className="section-head">DISPLAY</div>
           <div className="section-head">THUMBNAIL SCALING</div>
           <p className="settings-copy">Controls how model thumbnails are scaled inside the fixed Raphael card and import placeholder.</p>
           <div className="settings-options">
@@ -532,7 +533,7 @@ function SettingsOverlay({
           </div>
         </section>
 
-        <section className="settings-section">
+<section className="settings-section">
           <div className="section-head">TAGGING</div>
 
           <div className="section-head">MODEL TAGS</div>
@@ -1735,7 +1736,7 @@ function App() {
     }
   };
   return <div className={`app-shell thumb-fit-${thumbnailFit}`}><Background/><div className="noise"/>
-    <header className="topbar"><div className="brand"><PulseMark/><span>RAPHAEL MODEL MANAGER</span></div><div className="top-stats"><span>CACHED <b>{fmtBytes(state.storage.cached_bytes)}</b></span><span>TOTAL <b>{fmtBytes(state.storage.total_model_bytes)}</b></span></div><div className="top-actions"><button className={`web-app-btn ${webStatus.enabled && webConnected ? 'active' : ''}`} disabled={api.isWebApp || webBusy} title={api.isWebApp ? (webConnected ? 'LAN web app connection is healthy' : 'LAN web app connection is offline; retrying automatically') : 'Expose Raphael to other devices on your private LAN'} onClick={toggleWebApp}>{webBusy ? 'STARTING…' : api.isWebApp ? (webConnected ? 'WEB APP · CONNECTED' : 'WEB APP · RECONNECTING…') : webStatus.enabled ? 'WEB APP · ON' : 'ENABLE WEB APP'}</button>{webStatus.enabled && webStatus.url ? <a className="web-app-url" href={webStatus.url} target="_blank" rel="noreferrer">{webStatus.url}</a> : null}{webError ? <span className="web-app-error" title={webError}>WEB ERROR</span> : null}<div className="root-path" title={state.models_root}>{state.models_root}</div></div></header>
+    <header className="topbar"><div className="brand"><PulseMark/><span>RAPHAEL MODEL MANAGER</span></div><div className="top-stats"><span>CACHED <b>{fmtBytes(state.storage.cached_bytes)}</b></span><span>TOTAL <b>{fmtBytes(state.storage.total_model_bytes)}</b></span></div><div className="top-actions"><button className={`web-app-btn ${webStatus.enabled && webConnected ? 'active' : ''}`} disabled={api.isWebApp || webBusy} title={api.isWebApp ? (webConnected ? 'LAN web app connection is healthy' : 'LAN web app connection is offline; retrying automatically') : 'Expose Raphael to other devices on your private LAN'} onClick={toggleWebApp}>{webBusy ? 'STARTING…' : api.isWebApp ? (webConnected ? 'WEB APP · CONNECTED' : 'WEB APP · RECONNECTING…') : webStatus.enabled ? 'WEB APP · ON' : 'ENABLE WEB APP'}</button>{webStatus.enabled && webStatus.url ? <a className="web-app-url" href={webStatus.url} target="_blank" rel="noreferrer">{webStatus.url}</a> : null}{webError ? <span className="web-app-error" title={webError}>WEB ERROR</span> : null}</div></header>
     <div className="workspace">
       <aside className="sidebar hud-panel">
         <div className="side-title">LIBRARY</div>
