@@ -850,7 +850,7 @@ async fn hydrate_local_model_from_registry(
             version_name,
             base_model,
             model.creator,
-            model.description,
+            description,
             serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
             now()
