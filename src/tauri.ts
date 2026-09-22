@@ -175,6 +175,7 @@ export const fileUrl = (path: string) =>
 export const api = {
   isWebApp,
   getState: () => command<AppState>('get_app_state'),
+  checkRegistryHealth: () => command<boolean>('check_registry_health'),
   chooseModelsFolder: async () => {
     if (isWebApp) throw new Error('Choose the models folder from the Raphael desktop app on the host PC.');
     const result = await open({ directory: true, multiple: false, title: 'Select your ComfyUI models folder' });
