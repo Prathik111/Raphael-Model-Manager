@@ -9,8 +9,15 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
+use tokio::{
+    process::Command,
+    time::{sleep, timeout},
+};
+use url::Url;
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:43217";
+const REGISTRY_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const REGISTRY_STARTUP_POLL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Error)]
 pub(crate) enum RegistryError {
@@ -24,6 +31,12 @@ pub(crate) enum RegistryError {
     Api { status: StatusCode, message: String },
     #[error("registry response could not be decoded: {0}")]
     Decode(#[from] serde_json::Error),
+    #[error("automatic Registry startup is only supported for a local HTTP Registry endpoint")]
+    AutoStartUnsupported,
+    #[error("could not locate the Raphael Model Registry executable; set RAPHAEL_REGISTRY_EXECUTABLE to its path")]
+    ExecutableNotFound,
+    #[error("Registry did not become available before the startup timeout")]
+    StartupTimeout,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -121,6 +134,64 @@ impl RegistryClient {
                 .timeout(Duration::from_secs(30))
                 .build()?,
         })
+    }
+
+    pub(crate) async fn ensure_running(&self) -> Result<(), RegistryError> {
+        if self.health().await {
+            return Ok(());
+        }
+
+        let (bind, port) = local_http_registry_endpoint(&self.base_url)?;
+        let data_dir = self
+            .token_file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let mut child = if let Some(executable) = env::var_os("RAPHAEL_REGISTRY_EXECUTABLE") {
+            let executable = PathBuf::from(executable);
+            if !executable.is_file() {
+                return Err(RegistryError::ExecutableNotFound);
+            }
+            spawn_registry_executable(&executable, &bind, port, &data_dir, &self.token_file)?
+        } else if let Some(executable) = find_registry_executable() {
+            spawn_registry_executable(&executable, &bind, port, &data_dir, &self.token_file)?
+        } else if let Some(manifest) = find_registry_workspace_manifest() {
+            spawn_registry_cargo(&manifest, &bind, port, &data_dir, &self.token_file)?
+        } else {
+            return Err(RegistryError::ExecutableNotFound);
+        };
+
+        let ready = timeout(REGISTRY_STARTUP_TIMEOUT, async {
+            loop {
+                if self.health().await {
+                    return Ok::<(), RegistryError>(());
+                }
+                sleep(REGISTRY_STARTUP_POLL).await;
+            }
+        })
+        .await;
+
+        match ready {
+            Ok(result) => {
+                result?;
+                let _ = child.id();
+                Ok(())
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                Err(RegistryError::StartupTimeout)
+            }
+        }
+    }
+
+    async fn health(&self) -> bool {
+        self.client
+            .get(format!("{}/health", self.base_url))
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
     }
 
     fn token(&self) -> Result<String, RegistryError> {
@@ -391,6 +462,117 @@ impl RegistryClient {
 
 }
 
+fn local_http_registry_endpoint(base_url: &str) -> Result<(String, u16), RegistryError> {
+    let parsed = Url::parse(base_url).map_err(|error| RegistryError::Api {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("Invalid registry URL: {error}"),
+    })?;
+
+    if parsed.scheme() != "http" {
+        return Err(RegistryError::AutoStartUnsupported);
+    }
+
+    let host = parsed.host_str().unwrap_or_default();
+    let bind = match host {
+        "localhost" | "127.0.0.1" => "127.0.0.1".to_string(),
+        "::1" => "::1".to_string(),
+        _ => return Err(RegistryError::AutoStartUnsupported),
+    };
+
+    Ok((bind, parsed.port().unwrap_or(43217)))
+}
+
+fn spawn_registry_executable(
+    executable: &Path,
+    bind: &str,
+    port: u16,
+    data_dir: &Path,
+    token_file: &Path,
+) -> Result<tokio::process::Child, RegistryError> {
+    let mut command = Command::new(executable);
+    command.arg("server");
+    configure_registry_command(&mut command, bind, port, data_dir, token_file);
+    Ok(command.spawn()?)
+}
+
+fn spawn_registry_cargo(
+    manifest: &Path,
+    bind: &str,
+    port: u16,
+    data_dir: &Path,
+    token_file: &Path,
+) -> Result<tokio::process::Child, RegistryError> {
+    let mut command = Command::new("cargo");
+    command.args([
+        "run",
+        "--manifest-path",
+        &manifest.to_string_lossy(),
+        "-p",
+        "registry-server",
+        "--",
+        "server",
+    ]);
+    configure_registry_command(&mut command, bind, port, data_dir, token_file);
+    Ok(command.spawn()?)
+}
+
+fn configure_registry_command(
+    command: &mut Command,
+    bind: &str,
+    port: u16,
+    data_dir: &Path,
+    token_file: &Path,
+) {
+    command
+        .env("RAPHAEL_REGISTRY_BIND", bind)
+        .env("RAPHAEL_REGISTRY_PORT", port.to_string())
+        .env("RAPHAEL_REGISTRY_DATA_DIR", data_dir);
+
+    if let Ok(token) = fs::read_to_string(token_file) {
+        let token = token.trim();
+        if !token.is_empty() {
+            command.env("RAPHAEL_REGISTRY_AUTH_TOKEN", token);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+}
+
+fn find_registry_executable() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(current_exe) = env::current_exe() {
+        for ancestor in current_exe.ancestors() {
+            if ancestor.file_name().and_then(|name| name.to_str()) == Some("Raphael-Model-Manager") {
+                if let Some(projects) = ancestor.parent() {
+                    candidates.push(projects.join("Raphael-Model-Registry").join("target/debug/raphael-registry.exe"));
+                    candidates.push(projects.join("Raphael-Model-Registry").join("target/release/raphael-registry.exe"));
+                }
+            }
+        }
+    }
+
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../Raphael-Model-Registry/target/debug/raphael-registry.exe"));
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../Raphael-Model-Registry/target/release/raphael-registry.exe"));
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn find_registry_workspace_manifest() -> Option<PathBuf> {
+    let candidates = [
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Raphael-Model-Registry/Cargo.toml"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../Raphael-Model-Registry/Cargo.toml"),
+    ];
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
 fn is_revision_conflict(status: StatusCode) -> bool {
     matches!(status, StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED)
 }
@@ -444,6 +626,40 @@ mod tests {
         assert!(validate_registry_base_url("http://localhost:43217").is_ok());
         assert!(validate_registry_base_url("https://registry.example.com").is_ok());
         assert!(validate_registry_base_url("http://registry.example.com").is_err());
+    }
+
+    #[test]
+    fn auto_start_only_accepts_local_http_urls() {
+        assert_eq!(
+            local_http_registry_endpoint("http://127.0.0.1:43217").unwrap(),
+            ("127.0.0.1".to_string(), 43217)
+        );
+        assert_eq!(
+            local_http_registry_endpoint("http://localhost:45123").unwrap(),
+            ("127.0.0.1".to_string(), 45123)
+        );
+        assert_eq!(
+            local_http_registry_endpoint("http://[::1]:43217").unwrap(),
+            ("::1".to_string(), 43217)
+        );
+        assert!(matches!(
+            local_http_registry_endpoint("https://127.0.0.1:43217"),
+            Err(RegistryError::AutoStartUnsupported)
+        ));
+        assert!(matches!(
+            local_http_registry_endpoint("http://registry.example.com:43217"),
+            Err(RegistryError::AutoStartUnsupported)
+        ));
+    }
+
+    #[test]
+    fn registry_workspace_manifest_is_detected_from_manager_layout() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Raphael-Model-Registry/Cargo.toml");
+        assert_eq!(
+            find_registry_workspace_manifest().is_some(),
+            path.is_file()
+        );
     }
 
     #[test]
