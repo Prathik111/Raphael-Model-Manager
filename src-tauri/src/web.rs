@@ -1,8 +1,7 @@
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path as AxumPath, Query, State as AxumState},
-    http::{header, HeaderValue, Request, StatusCode},
-    middleware::{self, Next},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -160,7 +159,6 @@ struct WebServerControllerInner {
     url: RwLock<Option<String>>,
     generation: AtomicU64,
     tasks: WebTaskStore,
-    auth_token: RwLock<Option<String>>,
 }
 
 impl Default for WebServerControllerInner {
@@ -171,7 +169,6 @@ impl Default for WebServerControllerInner {
             url: RwLock::new(None),
             generation: AtomicU64::new(0),
             tasks: WebTaskStore::default(),
-            auth_token: RwLock::new(None),
         }
     }
 }
@@ -354,76 +351,12 @@ fn lan_ip() -> String {
     }
 }
 
-fn web_url(access_token: &str) -> String {
+fn web_url() -> String {
     if cfg!(debug_assertions) {
-        format!("http://{}:1420/#access_token={}", lan_ip(), access_token)
+        format!("http://{}:1420/", lan_ip())
     } else {
-        format!("http://{}:{}/#access_token={}", lan_ip(), WEB_PORT, access_token)
+        format!("http://{}:{}/", lan_ip(), WEB_PORT)
     }
-}
-
-fn generate_access_token() -> AppResult<String> {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| AppError::Invalid(format!("Could not generate web access token: {error}")))?;
-    Ok(hex::encode(bytes))
-}
-
-fn cookie_token(headers: &axum::http::HeaderMap) -> Option<String> {
-    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
-    cookie.split(';').find_map(|part| {
-        let (name, value) = part.trim().split_once('=')?;
-        (name == "raphael_auth").then(|| value.to_string())
-    })
-}
-
-fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    value.strip_prefix("Bearer ").map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
-}
-
-async fn auth_middleware(
-    AxumState(state): AxumState<WebServerState>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    let configured = state.controller.inner.auth_token.read().ok().and_then(|v| v.clone());
-    let Some(expected) = configured else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "Web app is not initialized" })),
-        )
-            .into_response();
-    };
-
-    let supplied_bearer = bearer_token(request.headers());
-    let supplied_cookie = cookie_token(request.headers());
-    let authorized = supplied_bearer.as_deref() == Some(expected.as_str())
-        || supplied_cookie.as_deref() == Some(expected.as_str());
-
-    if !authorized {
-        let mut response = (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer realm=raphael"))],
-            Json(json!({ "error": "Authentication required" })),
-        )
-            .into_response();
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        );
-        return response;
-    }
-
-    let mut response = next.run(request).await;
-    if supplied_cookie.as_deref() != Some(expected.as_str()) {
-        if let Ok(value) = HeaderValue::from_str(&format!(
-            "raphael_auth={expected}; Path=/; HttpOnly; SameSite=Strict"
-        )) {
-            response.headers_mut().append(header::SET_COOKIE, value);
-        }
-    }
-    response
 }
 
 async fn validate_cached_file(path: &Path, app_data: &Path) -> AppResult<PathBuf> {
@@ -810,7 +743,7 @@ async fn command_handler(
     let handle = &state.handle;
 
     let result: AppResult<Value> = match command.as_str() {
-        "get_app_state" => get_app_state(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "get_app_state" => get_app_state(handle.state(), handle.clone()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "list_models" => {
             let args: ListModelsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             list_models(handle.state(), args.r#type, args.query, args.tags).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
@@ -987,7 +920,6 @@ fn build_router(handle: AppHandle, controller: WebServerController, web_root: Op
         .route("/api/file", get(file_handler))
         .route("/api/command/{command}", post(command_handler))
         .layer(DefaultBodyLimit::max(1024 * 1024))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state.clone());
 
     let mut router = Router::new().merge(api);
@@ -1011,7 +943,6 @@ pub async fn set_web_app_enabled(
         }
         *controller.inner.enabled.write().unwrap() = false;
         *controller.inner.url.write().unwrap() = None;
-        *controller.inner.auth_token.write().unwrap() = None;
         return Ok(controller.status());
     }
 
@@ -1028,8 +959,7 @@ pub async fn set_web_app_enabled(
 
     let generation = controller.inner.generation.fetch_add(1, Ordering::AcqRel) + 1;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let auth_token = generate_access_token()?;
-    let url = web_url(&auth_token);
+    let url = web_url();
 
     let web_root = if cfg!(debug_assertions) {
         None
@@ -1043,7 +973,6 @@ pub async fn set_web_app_enabled(
     };
 
     *controller.inner.shutdown.lock().unwrap() = Some(shutdown_tx);
-    *controller.inner.auth_token.write().unwrap() = Some(auth_token.clone());
     *controller.inner.enabled.write().unwrap() = true;
     *controller.inner.url.write().unwrap() = Some(url);
 
@@ -1113,15 +1042,7 @@ pub async fn set_web_app_enabled(
                 match TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], WEB_PORT))).await {
                     Ok(next_listener) => {
                         listener = Some(next_listener);
-                        *task_controller.inner.url.write().unwrap() = Some(web_url(
-                            &task_controller
-                                .inner
-                                .auth_token
-                                .read()
-                                .unwrap()
-                                .clone()
-                                .unwrap_or_default(),
-                        ));
+                        *task_controller.inner.url.write().unwrap() = Some(web_url());
                         let (next_shutdown_tx, next_shutdown_rx) = oneshot::channel();
                         *task_controller.inner.shutdown.lock().unwrap() = Some(next_shutdown_tx);
                         shutdown_rx = Some(next_shutdown_rx);
@@ -1142,7 +1063,6 @@ pub async fn set_web_app_enabled(
             *task_controller.inner.shutdown.lock().unwrap() = None;
             *task_controller.inner.enabled.write().unwrap() = false;
             *task_controller.inner.url.write().unwrap() = None;
-            *task_controller.inner.auth_token.write().unwrap() = None;
         }
     });
     Ok(controller.status())
@@ -1168,30 +1088,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_access_tokens_are_256_bit_hex_values() {
-        let first = generate_access_token().expect("token generation should succeed");
-        let second = generate_access_token().expect("token generation should succeed");
-        assert_eq!(first.len(), 64);
-        assert!(first.chars().all(|value| value.is_ascii_hexdigit()));
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn bearer_and_cookie_tokens_are_parsed_without_accepting_other_schemes() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer secret-token"));
-        headers.insert(header::COOKIE, HeaderValue::from_static("foo=bar; raphael_auth=secret-token; other=value"));
-        assert_eq!(bearer_token(&headers).as_deref(), Some("secret-token"));
-        assert_eq!(cookie_token(&headers).as_deref(), Some("secret-token"));
-
-        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic secret-token"));
-        assert!(bearer_token(&headers).is_none());
-    }
-
-    #[test]
-    fn web_urls_keep_the_access_token_in_the_fragment() {
-        let url = web_url("abc123");
-        assert!(url.contains("#access_token=abc123"));
-        assert!(!url.contains("?access_token="));
+    fn web_urls_do_not_require_access_tokens() {
+        let url = web_url();
+        assert!(!url.contains("access_token"));
+        assert!(url.ends_with('/'));
     }
 }

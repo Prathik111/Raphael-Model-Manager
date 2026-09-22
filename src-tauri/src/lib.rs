@@ -12,7 +12,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, OnceLock, RwLock},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex, OnceLock, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -97,6 +97,7 @@ struct AppStateInner {
     registry: RegistryClient,
     registry_sync_running: Arc<Mutex<bool>>,
     registry_event_cursor: Arc<Mutex<i64>>,
+    startup_tasks_started: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1928,9 +1929,24 @@ async fn sync_featured_examples_inner(
     }
 }
 
+fn start_startup_tasks_once(app: &AppStateInner, handle: &AppHandle) {
+    if app
+        .startup_tasks_started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        spawn_registry_startup(app.clone(), handle.clone());
+    }
+}
+
 #[tauri::command]
-fn get_app_state(app: State<AppStateInner>) -> AppResult<AppStateResponse> {
-    let c=open_db(&app.app_data)?; let root=setting(&c,"models_root")?; let storage=storage_stats_inner(&app.app_data)?; Ok(AppStateResponse{models_root:root,storage})
+fn get_app_state(app: State<AppStateInner>, handle: AppHandle) -> AppResult<AppStateResponse> {
+    let c=open_db(&app.app_data)?;
+    let root=setting(&c,"models_root")?;
+    let storage=storage_stats_snapshot(&app.app_data)?;
+    let response=AppStateResponse{models_root:root,storage};
+    start_startup_tasks_once(app.inner(), &handle);
+    Ok(response)
 }
 #[tauri::command]
 fn set_models_root(app: State<AppStateInner>, handle: AppHandle, path:String)->AppResult<AppStateResponse>{
@@ -3652,6 +3668,7 @@ fn clear_download_progress(app: State<AppStateInner>, task_id: String) -> AppRes
     remove_download_progress(&app.downloads, &task_id)
 }
 
+fn storage_stats_snapshot(app_data:&Path)->AppResult<StorageStats>{let c=open_db(app_data)?;let total:i64=c.query_row("SELECT COALESCE(SUM(size_bytes),0) FROM models",[],|r|r.get(0))?;let cached=c.query_row("SELECT COALESCE((SELECT value FROM settings WHERE key='cache_bytes'),'0')",[],|r|r.get::<_,String>(0))?.parse::<i64>().unwrap_or(0);let mut stmt=c.prepare("SELECT model_type,COUNT(*),COALESCE(SUM(size_bytes),0) FROM models GROUP BY model_type ORDER BY model_type")?;let categories=stmt.query_map([],|r|Ok(CategoryStats{r#type:r.get(0)?,count:r.get(1)?,bytes:r.get(2)?}))?.filter_map(Result::ok).collect();Ok(StorageStats{total_model_bytes:total,cached_bytes:cached,categories})}
 fn storage_stats_inner(app_data:&Path)->AppResult<StorageStats>{let c=open_db(app_data)?;let total:i64=c.query_row("SELECT COALESCE(SUM(size_bytes),0) FROM models",[],|r|r.get(0))?;let cached=dir_size(&cache_root(app_data));let _=put_setting(&c,"cache_bytes",&cached.to_string());let mut stmt=c.prepare("SELECT model_type,COUNT(*),COALESCE(SUM(size_bytes),0) FROM models GROUP BY model_type ORDER BY model_type")?;let categories=stmt.query_map([],|r|Ok(CategoryStats{r#type:r.get(0)?,count:r.get(1)?,bytes:r.get(2)?}))?.filter_map(Result::ok).collect();Ok(StorageStats{total_model_bytes:total,cached_bytes:cached,categories})}
 fn dir_size(path:&Path)->i64{if !path.exists(){return 0} WalkDir::new(path).into_iter().filter_map(Result::ok).filter_map(|e|e.metadata().ok()).filter(|m|m.is_file()).map(|m|m.len() as i64).sum()}
 fn path_is_in_cache(app_data:&Path,path:&Path)->bool{
@@ -3917,11 +3934,29 @@ async fn check_registry_health(app: State<'_, AppStateInner>) -> AppResult<bool>
 
 fn spawn_registry_startup(app: AppStateInner, handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        if let Some(root) = app.models_root.read().ok().and_then(|value| value.clone()).filter(|root| root.is_dir()) {
+            let scan_app = app.clone();
+            let scan_root_path = root.clone();
+            match tokio::task::spawn_blocking(move || scan_root(&scan_app, &scan_root_path)).await {
+                Ok(Ok(removed)) => {
+                    if !removed.is_empty() {
+                        let app_state = app.clone();
+                        reconcile_removed_registry_files(&app_state, removed).await;
+                    }
+                    let _ = storage_stats_inner(&app.app_data);
+                    emit_models_changed(&handle);
+                }
+                Ok(Err(error)) => eprintln!("Raphael initial model scan failed: {error}"),
+                Err(error) => eprintln!("Raphael initial model scan task failed: {error}"),
+            }
+        }
+
         match app.registry.ensure_running().await {
             Ok(()) => {
                 if app.models_root.read().ok().and_then(|root| root.clone()).is_some() {
                     spawn_registry_sync(app.clone(), handle.clone());
-                    spawn_hash_enrichment(app, handle);
+                    spawn_hash_enrichment(app.clone(), handle.clone());
+                    spawn_registry_event_sync(app, handle);
                 }
             }
             Err(error) => {
@@ -3950,10 +3985,9 @@ pub fn run() {
                 registry,
                 registry_sync_running: Arc::new(Mutex::new(false)),
                 registry_event_cursor: Arc::new(Mutex::new(0)),
+                startup_tasks_started: Arc::new(AtomicBool::new(false)),
             };app.manage(state.clone());
-            if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let removed=scan_root(&state,&root).unwrap_or_default(); if !removed.is_empty(){let app_state=state.clone();tauri::async_runtime::spawn(async move{reconcile_removed_registry_files(&app_state,removed).await;});} let state2=state.clone();let handle2=app.handle().clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
-            spawn_registry_startup(state.clone(), app.handle().clone());
-            spawn_registry_event_sync(state.clone(),app.handle().clone());
+            if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let state2=state.clone();let handle2=app.handle().clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,refresh_all_model_tags,get_model_tags_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,check_registry_health,web::get_web_app_status,web::toggle_web_app])
@@ -3983,6 +4017,7 @@ mod tests {
             registry: RegistryClient::from_app_data(&app_data).unwrap(),
             registry_sync_running: Arc::new(Mutex::new(false)),
             registry_event_cursor: Arc::new(Mutex::new(0)),
+            startup_tasks_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
