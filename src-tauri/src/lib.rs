@@ -390,6 +390,7 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
         tags_json TEXT NOT NULL DEFAULT '[]',
         tags_user_modified INTEGER NOT NULL DEFAULT 0,
         model_type_user_modified INTEGER NOT NULL DEFAULT 0,
+        description_user_modified INTEGER NOT NULL DEFAULT 0,
         activation_json TEXT NOT NULL DEFAULT '[]',
         source_hash TEXT,
         updated_at INTEGER NOT NULL,
@@ -435,6 +436,8 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
     if has_tag_lock==0 { c.execute("ALTER TABLE models ADD COLUMN tags_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     let has_type_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='model_type_user_modified'",[],|r|r.get(0))?;
     if has_type_lock==0 { c.execute("ALTER TABLE models ADD COLUMN model_type_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
+    let has_description_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='description_user_modified'",[],|r|r.get(0))?;
+    if has_description_lock==0 { c.execute("ALTER TABLE models ADD COLUMN description_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     let has_cover_path:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_path'",[],|r|r.get(0))?;
     if has_cover_path==0 { c.execute("ALTER TABLE models ADD COLUMN cover_path TEXT",[])?; }
     let has_cover_x:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_position_x'",[],|r|r.get(0))?;
@@ -800,6 +803,24 @@ async fn hydrate_local_model_from_registry(
         .unwrap_or_default();
 
     let c = open_db(&app.app_data)?;
+    let description_user_modified: bool = c
+        .query_row(
+            "SELECT description_user_modified FROM models WHERE id=?1",
+            [local_id],
+            |r| r.get::<_, i64>(0),
+        )?
+        != 0;
+    let local_description: Option<String> = c.query_row(
+        "SELECT description FROM models WHERE id=?1",
+        [local_id],
+        |r| r.get(0),
+    )?;
+    let description = if description_user_modified {
+        local_description
+    } else {
+        model.description.clone()
+    };
+
     c.execute(
         "UPDATE models
          SET registry_model_id=?2,
@@ -1047,12 +1068,16 @@ async fn apply_civitai_metadata_to_registry(
     creator: Option<&str>,
 ) -> AppResult<(String, String)> {
     let _ = sync_local_model_to_registry(app, local_id).await?;
-    let (registry_model_id, tags_user_modified) = {
+    let (registry_model_id, tags_user_modified, description_user_modified) = {
         let c = open_db(&app.app_data)?;
         c.query_row(
-            "SELECT registry_model_id,tags_user_modified FROM models WHERE id=?1",
+            "SELECT registry_model_id,tags_user_modified,description_user_modified FROM models WHERE id=?1",
             [local_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, i64>(2)? != 0,
+            )),
         )?
     };
 
@@ -1067,16 +1092,20 @@ async fn apply_civitai_metadata_to_registry(
         registry_model_type(&local_type).to_string()
     };
 
+    let mut model_patch = json!({
+        "name": model.get("name").and_then(Value::as_str),
+        "model_type": model_type,
+        "creator": creator,
+        "base_model": version.get("baseModel").and_then(Value::as_str)
+    });
+    if !description_user_modified {
+        model_patch["description"] = json!(description);
+    }
+
     app.registry.update_model(
         &registry_model_id,
         registry_model.revision,
-        json!({
-            "name": model.get("name").and_then(Value::as_str),
-            "model_type": model_type,
-            "creator": creator,
-            "description": description,
-            "base_model": version.get("baseModel").and_then(Value::as_str)
-        }),
+        model_patch,
     ).await?;
 
     let external_version_id = version
@@ -3712,7 +3741,7 @@ pub fn run() {
             spawn_registry_event_sync(state.clone(),app.handle().clone());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,check_registry_health,web::get_web_app_status,web::toggle_web_app])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_description,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,check_registry_health,web::get_web_app_status,web::toggle_web_app])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
