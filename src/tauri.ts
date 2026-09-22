@@ -11,6 +11,7 @@ import type {
   TagRecord,
   WebAppStatus,
   ExamplesRefreshProgress,
+  ModelTagsRefreshProgress,
   ModelImagesResponse,
   CacheStats,
   CacheOperationResult,
@@ -235,6 +236,10 @@ export const api = {
     command<ExamplesRefreshProgress>('refresh_all_examples'),
   getExamplesRefreshStatus: () =>
     command<ExamplesRefreshProgress | null>('get_examples_refresh_status'),
+  refreshAllModelTags: () =>
+    command<ModelTagsRefreshProgress>('refresh_all_model_tags'),
+  getModelTagsRefreshStatus: () =>
+    command<ModelTagsRefreshProgress | null>('get_model_tags_refresh_status'),
   importCivitai: (url: string) =>
     isWebApp ? webTaskCommand<CivitaiImportPreview>('preview_civitai_import', { url }) : command<CivitaiImportPreview>('preview_civitai_import', { url }),
   installCivitai: (
@@ -371,4 +376,36 @@ export async function subscribeToExamplesRefresh(cb: (progress: ExamplesRefreshP
     };
   }
   return listen<ExamplesRefreshProgress>('examples-refresh-progress', event => cb(event.payload));
+}
+
+export async function subscribeToModelTagsRefresh(cb: (progress: ModelTagsRefreshProgress) => void) {
+  if (isWebApp) {
+    let disposed = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (disposed || inFlight) return;
+      inFlight = true;
+      try {
+        const response = await webFetch('/api/command/get_model_tags_refresh_status', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        });
+        if (!response.ok) return;
+        const payload = await response.json().catch(() => null);
+        if (!disposed && payload) cb(payload as ModelTagsRefreshProgress);
+      } catch {
+        // Connection state is handled by the dedicated heartbeat.
+      } finally {
+        inFlight = false;
+      }
+    };
+    await poll();
+    const timer = window.setInterval(() => void poll(), 1200);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }
+  return listen<ModelTagsRefreshProgress>('model-tags-refresh-progress', event => cb(event.payload));
 }
