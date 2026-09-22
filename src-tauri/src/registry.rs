@@ -137,8 +137,16 @@ impl RegistryClient {
     }
 
     pub(crate) async fn ensure_running(&self) -> Result<(), RegistryError> {
-        if self.is_healthy().await {
+        if self.is_authenticated().await {
             return Ok(());
+        }
+
+        if self.is_healthy().await {
+            let _ = self.token()?;
+            return Err(RegistryError::Api {
+                status: StatusCode::UNAUTHORIZED,
+                message: "Registry is reachable but rejected the configured authentication token".into(),
+            });
         }
 
         let (bind, port) = local_http_registry_endpoint(&self.base_url)?;
@@ -196,6 +204,19 @@ impl RegistryClient {
             .unwrap_or(false)
     }
 
+    pub(crate) async fn is_authenticated(&self) -> bool {
+        let request = match self.request(Method::GET, "/api/v1/events/snapshot") {
+            Ok(request) => request.query(&[("after_id", 0)]),
+            Err(_) => return false,
+        };
+
+        request
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+    }
+
     fn token(&self) -> Result<String, RegistryError> {
         if let Ok(value) = env::var("RAPHAEL_REGISTRY_AUTH_TOKEN") {
             if !value.trim().is_empty() {
@@ -203,13 +224,41 @@ impl RegistryClient {
             }
         }
 
-        let token = fs::read_to_string(&self.token_file)
-            .map_err(|_| RegistryError::MissingToken)?;
-        let token = token.trim();
-        if token.is_empty() {
-            return Err(RegistryError::MissingToken);
+        let mut token_files = vec![self.token_file.clone()];
+        for lock_file in self.registry_lock_candidates() {
+            if let Some(token_file) = token_file_from_lock(&lock_file) {
+                token_files.push(token_file);
+            }
         }
-        Ok(token.to_string())
+
+        let mut saw_empty = false;
+        for token_file in token_files {
+            let Ok(value) = fs::read_to_string(&token_file) else {
+                continue;
+            };
+            let token = value.trim();
+            if !token.is_empty() {
+                return Ok(token.to_string());
+            }
+            saw_empty = true;
+        }
+
+        let _ = saw_empty;
+        Err(RegistryError::MissingToken)
+    }
+
+    fn registry_lock_candidates(&self) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+
+        if let Some(parent) = self.token_file.parent() {
+            candidates.push(parent.join("registry.lock"));
+        }
+
+        if let Some(data_dir) = env::var_os("RAPHAEL_REGISTRY_DATA_DIR") {
+            candidates.push(PathBuf::from(data_dir).join("registry.lock"));
+        }
+
+        candidates
     }
 
     fn request(&self, method: Method, path: &str) -> Result<reqwest::RequestBuilder, RegistryError> {
@@ -462,6 +511,22 @@ impl RegistryClient {
         .await
     }
 
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RegistryLockInfo {
+    token_file: Option<PathBuf>,
+}
+
+fn token_file_from_lock(lock_file: &Path) -> Option<PathBuf> {
+    let content = fs::read_to_string(lock_file).ok()?;
+    let info: RegistryLockInfo = serde_json::from_str(&content).ok()?;
+    let token_file = info.token_file?;
+    if token_file.is_absolute() {
+        Some(token_file)
+    } else {
+        lock_file.parent().map(|parent| parent.join(token_file))
+    }
 }
 
 fn local_http_registry_endpoint(base_url: &str) -> Result<(String, u16), RegistryError> {
