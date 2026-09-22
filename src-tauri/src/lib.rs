@@ -1322,6 +1322,21 @@ fn normalized_import_type(t:&str)->Option<&'static str> { match t.to_ascii_lower
 fn civitai_host(url:&str)->AppResult<String>{Ok(Url::parse(url)?.host_str().unwrap_or("civitai.com").to_ascii_lowercase().replace("www.",""))}
 fn canonical_civitai_url(source:&str,model_id:Option<i64>,version_id:Option<i64>)->AppResult<String>{let host=civitai_host(source)?;Ok(match (model_id,version_id){(Some(mid),Some(vid))=>format!("https://{host}/models/{mid}?modelVersionId={vid}"),(Some(mid),None)=>format!("https://{host}/models/{mid}"),_=>source.to_string()})}
 fn json_strings(v:Option<&Value>)->Vec<String>{v.and_then(Value::as_array).map(|a|a.iter().filter_map(|x|x.as_str().map(str::to_string)).collect()).unwrap_or_default()}
+
+fn civitai_model_tags(model: &Value, version: &Value) -> Vec<String> {
+    let mut tags = json_strings(model.get("tags"));
+    if let Some(base_model) = version
+        .get("baseModel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !tags.iter().any(|tag| tag.trim().eq_ignore_ascii_case(base_model)) {
+            tags.push(base_model.to_string());
+        }
+    }
+    tags
+}
 fn strip_html(s:&str)->String{let mut out=String::with_capacity(s.len());let mut in_tag=false;for ch in s.chars(){match ch{ '<'=>in_tag=true,'>'=>in_tag=false,_ if !in_tag=>out.push(ch),_=>{}}}out.replace("&nbsp;"," ").replace("&amp;","&").replace("&lt;","<").replace("&gt;",">")}
 
 async fn download_cached_thumbnail(
@@ -2403,7 +2418,7 @@ async fn preview_civitai_import_inner(app: &AppStateInner, url: String) -> AppRe
             "name": model.get("name"),
             "type": typ,
             "description": model.get("description"),
-            "tags": model.get("tags"),
+            "tags": Value::Array(civitai_model_tags(&model, &version).into_iter().map(Value::String).collect()),
             "creator": model.get("creator").and_then(|v| v.get("username")),
             "thumbnail_path": thumb
         }),
@@ -2673,7 +2688,7 @@ async fn install_civitai_model(
             });
 
             let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().replace("\\", "/");
-            let tags = json_strings(model.get("tags"));
+            let tags = civitai_model_tags(&model, &version);
             let activation = json_strings(version.get("trainedWords"));
             let desc = model.get("description").and_then(Value::as_str).map(strip_html);
             let creator = model.get("creator").and_then(|v| v.get("username")).and_then(Value::as_str).map(str::to_string);
@@ -3186,7 +3201,7 @@ async fn link_model_civitai_inner(
     let trimmed=url.trim();
     let (_mid,_vid)=model_id_and_version(trimmed)?;
     let (model,version)=fetch_model_and_version(app,trimmed).await?;
-    let tags=json_strings(model.get("tags"));
+    let tags=civitai_model_tags(&model, &version);
     let activation=json_strings(version.get("trainedWords"));
     let desc=model.get("description").and_then(Value::as_str).map(strip_html);
     let creator=model.get("creator").and_then(|v|v.get("username")).and_then(Value::as_str).map(str::to_string);
@@ -3252,7 +3267,7 @@ async fn refresh_model_civitai_inner(
         .ok_or_else(|| AppError::Invalid("This model is not linked to Civitai".into()))?;
 
     let (model, version) = fetch_model_and_version(app, &url).await?;
-    let tags = json_strings(model.get("tags"));
+    let tags = civitai_model_tags(&model, &version);
     let activation = json_strings(version.get("trainedWords"));
     let desc = model
         .get("description")
@@ -3584,11 +3599,11 @@ fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
                 .and_then(Value::as_str)
                 .or_else(|| version.get("modelName").and_then(Value::as_str));
             let base_model = version.get("baseModel").and_then(Value::as_str);
-            let tags = version
+            let model_payload = version
                 .get("model")
-                .and_then(|m| m.get("tags"))
                 .cloned()
-                .unwrap_or_else(|| json!([]));
+                .unwrap_or_else(|| json!({}));
+            let tags = civitai_model_tags(&model_payload, &version);
             let activation = version
                 .get("trainedWords")
                 .cloned()
@@ -3870,6 +3885,25 @@ mod tests {
         assert_eq!(civitai_type_to_folder("TextualInversion"), "embeddings");
         assert_eq!(civitai_type_to_folder("Upscaler"), "upscale_models");
         assert_eq!(civitai_type_to_folder("UnknownType"), "other");
+    }
+
+    #[test]
+    fn civitai_tags_include_base_model_without_duplicates() {
+        let model = json!({
+            "tags": ["Anime", "SDXL 1.0"]
+        });
+        let version = json!({
+            "baseModel": "SDXL 1.0"
+        });
+        assert_eq!(civitai_model_tags(&model, &version), vec!["Anime".to_string(), "SDXL 1.0".to_string()]);
+
+        let version_with_new_base = json!({
+            "baseModel": "Flux.1 D"
+        });
+        assert_eq!(
+            civitai_model_tags(&model, &version_with_new_base),
+            vec!["Anime".to_string(), "SDXL 1.0".to_string(), "Flux.1 D".to_string()]
+        );
     }
 
     #[test]
