@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { memo, startTransition, useCallback, useEffect, useRef, useState } from 'react';
 import { api, fileUrl, subscribeToExamplesRefresh, subscribeToModelChanges } from './tauri';
 import type { AppState, CacheOperationResult, CacheStats, CivitaiImportPreview, DownloadProgress, ExamplesRefreshProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord, TagRefreshResult } from './types';
 import { civitaiTypeToModelType, defaultImportDirectory, folderForModelType, fmtBytes, fmtCount, fmtDateTime, initials } from './utils/model';
@@ -1409,7 +1409,7 @@ function DownloadProgressWidget({ progress, onClear }: { progress: DownloadProgr
 
 function App() {
   const startupStartedAt = useRef(performance.now());
-  const [state,setState]=useState<AppState|null>(null); const [startupReady,setStartupReady]=useState(false); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
+  const [state,setState]=useState<AppState|null>(null); const [startupReady,setStartupReady]=useState(false); const [showBackground,setShowBackground]=useState(false); const [startupError,setStartupError]=useState<string|null>(null); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
   useEffect(() => {
     if (!startupReady) return;
 
@@ -1420,11 +1420,19 @@ function App() {
     const elapsed = performance.now() - startupStartedAt.current;
     const remaining = Math.max(0, minimumVisibleMs - elapsed);
 
-    const timer = window.setTimeout(() => {
+    const reveal = () => {
       loader.classList.add('is-ready');
       window.setTimeout(() => loader.remove(), 260);
-    }, remaining);
 
+      const revealBackground = () => setShowBackground(true);
+      if ('requestIdleCallback' in window) {
+        window.requestIdleCallback(revealBackground, { timeout: 1500 });
+      } else {
+        window.setTimeout(revealBackground, 350);
+      }
+    };
+
+    const timer = window.setTimeout(reveal, remaining);
     return () => window.clearTimeout(timer);
   }, [startupReady]);
   const refreshGeneration = useRef(0);
@@ -1533,7 +1541,7 @@ function App() {
   const selected = models.find(m=>m.id===selectedId) || null;
 
   useEffect(() => {
-    setRenderModelCount(Math.min(72, models.length));
+    setRenderModelCount(Math.min(36, models.length));
   }, [models.length, type, query, sort, activeTags.join('\u0001')]);
 
   useEffect(() => {
@@ -1545,7 +1553,7 @@ function App() {
 
     const observer = new IntersectionObserver((entries) => {
       if (entries.some(entry => entry.isIntersecting)) {
-        setRenderModelCount(current => Math.min(current + 72, models.length));
+        setRenderModelCount(current => Math.min(current + 36, models.length));
       }
     }, {
       root: grid,
@@ -1595,6 +1603,8 @@ function App() {
       const s=await api.getState();
       if(generation!==refreshGeneration.current) return;
       setState(s);
+      setStartupError(null);
+      setStartupReady(true);
       if(!s.models_root){
         setModels([]);
         setCounts({all:0,by_type:{}});
@@ -1613,16 +1623,22 @@ function App() {
         ? list
         : list.filter(model => model.model_type.trim().toLowerCase() === type.trim().toLowerCase());
       visibleModels.sort((a,b)=>sort==='size'?b.size_bytes-a.size_bytes:sort==='path'?a.relative_path.localeCompare(b.relative_path):(a.civitai_name||a.filename).localeCompare(b.civitai_name||b.filename));
-      setModels(visibleModels);
-      setCounts(allCounts);
-      setAllTags(tags);
-      setSelectedId(previous=>{
-        if(previous!==null && list.some(m=>m.id===previous)) return previous;
-        return list[0]?.id ?? null;
+      startTransition(() => {
+        setModels(visibleModels);
+        setCounts(allCounts);
+        setAllTags(tags);
+        setSelectedId(previous=>{
+          if(previous!==null && list.some(m=>m.id===previous)) return previous;
+          return list[0]?.id ?? null;
+        });
       });
-      setStartupReady(true);
     } catch (error) {
-      if(generation===refreshGeneration.current) console.error('Raphael refresh failed',error);
+      if(generation===refreshGeneration.current) {
+        const message = error instanceof Error ? error.message : String(error);
+        setStartupError(message);
+        setStartupReady(true);
+        console.error('Raphael refresh failed',error);
+      }
     }
   }
   useEffect(()=>{
@@ -1744,7 +1760,6 @@ function App() {
   },[selectedId, selected?.civitai_model_id]);
   useEffect(()=>{const t=setTimeout(()=>refresh(),180); return ()=>clearTimeout(t);},[query,type,sort,activeTags]);
   if(!state) return <div className="loading-shell">
-    <Background/>
     <div className="loading-content">
       <PulseMark/>
       <div className="eyebrow">RAPHAEL CORE</div>
@@ -1753,7 +1768,7 @@ function App() {
       <div className="loading-status">{api.isWebApp ? 'CONNECTING TO HOST' : 'LOADING LOCAL LIBRARY'}</div>
     </div>
   </div>;
-  if(!state.models_root) return <><Background/><Setup onReady={s=>{setState(s); refresh();}}/></>;
+  if(!state.models_root) return <><Setup onReady={s=>{setState(s); setStartupReady(true); refresh();}}/></>;
   const doImport = async()=>{ if(!importUrl.trim()) return; setBusy(true); setImportError(null); try { const result=await api.importCivitai(importUrl.trim()); const nextType=civitaiTypeToModelType(result.model.type); setImportType(nextType); setCustomDownloadPath(false); setPreview(result); setDownloadPath(defaultImportDirectory(state.models_root,nextType) || result.target_directory); } catch (e) { setImportError(String(e)); } finally {setBusy(false);} };
   const install = async()=>{ if(!importUrl.trim()) return; setBusy(true); setImportError(null); try { await api.installCivitai(importUrl.trim(),customDownloadPath ? downloadPath : undefined,importType); setBusy(false); closeImport(); await refresh(); } catch (e) { setImportError(String(e)); setBusy(false); } };
   const refreshAllExamples = async()=>{
@@ -1891,8 +1906,9 @@ function App() {
       if(bulkFileInputRef.current) bulkFileInputRef.current.value='';
     }
   };
-  return <div className={`app-shell thumb-fit-${thumbnailFit}`}><Background/><div className="noise"/>
+  return <div className={`app-shell thumb-fit-${thumbnailFit}`}>{showBackground ? <Background/> : null}<div className="noise"/>
     <header className="topbar"><div className="brand"><PulseMark/><span>RAPHAEL MODEL MANAGER</span></div><div className="top-stats"><span>CACHED <b>{fmtBytes(state.storage.cached_bytes)}</b></span><span>TOTAL <b>{fmtBytes(state.storage.total_model_bytes)}</b></span></div><div className="top-actions"><button className={`web-app-btn ${webStatus.enabled && webConnected ? 'active' : ''}`} disabled={api.isWebApp || webBusy} title={api.isWebApp ? (webConnected ? 'LAN web app connection is healthy' : 'LAN web app connection is offline; retrying automatically') : 'Expose Raphael to other devices on your private LAN'} onClick={toggleWebApp}>{webBusy ? 'STARTING…' : api.isWebApp ? (webConnected ? 'WEB APP · CONNECTED' : 'WEB APP · RECONNECTING…') : webStatus.enabled ? 'WEB APP · ON' : 'ENABLE WEB APP'}</button>{webStatus.enabled && webStatus.url ? <a className="web-app-url" href={webStatus.url} target="_blank" rel="noreferrer">{webStatus.url}</a> : null}{webError ? <span className="web-app-error" title={webError}>WEB ERROR</span> : null}</div><div className="mobile-top-actions"><div className={`registry-indicator mobile-registry-indicator ${registryOnline === null ? 'checking' : registryOnline ? 'online' : 'offline'}`} role="status" aria-live="polite" title="Live health check of the Raphael Model Registry"><span className="registry-indicator-dot" aria-hidden="true"/><span className="registry-indicator-copy"><b>REGISTRY</b><em>{registryOnline === null ? 'CHECKING…' : registryOnline ? 'ONLINE' : 'OFFLINE'}</em></span></div><button className="settings-trigger mobile-settings-trigger" aria-label="Open settings" title="SETTINGS" onClick={()=>setSettingsOpen(true)}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Zm0-5.2 1 .3.7 2.1c.4.1.8.3 1.2.5l2-.9.9.7-.2 2.2c.3.3.6.6.9.9l2.2-.2.7.9-.9 2c.2.4.4.8.5 1.2l2.1.7.3 1-.3 1-2.1.7a7.4 7.4 0 0 1-.5 1.2l.9 2-.7 2-.9.7-2-.9c-.4.2-.8.4-1.2.5l-.7 2.1-1 .3-1-.3-.7-2.1a7.4 7.4 0 0 1-1.2-.5l-2 .9-.9-.7.2-2.2a7.2 7.2 0 0 1-.9-.9l-2.2.2-.7-.9.9-2c-.2-.4-.4-.8-.5-1.2l-.9-2 .7-.9 2.2.2c.3-.3.6-.6.9-.9l-.2-2.2.9-.7 2 .9Z"/></svg></button></div></header>
+    {startupError ? <div className="startup-error error-box" role="status">LIBRARY LOAD DELAYED · {startupError}</div> : null}
     <div className="workspace">
       <aside className="sidebar hud-panel">
         <div className="side-title">LIBRARY</div>
