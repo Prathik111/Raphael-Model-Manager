@@ -3669,7 +3669,7 @@ fn spawn_registry_event_sync(app: AppStateInner, handle: AppHandle) {
 
 #[tauri::command]
 async fn check_registry_health(app: State<'_, AppStateInner>) -> AppResult<bool> {
-    Ok(app.registry.is_healthy().await)
+    Ok(app.registry.is_authenticated().await)
 }
 
 fn spawn_registry_startup(app: AppStateInner, handle: AppHandle) {
