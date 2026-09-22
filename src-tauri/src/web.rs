@@ -810,7 +810,7 @@ async fn command_handler(
     let handle = &state.handle;
 
     let result: AppResult<Value> = match command.as_str() {
-        "get_app_state" => get_app_state(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "get_app_state" => get_app_state(handle.state(), handle.clone()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "list_models" => {
             let args: ListModelsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             list_models(handle.state(), args.r#type, args.query, args.tags).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
