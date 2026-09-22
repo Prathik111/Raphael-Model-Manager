@@ -803,6 +803,24 @@ async fn hydrate_local_model_from_registry(
         .unwrap_or_default();
 
     let c = open_db(&app.app_data)?;
+    let description_user_modified: bool = c
+        .query_row(
+            "SELECT description_user_modified FROM models WHERE id=?1",
+            [local_id],
+            |r| r.get::<_, i64>(0),
+        )?
+        != 0;
+    let local_description: Option<String> = c.query_row(
+        "SELECT description FROM models WHERE id=?1",
+        [local_id],
+        |r| r.get(0),
+    )?;
+    let description = if description_user_modified {
+        local_description
+    } else {
+        model.description.clone()
+    };
+
     c.execute(
         "UPDATE models
          SET registry_model_id=?2,
