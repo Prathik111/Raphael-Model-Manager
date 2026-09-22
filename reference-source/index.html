@@ -5,9 +5,12 @@
 <title>Great Sage HUD Prototype</title>
 <style>
   html, body { margin: 0; padding: 0; background: #030b08; overflow: hidden; height: 100%; }
+  #canvas-wrap { contain: strict; isolation: isolate; will-change: contents; }
   #canvas-wrap {
     position: fixed; inset: 0;
     transition: filter 380ms ease, transform 380ms ease;
+    backface-visibility: hidden;
+    transform: translateZ(0);
   }
   /* Idle "blink" only blurs the 3D visual/background (this element),
      not body - unlike the core-click/panel-open lens-focus, which is
@@ -6624,11 +6627,11 @@ const MINI_CHAT_PAD = 3;
   // motion is the product here, so the frame rate is set by how it feels
   // and the GPU is saved elsewhere (see fgQuality, which is where the
   // real win was: 94% -> 42% while answering).
-  const IDLE_FPS_CAP = 120;
+  const IDLE_FPS_CAP = 60;
   // While the model is working. Halved rather than gutted - this now
   // pairs with the drop to 1x foreground quality, which frees far more
   // GPU than dropping frames ever did, so it does not have to be brutal.
-  const BUSY_FPS_CAP = 60;
+  const BUSY_FPS_CAP = 45;
 
   // The main window keeps rendering at full rate while it sits behind a
   // game or a browser. Unfocused it steps down instead.
