@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { api, fileUrl, subscribeToExamplesRefresh, subscribeToModelChanges } from './tauri';
 import type { AppState, CacheOperationResult, CacheStats, CivitaiImportPreview, DownloadProgress, ExamplesRefreshProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord, TagRefreshResult } from './types';
 import { civitaiTypeToModelType, defaultImportDirectory, folderForModelType, fmtBytes, fmtCount, fmtDateTime, initials } from './utils/model';
@@ -589,11 +589,11 @@ function TypePlaceholder({ type }: { type: ModelType }) {
   </div>;
 }
 
-function ModelCard({ model, selected, onClick }: { model: ModelRecord; selected: boolean; onClick: ()=>void }) {
-  return <button className={`model-card ${selected ? 'selected' : ''}`} onClick={onClick}>
+const ModelCard = memo(function ModelCard({ model, selected, onSelect }: { model: ModelRecord; selected: boolean; onSelect: (id: number)=>void }) {
+  return <button className={`model-card ${selected ? 'selected' : ''}`} onClick={() => onSelect(model.id)}>
     <div className="thumb model-thumb">
       <TypePlaceholder type={model.model_type as ModelType}/>
-      {(model.cover_path || model.thumbnail_path) ? <img src={fileUrl(model.cover_path || model.thumbnail_path || '')} alt="" style={{objectPosition: `${model.cover_position_x}% ${model.cover_position_y}%`}} onError={(e)=>{e.currentTarget.style.display="none";}}/> : null}
+      {(model.cover_path || model.thumbnail_path) ? <img src={fileUrl(model.cover_path || model.thumbnail_path || '')} alt="" loading="lazy" decoding="async" fetchPriority="low" style={{objectPosition: `${model.cover_position_x}% ${model.cover_position_y}%`}} onError={(e)=>{e.currentTarget.style.display="none";}}/> : null}
     </div>
     <div className="card-body">
       <div className="card-title">{model.civitai_name || model.filename.replace(/\.[^.]+$/, '')}</div>
@@ -602,7 +602,7 @@ function ModelCard({ model, selected, onClick }: { model: ModelRecord; selected:
     </div>
     {model.civitai_model_id ? <span className="civitai-dot" title="Linked to Civitai"/> : null}
   </button>;
-}
+});
 
 function ImageViewerOverlay({ images, imageId, onClose, onNavigate }: {
   images: ModelImage[];
@@ -1423,6 +1423,10 @@ function App() {
   const [importClosing,setImportClosing]=useState(false);
   const [registryOnline,setRegistryOnline]=useState<boolean|null>(null);
   const [mobileInspectorOpen,setMobileInspectorOpen]=useState(false);
+  const handleModelSelect = useCallback((id: number) => {
+    setSelectedId(id);
+    setMobileInspectorOpen(true);
+  }, []);
   useEffect(()=>{window.localStorage.setItem(THUMBNAIL_FIT_KEY,thumbnailFit);},[thumbnailFit]);
 
   useEffect(() => {
@@ -1437,7 +1441,7 @@ function App() {
     };
 
     void checkRegistry();
-    const timer = window.setInterval(() => void checkRegistry(), 2000);
+    const timer = window.setInterval(() => void checkRegistry(), 5000);
     return () => {
       disposed = true;
       window.clearInterval(timer);
@@ -1446,20 +1450,30 @@ function App() {
 
   useEffect(() => {
     let disposed = false;
+    let previousProgress = '';
+    let previousParallel = parallelDownloads;
     const pull = async () => {
       try {
         const [progress, parallel] = await Promise.all([
           api.getDownloadProgress(),
           api.getParallelDownloads(),
         ]);
-        if (!disposed) {
-          setDownloadProgress(progress.filter(item => item.visible));
-          setParallelDownloads(Math.max(1, Math.min(8, parallel)));
+        if (disposed) return;
+        const visible = progress.filter(item => item.visible);
+        const progressKey = JSON.stringify(visible);
+        const nextParallel = Math.max(1, Math.min(8, parallel));
+        if (progressKey !== previousProgress) {
+          previousProgress = progressKey;
+          setDownloadProgress(visible);
+        }
+        if (nextParallel !== previousParallel) {
+          previousParallel = nextParallel;
+          setParallelDownloads(nextParallel);
         }
       } catch {}
     };
     void pull();
-    const timer = window.setInterval(() => void pull(), 1000);
+    const timer = window.setInterval(() => void pull(), 1500);
     return () => { disposed = true; window.clearInterval(timer); };
   }, []);
 
@@ -1682,7 +1696,16 @@ function App() {
     };
   },[selectedId, selected?.civitai_model_id]);
   useEffect(()=>{const t=setTimeout(()=>refresh(),180); return ()=>clearTimeout(t);},[query,type,sort,activeTags]);
-  if(!state) return <div className="loading-shell"><PulseMark/></div>;
+  if(!state) return <div className="loading-shell">
+    <Background/>
+    <div className="loading-content">
+      <PulseMark/>
+      <div className="eyebrow">RAPHAEL CORE</div>
+      <h1>INITIALIZING MODEL MANAGER</h1>
+      <div className="loading-track"><span/></div>
+      <div className="loading-status">{api.isWebApp ? 'CONNECTING TO HOST' : 'LOADING LOCAL LIBRARY'}</div>
+    </div>
+  </div>;
   if(!state.models_root) return <><Background/><Setup onReady={s=>{setState(s); refresh();}}/></>;
   const doImport = async()=>{ if(!importUrl.trim()) return; setBusy(true); setImportError(null); try { const result=await api.importCivitai(importUrl.trim()); const nextType=civitaiTypeToModelType(result.model.type); setImportType(nextType); setCustomDownloadPath(false); setPreview(result); setDownloadPath(defaultImportDirectory(state.models_root,nextType) || result.target_directory); } catch (e) { setImportError(String(e)); } finally {setBusy(false);} };
   const install = async()=>{ if(!importUrl.trim()) return; setBusy(true); setImportError(null); try { await api.installCivitai(importUrl.trim(),customDownloadPath ? downloadPath : undefined,importType); setBusy(false); closeImport(); await refresh(); } catch (e) { setImportError(String(e)); setBusy(false); } };
@@ -1859,7 +1882,7 @@ function App() {
         </button>
         </div>
       </aside>
-      <main className="library"><div className="library-head"><div><div className="eyebrow">{type.toUpperCase()}</div><h1>{type==='All'?'MODEL LIBRARY':type.toUpperCase()}</h1></div><div className="library-tools"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search models, tags, tag:…"/><button className={`tag-filter-button ${activeTags.length?'active':''}`} onClick={()=>setTagPanelOpen(v=>!v)}>TAGS{activeTags.length ? ` · ${activeTags.length}` : ''}</button><button className="import-btn" onClick={()=>{setImportClosing(false);setImportError(null);setImportUrl('');setImportType('Other');setCustomDownloadPath(false);setDownloadPath('');setPreview({model:{},version:{id:0,name:'',base_model:null,download_url:'',filename:null,size_bytes:null,activation_prompts:[]},target_directory:'',thumbnail_path:null});}}>IMPORT CIVITAI</button><select value={sort} onChange={e=>setSort(e.target.value)}><option value="name">NAME</option><option value="size">SIZE</option><option value="path">PATH</option></select></div>{tagPanelOpen && <TagFilterPanel tags={allTags} activeTags={activeTags} onToggle={tag=>setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current.filter(x=>x.toLowerCase()!==tag.toLowerCase()):[...current,tag])} onClear={()=>setActiveTags([])}/>}</div>{activeTags.length ? <div className="active-tag-bar">{activeTags.map(tag=><button key={tag} onClick={()=>setActiveTags(current=>current.filter(x=>x.toLowerCase()!==tag.toLowerCase()))}>{tag}<span>×</span></button>)}<span className="active-tag-help">TAG FILTERS</span></div> : null}<div className="grid">{models.map(m=><ModelCard key={m.id} model={m} selected={m.id===selectedId} onClick={()=>{setSelectedId(m.id);setMobileInspectorOpen(true);}}/>)}{!models.length&&<div className="empty-state">No models match the current view.</div>}</div></main>
+      <main className="library"><div className="library-head"><div><div className="eyebrow">{type.toUpperCase()}</div><h1>{type==='All'?'MODEL LIBRARY':type.toUpperCase()}</h1></div><div className="library-tools"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search models, tags, tag:…"/><button className={`tag-filter-button ${activeTags.length?'active':''}`} onClick={()=>setTagPanelOpen(v=>!v)}>TAGS{activeTags.length ? ` · ${activeTags.length}` : ''}</button><button className="import-btn" onClick={()=>{setImportClosing(false);setImportError(null);setImportUrl('');setImportType('Other');setCustomDownloadPath(false);setDownloadPath('');setPreview({model:{},version:{id:0,name:'',base_model:null,download_url:'',filename:null,size_bytes:null,activation_prompts:[]},target_directory:'',thumbnail_path:null});}}>IMPORT CIVITAI</button><select value={sort} onChange={e=>setSort(e.target.value)}><option value="name">NAME</option><option value="size">SIZE</option><option value="path">PATH</option></select></div>{tagPanelOpen && <TagFilterPanel tags={allTags} activeTags={activeTags} onToggle={tag=>setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current.filter(x=>x.toLowerCase()!==tag.toLowerCase()):[...current,tag])} onClear={()=>setActiveTags([])}/>}</div>{activeTags.length ? <div className="active-tag-bar">{activeTags.map(tag=><button key={tag} onClick={()=>setActiveTags(current=>current.filter(x=>x.toLowerCase()!==tag.toLowerCase()))}>{tag}<span>×</span></button>)}<span className="active-tag-help">TAG FILTERS</span></div> : null}<div className="grid">{models.map(m=><ModelCard key={m.id} model={m} selected={m.id===selectedId} onSelect={handleModelSelect}/>)}{!models.length&&<div className="empty-state">No models match the current view.</div>}</div></main>
       {selected && <Inspector key={selected.id} model={selected} images={images} allTags={allTags} galleryHasMore={galleryHasMore} galleryFetchBusy={galleryFetchBusy} refreshBusy={Boolean(refreshingModels[selected.id])} refreshError={refreshErrors[selected.id] || null} onFetchMore={onFetchMore} onOpenImage={openImageViewer} onRefresh={()=>refreshSelectedModel(selected.id)} onLinkCivitai={async(url)=>{const updated=await api.linkModelCivitai(selected.id,url); setModels(current=>current.map(item=>item.id===updated.id?updated:item)); void api.getTags().then(setAllTags).catch(()=>{});}} onSaveName={async(name)=>{const updated=await api.setModelName(selected.id,name); setModels(current=>current.map(item=>item.id===updated.id?updated:item));}} onSaveTags={async(tags)=>{const updated=await api.setModelTags(selected.id,tags); setModels(current=>current.map(item=>item.id===updated.id?updated:item)); void api.getTags().then(setAllTags).catch(()=>{});}} onSaveType={async(nextType)=>{await api.setModelType(selected.id,nextType); await refresh();}} onDelete={async()=>{await api.deleteModel(selected.id); setSelectedId(null); setMobileInspectorOpen(false); await refresh();}} onFilterTag={tag=>{setActiveTags(current=>current.some(x=>x.toLowerCase()===tag.toLowerCase())?current:[...current,tag]);}} onChangeCover={()=>setCoverEditorOpen(true)} onChooseThumbnail={async imageId=>{const updated=await api.setModelCoverFromImage(selected.id,imageId); setModels(current=>current.map(item=>item.id===updated.id?updated:item));}} onMobileClose={()=>setMobileInspectorOpen(false)} mobileOpen={mobileInspectorOpen}/>}
       {selected && coverEditorOpen && <CoverEditorOverlay model={selected} onClose={()=>setCoverEditorOpen(false)} onUpdated={updated=>{setModels(current=>current.map(item=>item.id===updated.id?updated:item));}}/>}
       {imageViewerId !== null && images.some(image => image.id === imageViewerId) && <ImageViewerOverlay images={images} imageId={imageViewerId} onClose={()=>setImageViewerId(null)} onNavigate={navigateImageViewer}/>}
