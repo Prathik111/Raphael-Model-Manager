@@ -604,9 +604,10 @@ const ModelCard = memo(function ModelCard({ model, selected, onSelect }: { model
   </button>;
 });
 
-function ImageViewerOverlay({ images, imageId, onClose, onNavigate }: {
+function ImageViewerOverlay({ images, imageId, direction, onClose, onNavigate }: {
   images: ModelImage[];
   imageId: number;
+  direction: 'next' | 'prev' | null;
   onClose: () => void;
   onNavigate: (direction: -1 | 1) => void;
 }) {
@@ -635,6 +636,18 @@ function ImageViewerOverlay({ images, imageId, onClose, onNavigate }: {
   const imagePath = image.local_path || image.thumbnail_path;
   if (!imagePath) return null;
 
+  useEffect(() => {
+    const preload = (candidate: ModelImage | undefined) => {
+      const path = candidate?.local_path || candidate?.thumbnail_path;
+      if (!path) return;
+      const image = new Image();
+      image.decoding = 'async';
+      image.src = fileUrl(path);
+    };
+    preload(images[index - 1]);
+    preload(images[index + 1]);
+  }, [image.id, index, images]);
+
   return <div className="image-viewer-backdrop" onClick={onClose}>
     <div className="image-viewer hud-panel" onClick={event => event.stopPropagation()}>
       <header className="image-viewer-header">
@@ -646,7 +659,13 @@ function ImageViewerOverlay({ images, imageId, onClose, onNavigate }: {
       </header>
       <div className="image-viewer-stage">
         <button className="image-viewer-nav left" onClick={() => onNavigate(-1)} aria-label="Previous image">‹</button>
-        <img src={fileUrl(imagePath)} alt={image.prompt || 'Civitai example'} />
+        <img
+          key={image.id}
+          className={direction ? `viewer-image-${direction}` : 'viewer-image-enter'}
+          src={fileUrl(imagePath)}
+          alt={image.prompt || 'Civitai example'}
+          decoding="async"
+        />
         <button className="image-viewer-nav right" onClick={() => onNavigate(1)} aria-label="Next image">›</button>
       </div>
       <div className="image-viewer-footer">
@@ -661,7 +680,7 @@ function ImageViewerOverlay({ images, imageId, onClose, onNavigate }: {
   </div>;
 }
 
-const GALLERY_LOAD_CONCURRENCY = 6;
+const GALLERY_LOAD_CONCURRENCY = 4;
 let activeGalleryImageLoads = 0;
 type GalleryLoadJob = {
   cancelled: boolean;
@@ -733,7 +752,7 @@ function GalleryImage({ src, alt }: { src: string; alt: string }) {
         setNearViewport(true);
         observer.disconnect();
       }
-    }, { rootMargin: '700px 0px' });
+    }, { rootMargin: '260px 0px' });
 
     observer.observe(element);
     return () => observer.disconnect();
@@ -785,11 +804,11 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
 }) {
   const [busyImage, setBusyImage] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [renderCount, setRenderCount] = useState(() => Math.min(48, images.length));
+  const [renderCount, setRenderCount] = useState(() => Math.min(24, images.length));
   const renderSentinelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    setRenderCount(Math.min(48, images.length));
+    setRenderCount(Math.min(24, images.length));
   }, [model.id, images.length]);
 
   useEffect(() => {
@@ -798,7 +817,7 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
     if (!element || !('IntersectionObserver' in window)) return;
     const observer = new IntersectionObserver((entries) => {
       if (entries.some(entry => entry.isIntersecting)) {
-        setRenderCount(current => Math.min(current + 48, images.length));
+        setRenderCount(current => Math.min(current + 24, images.length));
       }
     }, { rootMargin: '900px 0px' });
     observer.observe(element);
@@ -1410,6 +1429,7 @@ function DownloadProgressWidget({ progress, onClear }: { progress: DownloadProgr
 function App() {
   const startupStartedAt = useRef(performance.now());
   const [state,setState]=useState<AppState|null>(null); const [startupReady,setStartupReady]=useState(false); const [showBackground,setShowBackground]=useState(false); const [startupError,setStartupError]=useState<string|null>(null); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
+  const [imageViewerDirection,setImageViewerDirection]=useState<'next'|'prev'|null>(null);
   useEffect(() => {
     if (!startupReady) return;
 
@@ -1517,7 +1537,7 @@ function App() {
         void refresh();
         const currentId = selectedIdRef.current;
         if (currentId != null) {
-          void api.getImages(currentId, 1000).then(result => {
+          void api.getImages(currentId, 120).then(result => {
             if (selectedIdRef.current === currentId) {
               setImages(result.images);
             }
@@ -1727,7 +1747,7 @@ function App() {
 
     const loadImages = async () => {
       try {
-        const result = await api.getImages(modelId,1000);
+        const result = await api.getImages(modelId,120);
         if(cancelled) return;
         setImages(result.images);
       } catch {
@@ -1797,7 +1817,7 @@ function App() {
       void (async () => {
         try {
           const more = await api.syncModelGallery(modelId, 20);
-          const result = await api.getImages(modelId, 1000);
+          const result = await api.getImages(modelId, 120);
           if (selectedIdRef.current === modelId) {
             setImages(result.images);
             setGalleryHasMore(more);
@@ -1832,12 +1852,16 @@ function App() {
       setGalleryFetchBusy(false);
     }
   };
-  const openImageViewer = (imageId: number) => setImageViewerId(imageId);
+  const openImageViewer = (imageId: number) => {
+    setImageViewerDirection(null);
+    setImageViewerId(imageId);
+  };
   const navigateImageViewer = (direction: -1 | 1) => {
     if (imageViewerId == null || !images.length) return;
     const currentIndex = images.findIndex(image => image.id === imageViewerId);
     if (currentIndex < 0) return;
     const nextIndex = (currentIndex + direction + images.length) % images.length;
+    setImageViewerDirection(direction > 0 ? 'next' : 'prev');
     setImageViewerId(images[nextIndex].id);
   };
   const activeDownloadCount=downloadProgress.filter(item=>item.phase!=='COMPLETED'&&item.phase!=='FAILED'&&item.phase!=='ALREADY INSTALLED'&&item.phase!=='ALREADY QUEUED').length;
