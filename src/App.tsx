@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, fileUrl, subscribeToExamplesRefresh, subscribeToModelChanges } from './tauri';
-import type { AppState, CacheOperationResult, CacheStats, CivitaiImportPreview, DownloadProgress, ExamplesRefreshProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
+import { api, fileUrl, subscribeToExamplesRefresh, subscribeToModelTagsRefresh, subscribeToModelChanges } from './tauri';
+import type { AppState, CacheOperationResult, CacheStats, CivitaiImportPreview, DownloadProgress, ExamplesRefreshProgress, ModelTagsRefreshProgress, ModelImage, ModelRecord, ModelType, LibraryCounts, TagRecord } from './types';
 import { civitaiTypeToModelType, defaultImportDirectory, folderForModelType, fmtBytes, fmtCount, fmtDateTime, initials } from './utils/model';
 
 const TYPES: Array<{ key: ModelType | 'All'; label: string }> = [
@@ -69,6 +69,9 @@ function SettingsOverlay({
   progress,
   running,
   onRefreshExamples,
+  modelTagsRefreshProgress,
+  modelTagsRefreshRunning,
+  onRefreshModelTags,
   onClose,
 }: {
   thumbnailFit: ThumbnailFit;
@@ -76,6 +79,9 @@ function SettingsOverlay({
   progress: ExamplesRefreshProgress | null;
   running: boolean;
   onRefreshExamples: () => Promise<void>;
+  modelTagsRefreshProgress: ModelTagsRefreshProgress | null;
+  modelTagsRefreshRunning: boolean;
+  onRefreshModelTags: () => Promise<void>;
   onClose: () => void;
 }) {
   const [folderBusy, setFolderBusy] = useState(false);
@@ -370,7 +376,7 @@ function SettingsOverlay({
         </section>
 
         <section className="settings-section">
-          <div className="section-head">CIVITAI ACCESS</div>
+          <div className="section-head">CIVITAI</div>
           <p className="settings-copy">Paste an optional Civitai API token here. Raphael stores it in the host credential store and uses it for authenticated model downloads and API requests.</p>
           <div className="settings-token-status">
             <span className={tokenSet ? 'online' : ''}>{tokenSet ? 'TOKEN CONFIGURED' : 'NO TOKEN CONFIGURED'}</span>
@@ -393,9 +399,31 @@ function SettingsOverlay({
             {tokenSet ? <button className="text-btn settings-clear-btn" onClick={clearCivitaiToken} disabled={tokenBusy}>CLEAR</button> : null}
           </div>
           {tokenMessage ? <div className="settings-success">{tokenMessage}</div> : null}
-        </section>
 
-        <section className="settings-section">
+          <div className="section-head">MODEL TAGS</div>
+          <p className="settings-copy">Refetches tags from Civitai for every linked model. User-edited tags are preserved and are not overwritten.</p>
+          <button className="primary-btn" onClick={() => void onRefreshModelTags()} disabled={modelTagsRefreshRunning}>
+            {modelTagsRefreshRunning ? 'REFETCHING…' : 'REFETCH ALL MODEL TAGS'}
+          </button>
+          {modelTagsRefreshProgress ? (() => {
+            const overall = modelTagsRefreshProgress.total > 0
+              ? Math.min(100, (modelTagsRefreshProgress.current / modelTagsRefreshProgress.total) * 100)
+              : 0;
+            return <div className="examples-refresh-progress">
+              <div className="examples-refresh-head">
+                <span>{modelTagsRefreshProgress.model_name || 'ALL LINKED MODELS'}</span>
+                <span>{modelTagsRefreshProgress.total ? String(modelTagsRefreshProgress.current) + '/' + String(modelTagsRefreshProgress.total) + ' MODELS' : 'NO LINKED MODELS'}</span>
+              </div>
+              <div className="examples-refresh-track"><div className="examples-refresh-fill" style={{width: overall + '%'}}/></div>
+              <div className="examples-refresh-meta">
+                <span>{modelTagsRefreshProgress.updated_models} UPDATED · {modelTagsRefreshProgress.protected_models} PROTECTED</span>
+                <span>{modelTagsRefreshProgress.failed_models} FAILED</span>
+              </div>
+              <div className="examples-refresh-status">{modelTagsRefreshProgress.status}</div>
+              {modelTagsRefreshProgress.error ? <div className="examples-refresh-error">{modelTagsRefreshProgress.error}</div> : null}
+            </div>;
+          })() : null}
+
           <div className="section-head">CIVITAI EXAMPLE CACHE</div>
           <p className="settings-copy">Fetches all creator-uploaded featured example images from every published Civitai version for every linked model and rebuilds their local thumbnails.</p>
           <button className="primary-btn" onClick={() => void onRefreshExamples()} disabled={running}>
@@ -504,7 +532,7 @@ function SettingsOverlay({
         </section>
 
         <section className="settings-section">
-          <div className="section-head">DOWNLOAD CONCURRENCY</div>
+          <div className="section-head">PERFORMANCE & DISPLAY</div>
           <p className="settings-download-copy">Controls how many model files Raphael downloads at the same time. Additional installs stay queued and start automatically as slots open.</p>
           <div className="settings-parallel-row">
             <select className="type-select settings-parallel-select" value={parallelDownloads} onChange={e => void changeParallelDownloads(Number(e.target.value))} disabled={parallelBusy} aria-label="Parallel downloads">
@@ -512,9 +540,7 @@ function SettingsOverlay({
             </select>
             <span className="tag-save-state">{parallelBusy ? 'SAVING…' : parallelMessage || 'DEFAULT · 3'}</span>
           </div>
-        </section>
 
-        <section className="settings-section">
           <div className="section-head">THUMBNAIL SCALING</div>
           <p className="settings-copy">Controls how model thumbnails are scaled inside the fixed Raphael card and import placeholder.</p>
           <div className="settings-options">
@@ -531,7 +557,7 @@ function SettingsOverlay({
         </section>
 
         <section className="settings-section">
-          <div className="section-head">FOLDER → TAGS</div>
+          <div className="section-head">TAGGING</div>
           <p className="settings-copy">Adds every model subfolder below its ComfyUI type folder as a tag without removing existing tags.</p>
           <div className="folder-tag-example"><span>checkpoints/Illustrus/model.safetensors</span><b>→</b><em>Illustrus</em></div>
           <div className="folder-tag-example"><span>loras/Illustrus/Character/model.safetensors</span><b>→</b><em>Illustrus · Character</em></div>
@@ -1219,6 +1245,8 @@ function App() {
   const [parallelDownloads,setParallelDownloads]=useState(3);
   const [examplesRefreshProgress,setExamplesRefreshProgress]=useState<ExamplesRefreshProgress|null>(null);
   const [examplesRefreshRunning,setExamplesRefreshRunning]=useState(false);
+  const [modelTagsRefreshProgress,setModelTagsRefreshProgress]=useState<ModelTagsRefreshProgress|null>(null);
+  const [modelTagsRefreshRunning,setModelTagsRefreshRunning]=useState(false);
   const [refreshingModels,setRefreshingModels]=useState<Record<number, boolean>>({});
   const [refreshErrors,setRefreshErrors]=useState<Record<number, string | null>>({});
   const [importClosing,setImportClosing]=useState(false);
@@ -1285,6 +1313,26 @@ function App() {
             }
           }).catch(() => {});
         }
+      }
+    }).then(unlisten => {
+      if (disposed) unlisten();
+      else stop = unlisten;
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      stop?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let stop: undefined | (() => void);
+    subscribeToModelTagsRefresh(progress => {
+      if (disposed) return;
+      setModelTagsRefreshProgress(progress);
+      setModelTagsRefreshRunning(!progress.done);
+      if (progress.done) {
+        void refresh();
       }
     }).then(unlisten => {
       if (disposed) unlisten();
@@ -1500,6 +1548,24 @@ function App() {
       }));
     }
   };
+  const refreshAllModelTags = async () => {
+    if (modelTagsRefreshRunning) return;
+    setModelTagsRefreshRunning(true);
+    try {
+      const initial = await api.refreshAllModelTags();
+      setModelTagsRefreshProgress(initial);
+      setModelTagsRefreshRunning(!initial.done);
+    } catch (e) {
+      setModelTagsRefreshRunning(false);
+      setModelTagsRefreshProgress(p => ({
+        ...(p || {current:0,total:0,model_id:null,model_name:null,updated_models:0,protected_models:0,failed_models:0,status:'',done:true,error:null}),
+        status:'Could not start model tag refresh',
+        done:true,
+        error:String(e),
+      }));
+    }
+  };
+
   const refreshSelectedModel = async (modelId: number) => {
     if (refreshingModels[modelId]) return;
     setRefreshingModels(current => ({ ...current, [modelId]: true }));
@@ -1662,7 +1728,7 @@ function App() {
       {imageViewerId !== null && images.some(image => image.id === imageViewerId) && <ImageViewerOverlay images={images} imageId={imageViewerId} onClose={()=>setImageViewerId(null)} onNavigate={navigateImageViewer}/>}
 
     </div>
-    {settingsOpen && <SettingsOverlay thumbnailFit={thumbnailFit} onThumbnailFitChange={setThumbnailFit} progress={examplesRefreshProgress} running={examplesRefreshRunning} onRefreshExamples={refreshAllExamples} onClose={()=>setSettingsOpen(false)}/>} 
+    {settingsOpen && <SettingsOverlay thumbnailFit={thumbnailFit} onThumbnailFitChange={setThumbnailFit} progress={examplesRefreshProgress} running={examplesRefreshRunning} onRefreshExamples={refreshAllExamples} modelTagsRefreshProgress={modelTagsRefreshProgress} modelTagsRefreshRunning={modelTagsRefreshRunning} onRefreshModelTags={refreshAllModelTags} onClose={()=>setSettingsOpen(false)}/>} 
     {(preview || importUrl) && <div className={"modal-backdrop" + (importClosing ? " overlay-leaving" : "")} onClick={()=>{if(!busy) closeImport();}}><div className="import-modal hud-panel" onClick={e=>e.stopPropagation()}><div className="eyebrow">CIVITAI IMPORT</div><h2>INSTALL A MODEL</h2>{!preview || preview.version.id===0 ? <>{importError ? <div className="error-box modal-error">{importError}</div> : null}<div className="import-row"><input value={importUrl} onChange={e=>setImportUrl(e.target.value)} onKeyDown={e=>e.key==='Enter'&&doImport()} placeholder="civitai.com/models/... or civitai.red/models/..." autoFocus/><button className="primary-btn" onClick={doImport} disabled={busy || bulkBusy}>{busy?'ANALYZING…':'ANALYZE'}</button></div><div className="bulk-link-row"><input ref={bulkFileInputRef} className="bulk-link-input" type="file" accept=".txt,text/plain" onChange={e=>{const file=e.target.files?.[0];if(file)void handleBulkLinkFile(file);}}/><button className="text-btn" onClick={()=>bulkFileInputRef.current?.click()} disabled={busy || bulkBusy}>{bulkBusy?'QUEUING LINKS…':'UPLOAD LINK FILE'}</button><span className="bulk-link-status">ONE CIVITAI LINK PER LINE · DOWNLOADS FOLLOW YOUR PARALLEL SETTING</span>{bulkMessage ? <span className="bulk-link-status">{bulkMessage}</span> : null}</div></> : <><div className="import-preview-grid"><div className="preview-image">{preview.thumbnail_path ? <><TypePlaceholder type={importType}/><img src={fileUrl(preview.thumbnail_path)} alt="" onError={(e)=>{e.currentTarget.style.display="none";}}/></> : <TypePlaceholder type={importType}/>}</div><div className="preview-panel"><div className="preview-topline"><span className="type-chip">{importType}</span><span className="source-domain">CIVITAI</span></div><h3>{preview.model.name || preview.version.filename || 'Model'}</h3><div className="preview-meta">{preview.version.base_model || 'Base model unavailable'} · {preview.version.filename || 'Filename automatic'}</div><div className="kv"><span>MODEL FILE</span><b>{preview.version.filename || 'Automatic filename'}</b></div><div className="kv"><span>SIZE</span><b>{preview.version.size_bytes ? fmtBytes(preview.version.size_bytes) : 'Unknown'}</b></div><div className="section-head">LIBRARY TAG</div><div className="import-type-row"><label htmlFor="import-type">CLASSIFY AS</label><select id="import-type" className="import-type-select" value={importType} onChange={e=>{const next=e.target.value as ModelType; setImportType(next); if(!customDownloadPath) setDownloadPath(defaultImportDirectory(state.models_root,next));}} disabled={busy}>{IMPORT_TYPES.map(x=><option key={x} value={x}>{x}</option>)}</select></div><div className="import-type-note">Civitai suggests <b>{preview.model.type || 'Unknown'}</b>; Raphael uses the tag you choose for its library category and default folder.</div><div className="section-head">DOWNLOAD LOCATION</div><div className="destination-box"><div className="destination-path" title={downloadPath}>{downloadPath || defaultImportDirectory(state.models_root,importType) || preview.target_directory}</div><button className="primary-btn small" onClick={async()=>{const next=await api.chooseDirectory(downloadPath || defaultImportDirectory(state.models_root,importType) || preview.target_directory); if(next){setDownloadPath(next);setCustomDownloadPath(true);setImportError(null);}}} disabled={busy || api.isWebApp}>{api.isWebApp ? 'DESKTOP ONLY' : 'BROWSE'}</button></div><div className="destination-note">Choose a folder inside your configured ComfyUI models directory. Changing the tag updates the default folder until you manually browse.</div><div className="section-head">ACTIVATION PROMPTS</div><div className="chips">{preview.version.activation_prompts.map(x=><span key={x}>{x}</span>)}</div></div></div><div className="modal-actions"><button className="text-btn" onClick={closeImport}>BACK</button><button className="primary-btn" onClick={install} disabled={busy}>{busy?'STARTING…':'DOWNLOAD & INSTALL'}</button></div>{importError ? <div className="error-box modal-error">{importError}</div> : null}</>}</div></div>}
   </div>;
 }
