@@ -258,6 +258,12 @@ struct TagsArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct DescriptionArgs {
+    id: i64,
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TypeArgs {
     id: i64,
     #[serde(rename = "modelType")]
@@ -823,6 +829,12 @@ async fn command_handler(
         "set_model_tags" => {
             let args: TagsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             set_model_tags(handle.state(), handle.clone(), args.id, args.tags).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        }
+        "set_model_description" => {
+            let args: DescriptionArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            set_model_description(handle.state(), handle.clone(), args.id, args.description)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "set_model_type" => {
             let args: TypeArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
