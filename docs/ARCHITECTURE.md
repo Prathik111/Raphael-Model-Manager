@@ -6,6 +6,8 @@ Raphael is a single Tauri desktop application with a React/TypeScript frontend a
 
 The LAN web API is a transport adapter over the same application services; it is not a second business-logic implementation. API requests are authenticated before command dispatch, and the static web assets remain loadable without exposing the command surface.
 
+At desktop startup, `registry.rs` health-checks the configured Registry. For a local HTTP Registry, the Manager can start the local `raphael-registry` process (or the sibling Registry workspace through Cargo), sharing the configured data directory and bearer token. Initial Registry synchronization is started only after the health check succeeds. Remote and HTTPS Registry endpoints remain externally managed.
+
 ## Rust module boundaries
 
 - `lib.rs` contains application wiring, shared state, filesystem scanning, registry synchronization orchestration, Civitai operations, command registration, and startup.
