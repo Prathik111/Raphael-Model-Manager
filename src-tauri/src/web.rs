@@ -480,8 +480,23 @@ async fn health_handler() -> Response {
         .into_response()
 }
 
-async fn serve_cached_file(path: &Path, headers: &axum::http::HeaderMap) -> Response {
-    let metadata = match tokio::fs::metadata(path).await {
+async fn file_handler(
+    AxumState(state): AxumState<WebServerState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<FileQuery>,
+) -> Response {
+    let app_data = match state.handle.path().app_data_dir() {
+        Ok(path) => path,
+        Err(error) => return response_err(AppError::Io(std::io::Error::other(error.to_string()))),
+    };
+
+    let requested = PathBuf::from(query.path);
+    let path = match validate_cached_file(&requested, &app_data).await {
+        Ok(path) => path,
+        Err(error) => return response_err(error),
+    };
+
+    let metadata = match tokio::fs::metadata(&path).await {
         Ok(metadata) => metadata,
         Err(error) => return response_err(AppError::Io(error)),
     };
@@ -515,7 +530,7 @@ async fn serve_cached_file(path: &Path, headers: &axum::http::HeaderMap) -> Resp
     };
 
     let content_length = if size == 0 { 0 } else { end - start + 1 };
-    let mut file = match File::open(path).await {
+    let mut file = match File::open(&path).await {
         Ok(file) => file,
         Err(error) => return response_err(AppError::Io(error)),
     };
@@ -573,73 +588,6 @@ async fn serve_cached_file(path: &Path, headers: &axum::http::HeaderMap) -> Resp
         }
     }
 
-    response
-}
-
-async fn file_handler(
-    AxumState(state): AxumState<WebServerState>,
-    headers: axum::http::HeaderMap,
-    Query(query): Query<FileQuery>,
-) -> Response {
-    let app_data = match state.handle.path().app_data_dir() {
-        Ok(path) => path,
-        Err(error) => return response_err(AppError::Io(std::io::Error::other(error.to_string()))),
-    };
-
-    let requested = PathBuf::from(query.path);
-    let path = match validate_cached_file(&requested, &app_data).await {
-        Ok(path) => path,
-        Err(error) => return response_err(error),
-    };
-
-    serve_cached_file(&path, &headers).await
-}
-
-async fn public_model_thumbnail_handler(
-    AxumState(state): AxumState<WebServerState>,
-    AxumPath(registry_model_id): AxumPath<String>,
-) -> Response {
-    let app_data = match state.handle.path().app_data_dir() {
-        Ok(path) => path,
-        Err(error) => return response_err(AppError::Io(std::io::Error::other(error.to_string()))),
-    };
-
-    let db_path = app_data.join("raphael.db");
-    let connection = match rusqlite::Connection::open(&db_path) {
-        Ok(connection) => connection,
-        Err(error) => return response_err(AppError::Db(error)),
-    };
-
-    let cached_path = connection.query_row(
-        "SELECT COALESCE(NULLIF(cover_path, ''), thumbnail_path)
-         FROM models
-         WHERE registry_model_id = ?1
-         LIMIT 1",
-        [registry_model_id.as_str()],
-        |row| row.get::<_, Option<String>>(0),
-    );
-
-    let Some(cached_path) = match cached_path {
-        Ok(value) => value,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return (StatusCode::NOT_FOUND, Json(json!({ "error": "Model thumbnail not found" }))).into_response();
-        }
-        Err(error) => return response_err(AppError::Db(error)),
-    } else {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "Model has no cached thumbnail" }))).into_response();
-    };
-
-    let path = match validate_cached_file(Path::new(&cached_path), &app_data).await {
-        Ok(path) => path,
-        Err(error) => return response_err(error),
-    };
-
-    let headers = axum::http::HeaderMap::new();
-    let mut response = serve_cached_file(&path, &headers).await;
-    response.headers_mut().insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
     response
 }
 
@@ -1022,13 +970,6 @@ fn build_router(handle: AppHandle, controller: WebServerController, web_root: Op
         controller,
     };
 
-    let public_api = Router::new()
-        .route(
-            "/api/public/model-thumbnail/{registry_model_id}",
-            get(public_model_thumbnail_handler),
-        )
-        .with_state(state.clone());
-
     let api = Router::new()
         .route("/api/health", get(health_handler))
         .route("/api/changes", get(model_changes_handler))
@@ -1041,7 +982,7 @@ fn build_router(handle: AppHandle, controller: WebServerController, web_root: Op
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state.clone());
 
-    let mut router = Router::new().merge(public_api).merge(api);
+    let mut router = Router::new().merge(api);
     if let Some(root) = web_root {
         router = router.fallback_service(ServeDir::new(root));
     }
