@@ -14,36 +14,13 @@ import type {
   ModelImagesResponse,
   CacheStats,
   CacheOperationResult,
+  TagRefreshResult,
 } from './types';
 
 export const isWebApp = typeof window !== 'undefined' && !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
 
 const WEB_REQUEST_TIMEOUT_MS = 10_000;
 const WEB_STATUS_TIMEOUT_MS = 4_000;
-const WEB_TOKEN_STORAGE_KEY = 'raphael.webToken';
-
-function getWebAccessToken(): string | null {
-  if (!isWebApp) return null;
-  try {
-    const stored = window.sessionStorage.getItem(WEB_TOKEN_STORAGE_KEY);
-    if (stored) return stored;
-
-    const rawHash = window.location.hash.startsWith('#')
-      ? window.location.hash.slice(1)
-      : window.location.hash;
-    const params = new URLSearchParams(rawHash);
-    const token = params.get('access_token');
-    if (!token) return null;
-
-    window.sessionStorage.setItem(WEB_TOKEN_STORAGE_KEY, token);
-    const cleanUrl = window.location.pathname + window.location.search;
-    window.history.replaceState(null, document.title, cleanUrl);
-    return token;
-  } catch {
-    return null;
-  }
-}
-
 async function webFetch(
   url: string,
   init: RequestInit = {},
@@ -52,14 +29,8 @@ async function webFetch(
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const headers = new Headers(init.headers);
-    const token = getWebAccessToken();
-    if (token && !headers.has('Authorization')) {
-      headers.set('Authorization', `Bearer ${token}`);
-    }
     return await fetch(url, {
       ...init,
-      headers,
       credentials: 'same-origin',
       cache: 'no-store',
       signal: controller.signal,
@@ -207,8 +178,14 @@ export const api = {
   getLibraryCounts: () => command<LibraryCounts>('get_library_counts'),
   getTags: () => command<TagRecord[]>('get_tags'),
   addSubfolderTags: () => isWebApp ? webTaskCommand<number>('add_subfolder_tags') : command<number>('add_subfolder_tags'),
+  refetchAllModelTags: () =>
+    isWebApp ? webTaskCommand<TagRefreshResult>('refetch_all_model_tags') : command<TagRefreshResult>('refetch_all_model_tags'),
   setModelTags: (id: number, tags: string[]) =>
     command<ModelRecord>('set_model_tags', { id, tags }),
+  setModelName: (id: number, name: string) =>
+    command<ModelRecord>('set_model_name', { id, name }),
+  setModelDescription: (id: number, description: string) =>
+    command<ModelRecord>('set_model_description', { id, description }),
   setModelType: (id: number, modelType: string) =>
     command<ModelRecord>('set_model_type', { id, modelType }),
   setModelCoverPosition: (id: number, x: number, y: number) =>

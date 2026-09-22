@@ -383,6 +383,7 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
         civitai_version_id INTEGER,
         civitai_url TEXT,
         civitai_name TEXT,
+        civitai_name_user_modified INTEGER NOT NULL DEFAULT 0,
         version_name TEXT,
         base_model TEXT,
         creator TEXT,
@@ -390,6 +391,7 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
         tags_json TEXT NOT NULL DEFAULT '[]',
         tags_user_modified INTEGER NOT NULL DEFAULT 0,
         model_type_user_modified INTEGER NOT NULL DEFAULT 0,
+        description_user_modified INTEGER NOT NULL DEFAULT 0,
         activation_json TEXT NOT NULL DEFAULT '[]',
         source_hash TEXT,
         updated_at INTEGER NOT NULL,
@@ -435,6 +437,10 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
     if has_tag_lock==0 { c.execute("ALTER TABLE models ADD COLUMN tags_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     let has_type_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='model_type_user_modified'",[],|r|r.get(0))?;
     if has_type_lock==0 { c.execute("ALTER TABLE models ADD COLUMN model_type_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
+    let has_name_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='civitai_name_user_modified'",[],|r|r.get(0))?;
+    if has_name_lock==0 { c.execute("ALTER TABLE models ADD COLUMN civitai_name_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
+    let has_description_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='description_user_modified'",[],|r|r.get(0))?;
+    if has_description_lock==0 { c.execute("ALTER TABLE models ADD COLUMN description_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     let has_cover_path:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_path'",[],|r|r.get(0))?;
     if has_cover_path==0 { c.execute("ALTER TABLE models ADD COLUMN cover_path TEXT",[])?; }
     let has_cover_x:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_position_x'",[],|r|r.get(0))?;
@@ -800,6 +806,24 @@ async fn hydrate_local_model_from_registry(
         .unwrap_or_default();
 
     let c = open_db(&app.app_data)?;
+    let (name_user_modified, description_user_modified): (bool, bool) = c.query_row(
+        "SELECT civitai_name_user_modified,description_user_modified FROM models WHERE id=?1",
+        [local_id],
+        |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0)),
+    )?;
+    let local_name: Option<String> = c.query_row(
+        "SELECT civitai_name FROM models WHERE id=?1",
+        [local_id],
+        |r| r.get(0),
+    )?;
+    let name = if name_user_modified { local_name } else { Some(model.name.clone()) };
+    let local_description: Option<String> = c.query_row(
+        "SELECT description FROM models WHERE id=?1",
+        [local_id],
+        |r| r.get(0),
+    )?;
+    let description = if description_user_modified { local_description } else { model.description.clone() };
+
     c.execute(
         "UPDATE models
          SET registry_model_id=?2,
@@ -825,11 +849,11 @@ async fn hydrate_local_model_from_registry(
             civitai_model_id,
             civitai_version_id,
             civitai_url,
-            model.name,
+            name,
             version_name,
             base_model,
             model.creator,
-            model.description,
+            description,
             serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&activation).unwrap_or_else(|_| "[]".into()),
             now()
@@ -1047,12 +1071,17 @@ async fn apply_civitai_metadata_to_registry(
     creator: Option<&str>,
 ) -> AppResult<(String, String)> {
     let _ = sync_local_model_to_registry(app, local_id).await?;
-    let (registry_model_id, tags_user_modified) = {
+    let (registry_model_id, tags_user_modified, description_user_modified, name_user_modified) = {
         let c = open_db(&app.app_data)?;
         c.query_row(
-            "SELECT registry_model_id,tags_user_modified FROM models WHERE id=?1",
+            "SELECT registry_model_id,tags_user_modified,description_user_modified,civitai_name_user_modified FROM models WHERE id=?1",
             [local_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, i64>(2)? != 0,
+                r.get::<_, i64>(3)? != 0,
+            )),
         )?
     };
 
@@ -1067,16 +1096,22 @@ async fn apply_civitai_metadata_to_registry(
         registry_model_type(&local_type).to_string()
     };
 
+    let mut model_patch = json!({
+        "model_type": model_type,
+        "creator": creator,
+        "base_model": version.get("baseModel").and_then(Value::as_str)
+    });
+    if !name_user_modified {
+        model_patch["name"] = json!(model.get("name").and_then(Value::as_str));
+    }
+    if !description_user_modified {
+        model_patch["description"] = json!(description);
+    }
+
     app.registry.update_model(
         &registry_model_id,
         registry_model.revision,
-        json!({
-            "name": model.get("name").and_then(Value::as_str),
-            "model_type": model_type,
-            "creator": creator,
-            "description": description,
-            "base_model": version.get("baseModel").and_then(Value::as_str)
-        }),
+        model_patch,
     ).await?;
 
     let external_version_id = version
@@ -1293,6 +1328,21 @@ fn normalized_import_type(t:&str)->Option<&'static str> { match t.to_ascii_lower
 fn civitai_host(url:&str)->AppResult<String>{Ok(Url::parse(url)?.host_str().unwrap_or("civitai.com").to_ascii_lowercase().replace("www.",""))}
 fn canonical_civitai_url(source:&str,model_id:Option<i64>,version_id:Option<i64>)->AppResult<String>{let host=civitai_host(source)?;Ok(match (model_id,version_id){(Some(mid),Some(vid))=>format!("https://{host}/models/{mid}?modelVersionId={vid}"),(Some(mid),None)=>format!("https://{host}/models/{mid}"),_=>source.to_string()})}
 fn json_strings(v:Option<&Value>)->Vec<String>{v.and_then(Value::as_array).map(|a|a.iter().filter_map(|x|x.as_str().map(str::to_string)).collect()).unwrap_or_default()}
+
+fn civitai_model_tags(model: &Value, version: &Value) -> Vec<String> {
+    let mut tags = json_strings(model.get("tags"));
+    if let Some(base_model) = version
+        .get("baseModel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !tags.iter().any(|tag| tag.trim().eq_ignore_ascii_case(base_model)) {
+            tags.push(base_model.to_string());
+        }
+    }
+    tags
+}
 fn strip_html(s:&str)->String{let mut out=String::with_capacity(s.len());let mut in_tag=false;for ch in s.chars(){match ch{ '<'=>in_tag=true,'>'=>in_tag=false,_ if !in_tag=>out.push(ch),_=>{}}}out.replace("&nbsp;"," ").replace("&amp;","&").replace("&lt;","<").replace("&gt;",">")}
 
 async fn download_cached_thumbnail(
@@ -2374,7 +2424,7 @@ async fn preview_civitai_import_inner(app: &AppStateInner, url: String) -> AppRe
             "name": model.get("name"),
             "type": typ,
             "description": model.get("description"),
-            "tags": model.get("tags"),
+            "tags": Value::Array(civitai_model_tags(&model, &version).into_iter().map(Value::String).collect()),
             "creator": model.get("creator").and_then(|v| v.get("username")),
             "thumbnail_path": thumb
         }),
@@ -2644,7 +2694,7 @@ async fn install_civitai_model(
             });
 
             let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().replace("\\", "/");
-            let tags = json_strings(model.get("tags"));
+            let tags = civitai_model_tags(&model, &version);
             let activation = json_strings(version.get("trainedWords"));
             let desc = model.get("description").and_then(Value::as_str).map(strip_html);
             let creator = model.get("creator").and_then(|v| v.get("username")).and_then(Value::as_str).map(str::to_string);
@@ -3157,7 +3207,7 @@ async fn link_model_civitai_inner(
     let trimmed=url.trim();
     let (_mid,_vid)=model_id_and_version(trimmed)?;
     let (model,version)=fetch_model_and_version(app,trimmed).await?;
-    let tags=json_strings(model.get("tags"));
+    let tags=civitai_model_tags(&model, &version);
     let activation=json_strings(version.get("trainedWords"));
     let desc=model.get("description").and_then(Value::as_str).map(strip_html);
     let creator=model.get("creator").and_then(|v|v.get("username")).and_then(Value::as_str).map(str::to_string);
@@ -3223,7 +3273,7 @@ async fn refresh_model_civitai_inner(
         .ok_or_else(|| AppError::Invalid("This model is not linked to Civitai".into()))?;
 
     let (model, version) = fetch_model_and_version(app, &url).await?;
-    let tags = json_strings(model.get("tags"));
+    let tags = civitai_model_tags(&model, &version);
     let activation = json_strings(version.get("trainedWords"));
     let desc = model
         .get("description")
@@ -3555,11 +3605,11 @@ fn spawn_hash_enrichment(app: AppStateInner, handle: AppHandle) {
                 .and_then(Value::as_str)
                 .or_else(|| version.get("modelName").and_then(Value::as_str));
             let base_model = version.get("baseModel").and_then(Value::as_str);
-            let tags = version
+            let model_payload = version
                 .get("model")
-                .and_then(|m| m.get("tags"))
                 .cloned()
-                .unwrap_or_else(|| json!([]));
+                .unwrap_or_else(|| json!({}));
+            let tags = civitai_model_tags(&model_payload, &version);
             let activation = version
                 .get("trainedWords")
                 .cloned()
@@ -3669,7 +3719,7 @@ fn spawn_registry_event_sync(app: AppStateInner, handle: AppHandle) {
 
 #[tauri::command]
 async fn check_registry_health(app: State<'_, AppStateInner>) -> AppResult<bool> {
-    Ok(app.registry.is_healthy().await)
+    Ok(app.registry.is_authenticated().await)
 }
 
 fn spawn_registry_startup(app: AppStateInner, handle: AppHandle) {
@@ -3712,7 +3762,7 @@ pub fn run() {
             spawn_registry_event_sync(state.clone(),app.handle().clone());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,set_model_tags,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,check_registry_health,web::get_web_app_status,web::toggle_web_app])
+        .invoke_handler(tauri::generate_handler![get_app_state,set_models_root,list_models,get_tags,add_subfolder_tags,refetch_all_model_tags,set_model_tags,set_model_name,set_model_description,set_model_type,set_model_cover_position,set_model_cover_from_image,set_model_custom_cover,reset_model_cover,delete_model,get_library_counts,get_model_images,sync_model_gallery,refresh_all_examples,get_examples_refresh_status,preview_civitai_import,install_civitai_model,get_download_progress,clear_download_progress,get_parallel_downloads,set_parallel_downloads,link_model_civitai,refresh_model_civitai,get_storage_stats,get_cache_stats,set_cache_max_bytes,set_cache_location,clear_cache_images,clear_complete_cache,prune_cache_images,clean_cache_orphans,get_example_load_amount,set_example_load_amount,load_more_model_examples,open_in_file_manager,set_civitai_token,is_civitai_token_set,check_registry_health,web::get_web_app_status,web::toggle_web_app])
         .run(tauri::generate_context!())
         .expect("error while running Raphael Model Manager");
 }
@@ -3841,6 +3891,25 @@ mod tests {
         assert_eq!(civitai_type_to_folder("TextualInversion"), "embeddings");
         assert_eq!(civitai_type_to_folder("Upscaler"), "upscale_models");
         assert_eq!(civitai_type_to_folder("UnknownType"), "other");
+    }
+
+    #[test]
+    fn civitai_tags_include_base_model_without_duplicates() {
+        let model = json!({
+            "tags": ["Anime", "SDXL 1.0"]
+        });
+        let version = json!({
+            "baseModel": "SDXL 1.0"
+        });
+        assert_eq!(civitai_model_tags(&model, &version), vec!["Anime".to_string(), "SDXL 1.0".to_string()]);
+
+        let version_with_new_base = json!({
+            "baseModel": "Flux.1 D"
+        });
+        assert_eq!(
+            civitai_model_tags(&model, &version_with_new_base),
+            vec!["Anime".to_string(), "SDXL 1.0".to_string(), "Flux.1 D".to_string()]
+        );
     }
 
     #[test]

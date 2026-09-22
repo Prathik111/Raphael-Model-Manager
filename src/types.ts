@@ -65,3 +65,5 @@ export interface ModelImagesResponse {
 }
 
 export interface WebAppStatus { enabled: boolean; url: string | null; port: number; }
+
+export interface TagRefreshResult { models_scanned:number; models_updated:number; tags_added:number; failures:number; }

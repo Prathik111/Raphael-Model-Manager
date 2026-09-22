@@ -137,8 +137,16 @@ impl RegistryClient {
     }
 
     pub(crate) async fn ensure_running(&self) -> Result<(), RegistryError> {
-        if self.is_healthy().await {
+        if self.is_authenticated().await {
             return Ok(());
+        }
+
+        if self.is_healthy().await {
+            let _ = self.token()?;
+            return Err(RegistryError::Api {
+                status: StatusCode::UNAUTHORIZED,
+                message: "Registry is reachable but rejected the configured authentication token".into(),
+            });
         }
 
         let (bind, port) = local_http_registry_endpoint(&self.base_url)?;
@@ -166,7 +174,7 @@ impl RegistryClient {
 
         let ready = timeout(REGISTRY_STARTUP_TIMEOUT, async {
             loop {
-                if self.is_healthy().await {
+                if self.is_authenticated().await {
                     return Ok::<(), RegistryError>(());
                 }
                 sleep(REGISTRY_STARTUP_POLL).await;
@@ -196,6 +204,19 @@ impl RegistryClient {
             .unwrap_or(false)
     }
 
+    pub(crate) async fn is_authenticated(&self) -> bool {
+        let request = match self.request(Method::GET, "/api/v1/events/snapshot") {
+            Ok(request) => request.query(&[("after_id", 0)]),
+            Err(_) => return false,
+        };
+
+        request
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+    }
+
     fn token(&self) -> Result<String, RegistryError> {
         if let Ok(value) = env::var("RAPHAEL_REGISTRY_AUTH_TOKEN") {
             if !value.trim().is_empty() {
@@ -203,13 +224,85 @@ impl RegistryClient {
             }
         }
 
-        let token = fs::read_to_string(&self.token_file)
-            .map_err(|_| RegistryError::MissingToken)?;
-        let token = token.trim();
-        if token.is_empty() {
-            return Err(RegistryError::MissingToken);
+        let mut token_files = self.token_file_candidates();
+        for lock_file in self.registry_lock_candidates(&token_files) {
+            if let Some(token_file) = token_file_from_lock(&lock_file) {
+                if !token_files.contains(&token_file) {
+                    token_files.push(token_file);
+                }
+            }
         }
-        Ok(token.to_string())
+
+        for token_file in token_files {
+            let Ok(value) = fs::read_to_string(&token_file) else {
+                continue;
+            };
+            let token = value.trim();
+            if !token.is_empty() {
+                return Ok(token.to_string());
+            }
+        }
+
+        Err(RegistryError::MissingToken)
+    }
+
+    fn token_file_candidates(&self) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+
+        let mut push_unique = |path: PathBuf| {
+            if !candidates.contains(&path) {
+                candidates.push(path);
+            }
+        };
+
+        push_unique(self.token_file.clone());
+
+        if let Some(data_dir) = env::var_os("RAPHAEL_REGISTRY_DATA_DIR") {
+            push_unique(PathBuf::from(data_dir).join("registry.token"));
+        }
+
+        if let Some(database) = env::var_os("RAPHAEL_REGISTRY_DATABASE") {
+            if let Some(parent) = Path::new(&database).parent() {
+                push_unique(parent.join("registry.token"));
+            }
+        }
+
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            push_unique(
+                PathBuf::from(local_app_data)
+                    .join("Raphael")
+                    .join("ModelRegistry")
+                    .join("data")
+                    .join("registry.token"),
+            );
+        }
+
+        if let Some(app_data) = env::var_os("APPDATA") {
+            push_unique(
+                PathBuf::from(app_data)
+                    .join("Raphael")
+                    .join("ModelRegistry")
+                    .join("data")
+                    .join("registry.token"),
+            );
+        }
+
+        candidates
+    }
+
+    fn registry_lock_candidates(&self, token_files: &[PathBuf]) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+
+        for token_file in token_files {
+            if let Some(parent) = token_file.parent() {
+                let lock = parent.join("registry.lock");
+                if !candidates.contains(&lock) {
+                    candidates.push(lock);
+                }
+            }
+        }
+
+        candidates
     }
 
     fn request(&self, method: Method, path: &str) -> Result<reqwest::RequestBuilder, RegistryError> {
@@ -464,6 +557,22 @@ impl RegistryClient {
 
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RegistryLockInfo {
+    token_file: Option<PathBuf>,
+}
+
+fn token_file_from_lock(lock_file: &Path) -> Option<PathBuf> {
+    let content = fs::read_to_string(lock_file).ok()?;
+    let info: RegistryLockInfo = serde_json::from_str(&content).ok()?;
+    let token_file = info.token_file?;
+    if token_file.is_absolute() {
+        Some(token_file)
+    } else {
+        lock_file.parent().map(|parent| parent.join(token_file))
+    }
+}
+
 fn local_http_registry_endpoint(base_url: &str) -> Result<(String, u16), RegistryError> {
     let parsed = Url::parse(base_url).map_err(|error| RegistryError::Api {
         status: StatusCode::BAD_REQUEST,
@@ -659,6 +768,29 @@ mod tests {
     fn default_token_path_uses_app_data_when_localappdata_is_missing() {
         std::env::remove_var("LOCALAPPDATA");
         assert!(default_token_path(Path::new("app")).ends_with("registry.token"));
+    }
+
+    #[test]
+    fn lock_token_path_is_resolved_relative_to_lock_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "raphael-registry-lock-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let lock = dir.join("registry.lock");
+        fs::write(
+            &lock,
+            r#"{"token_file":"registry.token"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            token_file_from_lock(&lock),
+            Some(dir.join("registry.token"))
+        );
+
+        let _ = fs::remove_file(lock);
+        let _ = fs::remove_dir(dir);
     }
 
     #[test]

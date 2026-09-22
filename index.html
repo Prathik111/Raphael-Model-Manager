@@ -1,5 +1,40 @@
 <!doctype html>
 <html lang="en">
-  <head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><title>Raphael Model Manager</title><link rel="icon" type="image/svg+xml" href="/raphael-core.svg" /></head>
-  <body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#030b08" />
+    <title>Raphael Model Manager</title>
+    <link rel="icon" type="image/svg+xml" href="/raphael-core.svg" />
+    <style>
+      html,body{margin:0;width:100%;height:100%;background:#030b08;overflow:hidden}
+      #initial-loader{position:fixed;inset:0;z-index:2147483647;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:#030b08;color:#f4f8ff;font-family:Consolas,"SFMono-Regular",ui-monospace,monospace;transition:opacity .22s ease,visibility .22s ease}
+      #initial-loader.is-ready{opacity:0;visibility:hidden;pointer-events:none}
+      .initial-loader-core{position:relative;width:72px;height:72px;margin-bottom:8px}
+      .initial-loader-core span,.initial-loader-core i{position:absolute;left:50%;top:50%;width:34px;height:34px;border:1px solid rgba(255,255,255,.72);transform:translate(-50%,-50%) rotate(45deg);animation:raphael-loader-pulse 2.4s ease-in-out infinite}
+      .initial-loader-core span{width:8px;height:8px;border-radius:50%;background:#fff;box-shadow:0 0 20px rgba(255,255,255,.7);animation-delay:-.1s}
+      .initial-loader-core i:nth-of-type(1){width:28px;height:28px;opacity:.55}
+      .initial-loader-core i:nth-of-type(2){width:48px;height:48px;opacity:.28;animation-delay:.12s}
+      .initial-loader-core i:nth-of-type(3){width:66px;height:66px;opacity:.14;animation-delay:.24s}
+      .initial-loader-eyebrow{font-size:8px;letter-spacing:.3em;color:rgba(255,255,255,.42)}
+      .initial-loader-title{font-size:13px;letter-spacing:.14em;color:rgba(255,255,255,.82);text-align:center}
+      .initial-loader-track{width:min(280px,62vw);height:3px;margin-top:4px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.35);overflow:hidden}
+      .initial-loader-track span{display:block;width:42%;height:100%;background:rgba(235,248,255,.82);box-shadow:0 0 12px rgba(220,240,255,.24);animation:raphael-loader-progress 1.6s ease-in-out infinite}
+      .initial-loader-status{font-size:7px;letter-spacing:.17em;color:rgba(255,255,255,.28)}
+      @keyframes raphael-loader-pulse{0%,100%{transform:translate(-50%,-50%) rotate(45deg) scale(.92)}50%{transform:translate(-50%,-50%) rotate(45deg) scale(1.06)}}
+      @keyframes raphael-loader-progress{0%{transform:translateX(-130%)}100%{transform:translateX(340%)}}
+      @media(prefers-reduced-motion:reduce){#initial-loader *{animation-duration:.01ms!important;animation-iteration-count:1!important}}
+    </style>
+  </head>
+  <body>
+    <div id="initial-loader" aria-live="polite">
+      <div class="initial-loader-core" aria-hidden="true"><span></span><i></i><i></i><i></i></div>
+      <div class="initial-loader-eyebrow">RAPHAEL CORE</div>
+      <div class="initial-loader-title">INITIALIZING MODEL MANAGER</div>
+      <div class="initial-loader-track" aria-hidden="true"><span></span></div>
+      <div class="initial-loader-status">STARTING APPLICATION</div>
+    </div>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>
