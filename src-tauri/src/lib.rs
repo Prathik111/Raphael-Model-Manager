@@ -3451,6 +3451,9 @@ async fn refresh_model_tags_only(app: &AppStateInner, id: i64) -> AppResult<bool
     let (model, _version) = fetch_model_and_version(app, &url).await?;
     let tags = json_strings(model.get("tags"));
 
+    // Ensure older/library rows have a registry projection before we mutate tags.
+    let _ = sync_local_model_to_registry(app, id).await?;
+
     let (registry_model_id, tags_user_modified) = {
         let c = open_db(&app.app_data)?;
         c.query_row(
