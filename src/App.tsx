@@ -1378,8 +1378,11 @@ function App() {
         api.getTags()
       ]);
       if(generation!==refreshGeneration.current) return;
-      list.sort((a,b)=>sort==='size'?b.size_bytes-a.size_bytes:sort==='path'?a.relative_path.localeCompare(b.relative_path):(a.civitai_name||a.filename).localeCompare(b.civitai_name||b.filename));
-      setModels(list);
+      const visibleModels = type === 'All'
+        ? list
+        : list.filter(model => model.model_type.trim().toLowerCase() === type.trim().toLowerCase());
+      visibleModels.sort((a,b)=>sort==='size'?b.size_bytes-a.size_bytes:sort==='path'?a.relative_path.localeCompare(b.relative_path):(a.civitai_name||a.filename).localeCompare(b.civitai_name||b.filename));
+      setModels(visibleModels);
       setCounts(allCounts);
       setAllTags(tags);
       setSelectedId(previous=>{
