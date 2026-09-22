@@ -21,9 +21,27 @@ const WEB_REQUEST_TIMEOUT_MS = 10_000;
 const WEB_STATUS_TIMEOUT_MS = 4_000;
 const WEB_TOKEN_STORAGE_KEY = 'raphael.webToken';
 
+function isDesktopOrigin(): boolean {
+  if (typeof window === 'undefined') return false;
+
+  const { protocol, hostname } = window.location;
+  return (
+    protocol === 'tauri:' ||
+    protocol === 'asset:' ||
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname === '[::1]'
+  );
+}
+
 function hasWebAccessToken(): boolean {
   if (typeof window === 'undefined') return false;
   try {
+    if (isDesktopOrigin()) {
+      window.sessionStorage.removeItem(WEB_TOKEN_STORAGE_KEY);
+      return false;
+    }
+
     if (window.sessionStorage.getItem(WEB_TOKEN_STORAGE_KEY)) return true;
 
     const rawHash = window.location.hash.startsWith('#')
@@ -35,7 +53,7 @@ function hasWebAccessToken(): boolean {
   }
 }
 
-export const isWebApp = hasWebAccessToken();
+export const isWebApp = !isDesktopOrigin() && hasWebAccessToken();
 
 function getWebAccessToken(): string | null {
   if (!isWebApp) return null;
