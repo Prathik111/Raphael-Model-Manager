@@ -816,7 +816,7 @@ async fn hydrate_local_model_from_registry(
         [local_id],
         |r| r.get(0),
     )?;
-    let name = if name_user_modified { local_name } else { model.name.clone() };
+    let name = if name_user_modified { local_name } else { Some(model.name.clone()) };
     let local_description: Option<String> = c.query_row(
         "SELECT description FROM models WHERE id=?1",
         [local_id],
