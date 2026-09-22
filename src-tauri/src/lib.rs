@@ -1068,12 +1068,16 @@ async fn apply_civitai_metadata_to_registry(
     creator: Option<&str>,
 ) -> AppResult<(String, String)> {
     let _ = sync_local_model_to_registry(app, local_id).await?;
-    let (registry_model_id, tags_user_modified) = {
+    let (registry_model_id, tags_user_modified, description_user_modified) = {
         let c = open_db(&app.app_data)?;
         c.query_row(
-            "SELECT registry_model_id,tags_user_modified FROM models WHERE id=?1",
+            "SELECT registry_model_id,tags_user_modified,description_user_modified FROM models WHERE id=?1",
             [local_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, i64>(2)? != 0,
+            )),
         )?
     };
 
@@ -1088,16 +1092,20 @@ async fn apply_civitai_metadata_to_registry(
         registry_model_type(&local_type).to_string()
     };
 
+    let mut model_patch = json!({
+        "name": model.get("name").and_then(Value::as_str),
+        "model_type": model_type,
+        "creator": creator,
+        "base_model": version.get("baseModel").and_then(Value::as_str)
+    });
+    if !description_user_modified {
+        model_patch["description"] = json!(description);
+    }
+
     app.registry.update_model(
         &registry_model_id,
         registry_model.revision,
-        json!({
-            "name": model.get("name").and_then(Value::as_str),
-            "model_type": model_type,
-            "creator": creator,
-            "description": description,
-            "base_model": version.get("baseModel").and_then(Value::as_str)
-        }),
+        model_patch,
     ).await?;
 
     let external_version_id = version
