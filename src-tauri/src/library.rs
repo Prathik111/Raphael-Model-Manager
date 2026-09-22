@@ -174,6 +174,53 @@ pub(crate) async fn set_model_tags(
 }
 
 #[tauri::command]
+pub(crate) async fn set_model_name(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    name: String,
+) -> AppResult<ModelRecord> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::Invalid("Model name cannot be empty".into()));
+    }
+    if name.chars().count() > 200 {
+        return Err(AppError::Invalid("Model name cannot exceed 200 characters".into()));
+    }
+
+    let _ = sync_local_model_to_registry(app.inner(), id).await?;
+
+    let registry_model_id: String = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id FROM models WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?
+    };
+
+    let registry_model = app.registry.get_model(&registry_model_id).await?;
+    app.registry
+        .update_model(
+            &registry_model_id,
+            registry_model.revision,
+            serde_json::json!({ "name": name }),
+        )
+        .await?;
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET civitai_name=?2,civitai_name_user_modified=1,updated_at=?3 WHERE id=?1",
+        params![id, name, now()],
+    )?;
+    drop(c);
+
+    let rec = model_by_id(&open_db(&app.app_data)?, id)?;
+    emit_models_changed(&handle);
+    Ok(rec)
+}
+
+#[tauri::command]
 pub(crate) async fn set_model_description(
     app: State<'_, AppStateInner>,
     handle: AppHandle,
@@ -225,6 +272,101 @@ pub(crate) async fn set_model_description(
     let rec = model_by_id(&open_db(&app.app_data)?, id)?;
     emit_models_changed(&handle);
     Ok(rec)
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TagRefreshResult {
+    pub models_scanned: i64,
+    pub models_updated: i64,
+    pub tags_added: i64,
+    pub failures: i64,
+}
+
+#[tauri::command]
+pub(crate) async fn refetch_all_model_tags(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+) -> AppResult<TagRefreshResult> {
+    let candidates: Vec<(i64, String, Vec<String>)> = {
+        let c = open_db(&app.app_data)?;
+        let mut stmt = c.prepare(
+            "SELECT id,civitai_url,tags_json
+             FROM models
+             WHERE civitai_url IS NOT NULL AND TRIM(civitai_url) <> ''",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let raw: String = r.get(2)?;
+            let tags = serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default();
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, tags))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut result = TagRefreshResult {
+        models_scanned: candidates.len() as i64,
+        models_updated: 0,
+        tags_added: 0,
+        failures: 0,
+    };
+
+    for (id, url, local_tags) in candidates {
+        let (model, version) = match fetch_model_and_version(&app, &url).await {
+            Ok(value) => value,
+            Err(_) => {
+                result.failures += 1;
+                continue;
+            }
+        };
+
+        let fetched_tags = civitai_model_tags(&model, &version);
+
+        let _ = sync_local_model_to_registry(&app, id).await;
+        let registry_model_id: String = {
+            let c = open_db(&app.app_data)?;
+            c.query_row(
+                "SELECT registry_model_id FROM models WHERE id=?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )?
+        };
+
+        let registry_tags = app.registry.tags(&registry_model_id).await.unwrap_or_default();
+        let before = normalize_tags(local_tags);
+        let mut merged = before.clone();
+        merged.extend(registry_tags.clone());
+        merged.extend(fetched_tags);
+        let merged = normalize_tags(merged);
+
+        let added_to_local = merged
+            .iter()
+            .filter(|tag| !before.iter().any(|existing| existing.eq_ignore_ascii_case(tag)))
+            .count() as i64;
+
+        for tag in &merged {
+            if !registry_tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag)) {
+                if app.registry.add_tag(&registry_model_id, tag).await.is_err() {
+                    result.failures += 1;
+                }
+            }
+        }
+
+        if merged != before {
+            let c = open_db(&app.app_data)?;
+            c.execute(
+                "UPDATE models SET tags_json=?2,updated_at=?3 WHERE id=?1",
+                params![
+                    id,
+                    serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into()),
+                    now()
+                ],
+            )?;
+            result.models_updated += 1;
+            result.tags_added += added_to_local;
+        }
+    }
+
+    emit_models_changed(&handle);
+    Ok(result)
 }
 
 pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
