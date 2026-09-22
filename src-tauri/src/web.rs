@@ -948,7 +948,7 @@ async fn command_handler(
         "is_civitai_token_set" => Ok(json!(is_civitai_token_set())),
         "check_registry_health" => {
             let app = handle.state::<crate::AppStateInner>();
-            Ok(json!(app.registry.is_healthy().await))
+            Ok(json!(app.registry.is_authenticated().await))
         }
         "open_in_file_manager" => {
             let _ = arg::<serde_json::Map<String, Value>>(args);
