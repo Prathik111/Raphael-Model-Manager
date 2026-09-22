@@ -1,8 +1,7 @@
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path as AxumPath, Query, State as AxumState},
-    http::{header, HeaderValue, Request, StatusCode},
-    middleware,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -1081,15 +1080,7 @@ pub async fn set_web_app_enabled(
                 match TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], WEB_PORT))).await {
                     Ok(next_listener) => {
                         listener = Some(next_listener);
-                        *task_controller.inner.url.write().unwrap() = Some(web_url(
-                            &task_controller
-                                .inner
-                                .auth_token
-                                .read()
-                                .unwrap()
-                                .clone()
-                                .unwrap_or_default(),
-                        ));
+                        *task_controller.inner.url.write().unwrap() = Some(web_url());
                         let (next_shutdown_tx, next_shutdown_rx) = oneshot::channel();
                         *task_controller.inner.shutdown.lock().unwrap() = Some(next_shutdown_tx);
                         shutdown_rx = Some(next_shutdown_rx);
@@ -1136,32 +1127,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_access_tokens_are_six_digit_numbers() {
-        for _ in 0..100 {
-            let token = generate_access_token().expect("token generation should succeed");
-            assert_eq!(token.len(), 6);
-            assert!(token.chars().all(|value| value.is_ascii_digit()));
-            let value: u32 = token.parse().expect("token should be numeric");
-            assert!((100_000..=999_999).contains(&value));
-        }
-    }
-
-    #[test]
-    fn bearer_and_cookie_tokens_are_parsed_without_accepting_other_schemes() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer secret-token"));
-        headers.insert(header::COOKIE, HeaderValue::from_static("foo=bar; raphael_auth=secret-token; other=value"));
-        assert_eq!(bearer_token(&headers).as_deref(), Some("secret-token"));
-        assert_eq!(cookie_token(&headers).as_deref(), Some("secret-token"));
-
-        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic secret-token"));
-        assert!(bearer_token(&headers).is_none());
-    }
-
-    #[test]
-    fn web_urls_keep_the_access_token_in_the_fragment() {
-        let url = web_url("abc123");
-        assert!(url.contains("#access_token=abc123"));
-        assert!(!url.contains("?access_token="));
+    fn web_urls_do_not_contain_access_tokens() {
+        let url = web_url();
+        assert!(!url.contains("access_token"));
+        assert!(!url.contains("raphael_auth"));
+        assert!(url.ends_with('/'));
     }
 }
