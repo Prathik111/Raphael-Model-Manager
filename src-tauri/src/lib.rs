@@ -3667,6 +3667,22 @@ fn spawn_registry_event_sync(app: AppStateInner, handle: AppHandle) {
     });
 }
 
+fn spawn_registry_startup(app: AppStateInner, handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        match app.registry.ensure_running().await {
+            Ok(()) => {
+                if app.models_root.read().ok().and_then(|root| root.clone()).is_some() {
+                    spawn_registry_sync(app.clone(), handle.clone());
+                    spawn_hash_enrichment(app, handle);
+                }
+            }
+            Err(error) => {
+                eprintln!("Raphael Model Registry auto-start failed: {error}");
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3686,7 +3702,8 @@ pub fn run() {
                 registry_sync_running: Arc::new(Mutex::new(false)),
                 registry_event_cursor: Arc::new(Mutex::new(0)),
             };app.manage(state.clone());
-            if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let removed=scan_root(&state,&root).unwrap_or_default(); if !removed.is_empty(){let app_state=state.clone();tauri::async_runtime::spawn(async move{reconcile_removed_registry_files(&app_state,removed).await;});} let handle=app.handle().clone();spawn_registry_sync(state.clone(),handle.clone());spawn_hash_enrichment(state.clone(),handle.clone());let state2=state.clone();let handle2=handle.clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
+            if let Some(root)=state.models_root.read().unwrap().clone(){ if root.is_dir(){let removed=scan_root(&state,&root).unwrap_or_default(); if !removed.is_empty(){let app_state=state.clone();tauri::async_runtime::spawn(async move{reconcile_removed_registry_files(&app_state,removed).await;});} let state2=state.clone();let handle2=app.handle().clone();if let Ok(mut watcher)=notify::recommended_watcher(move |res:Result<notify::Event,notify::Error>|{if let Ok(e)=res{match e.kind{EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)=>{std::thread::sleep(Duration::from_millis(120));recursive_scan_and_emit(state2.clone(),handle2.clone());},_=>{}}}}){if watcher.watch(&root,RecursiveMode::Recursive).is_ok(){*state.watcher.lock().unwrap()=Some(watcher)}}}}
+            spawn_registry_startup(state.clone(), app.handle().clone());
             spawn_registry_event_sync(state.clone(),app.handle().clone());
             Ok(())
         })
