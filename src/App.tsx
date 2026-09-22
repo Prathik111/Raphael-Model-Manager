@@ -47,8 +47,22 @@ function PulseMark() {
 
 function Setup({ onReady }: { onReady: (state: AppState)=>void }) {
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const webMode = api.isWebApp;
-  const choose = async () => { setBusy(true); try { const p = await api.chooseModelsFolder(); if (p) onReady(await api.setModelsRoot(p)); } finally { setBusy(false); } };
+  const choose = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const p = await api.chooseModelsFolder();
+      if (!p) return;
+      onReady(await api.setModelsRoot(p));
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
   return <div className="setup-shell">
     <div className="scan-corners"/>
     <PulseMark/>
@@ -58,7 +72,11 @@ function Setup({ onReady }: { onReady: (state: AppState)=>void }) {
       <p>{webMode
         ? 'Select the models folder from Raphael on the Windows host. The LAN web app uses that same library.'
         : 'The manager watches this folder and everything beneath it. Your model files stay where they are.'}</p>
-      {!webMode ? <><button className="primary-btn" onClick={choose} disabled={busy}>{busy ? 'OPENING…' : 'BROWSE MODELS FOLDER'}</button><div className="tiny">Example: C:\ComfyUI\models</div></> : <div className="tiny">Return to the Raphael desktop window and choose the host models folder.</div>}
+      {!webMode ? <>
+        <button className="primary-btn" onClick={choose} disabled={busy}>{busy ? 'OPENING…' : 'BROWSE MODELS FOLDER'}</button>
+        <div className="tiny">Example: C:\ComfyUI\models</div>
+        {error ? <div className="setup-error" role="alert">{error}</div> : null}
+      </> : <div className="tiny">Return to the Raphael desktop window and choose the host models folder.</div>}
     </div>
   </div>;
 }
