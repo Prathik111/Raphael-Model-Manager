@@ -12,7 +12,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, OnceLock, RwLock},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex, OnceLock, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify};
