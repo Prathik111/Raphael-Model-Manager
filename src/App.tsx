@@ -400,30 +400,6 @@ function SettingsOverlay({
           </div>
           {tokenMessage ? <div className="settings-success">{tokenMessage}</div> : null}
 
-          <div className="section-head">MODEL TAGS</div>
-          <p className="settings-copy">Refetches tags from Civitai for every linked model. User-edited tags are preserved and are not overwritten.</p>
-          <button className="primary-btn" onClick={() => void onRefreshModelTags()} disabled={modelTagsRefreshRunning}>
-            {modelTagsRefreshRunning ? 'REFETCHING…' : 'REFETCH ALL MODEL TAGS'}
-          </button>
-          {modelTagsRefreshProgress ? (() => {
-            const overall = modelTagsRefreshProgress.total > 0
-              ? Math.min(100, (modelTagsRefreshProgress.current / modelTagsRefreshProgress.total) * 100)
-              : 0;
-            return <div className="examples-refresh-progress">
-              <div className="examples-refresh-head">
-                <span>{modelTagsRefreshProgress.model_name || 'ALL LINKED MODELS'}</span>
-                <span>{modelTagsRefreshProgress.total ? String(modelTagsRefreshProgress.current) + '/' + String(modelTagsRefreshProgress.total) + ' MODELS' : 'NO LINKED MODELS'}</span>
-              </div>
-              <div className="examples-refresh-track"><div className="examples-refresh-fill" style={{width: overall + '%'}}/></div>
-              <div className="examples-refresh-meta">
-                <span>{modelTagsRefreshProgress.updated_models} UPDATED · {modelTagsRefreshProgress.protected_models} PROTECTED</span>
-                <span>{modelTagsRefreshProgress.failed_models} FAILED</span>
-              </div>
-              <div className="examples-refresh-status">{modelTagsRefreshProgress.status}</div>
-              {modelTagsRefreshProgress.error ? <div className="examples-refresh-error">{modelTagsRefreshProgress.error}</div> : null}
-            </div>;
-          })() : null}
-
           <div className="section-head">CIVITAI EXAMPLE CACHE</div>
           <p className="settings-copy">Fetches all creator-uploaded featured example images from every published Civitai version for every linked model and rebuilds their local thumbnails.</p>
           <button className="primary-btn" onClick={() => void onRefreshExamples()} disabled={running}>
@@ -558,6 +534,32 @@ function SettingsOverlay({
 
         <section className="settings-section">
           <div className="section-head">TAGGING</div>
+
+          <div className="section-head">MODEL TAGS</div>
+          <p className="settings-copy">Refetches tags from Civitai for every linked model. User-edited tags are preserved and are not overwritten.</p>
+          <button className="primary-btn" onClick={() => void onRefreshModelTags()} disabled={modelTagsRefreshRunning}>
+            {modelTagsRefreshRunning ? 'REFETCHING…' : 'REFETCH ALL MODEL TAGS'}
+          </button>
+          {modelTagsRefreshProgress ? (() => {
+            const overall = modelTagsRefreshProgress.total > 0
+              ? Math.min(100, (modelTagsRefreshProgress.current / modelTagsRefreshProgress.total) * 100)
+              : 0;
+            return <div className="examples-refresh-progress">
+              <div className="examples-refresh-head">
+                <span>{modelTagsRefreshProgress.model_name || 'ALL LINKED MODELS'}</span>
+                <span>{modelTagsRefreshProgress.total ? String(modelTagsRefreshProgress.current) + '/' + String(modelTagsRefreshProgress.total) + ' MODELS' : 'NO LINKED MODELS'}</span>
+              </div>
+              <div className="examples-refresh-track"><div className="examples-refresh-fill" style={{width: overall + '%'}}/></div>
+              <div className="examples-refresh-meta">
+                <span>{modelTagsRefreshProgress.updated_models} UPDATED · {modelTagsRefreshProgress.protected_models} PROTECTED</span>
+                <span>{modelTagsRefreshProgress.failed_models} FAILED</span>
+              </div>
+              <div className="examples-refresh-status">{modelTagsRefreshProgress.status}</div>
+              {modelTagsRefreshProgress.error ? <div className="examples-refresh-error">{modelTagsRefreshProgress.error}</div> : null}
+            </div>;
+          })() : null}
+
+          <div className="section-head">FOLDER → TAGS</div>
           <p className="settings-copy">Adds every model subfolder below its ComfyUI type folder as a tag without removing existing tags.</p>
           <div className="folder-tag-example"><span>checkpoints/Illustrus/model.safetensors</span><b>→</b><em>Illustrus</em></div>
           <div className="folder-tag-example"><span>loras/Illustrus/Character/model.safetensors</span><b>→</b><em>Illustrus · Character</em></div>
