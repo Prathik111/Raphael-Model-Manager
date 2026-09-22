@@ -1408,16 +1408,16 @@ function DownloadProgressWidget({ progress, onClear }: { progress: DownloadProgr
 }
 
 function App() {
-  const [state,setState]=useState<AppState|null>(null); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
+  const startupStartedAt = useRef(performance.now());
+  const [state,setState]=useState<AppState|null>(null); const [startupReady,setStartupReady]=useState(false); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
   useEffect(() => {
-    if (!state) return;
+    if (!startupReady) return;
 
     const loader = document.getElementById('initial-loader');
     if (!loader) return;
 
-    const startedAt = performance.now();
     const minimumVisibleMs = api.isWebApp ? 700 : 1200;
-    const elapsed = performance.now() - startedAt;
+    const elapsed = performance.now() - startupStartedAt.current;
     const remaining = Math.max(0, minimumVisibleMs - elapsed);
 
     const timer = window.setTimeout(() => {
@@ -1573,6 +1573,7 @@ function App() {
         setCounts({all:0,by_type:{}});
         setAllTags([]);
         setSelectedId(null);
+        setStartupReady(true);
         return;
       }
       const [list,allCounts,tags]=await Promise.all([
@@ -1592,6 +1593,7 @@ function App() {
         if(previous!==null && list.some(m=>m.id===previous)) return previous;
         return list[0]?.id ?? null;
       });
+      setStartupReady(true);
     } catch (error) {
       if(generation===refreshGeneration.current) console.error('Raphael refresh failed',error);
     }
