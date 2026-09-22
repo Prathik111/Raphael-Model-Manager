@@ -538,7 +538,6 @@ fn configure_registry_command(
 
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
 }
