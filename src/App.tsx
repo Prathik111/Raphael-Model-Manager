@@ -1222,7 +1222,27 @@ function App() {
   const [refreshingModels,setRefreshingModels]=useState<Record<number, boolean>>({});
   const [refreshErrors,setRefreshErrors]=useState<Record<number, string | null>>({});
   const [importClosing,setImportClosing]=useState(false);
+  const [registryOnline,setRegistryOnline]=useState<boolean|null>(null);
   useEffect(()=>{window.localStorage.setItem(THUMBNAIL_FIT_KEY,thumbnailFit);},[thumbnailFit]);
+
+  useEffect(() => {
+    let disposed = false;
+    const checkRegistry = async () => {
+      try {
+        const online = await api.checkRegistryHealth();
+        if (!disposed) setRegistryOnline(online);
+      } catch {
+        if (!disposed) setRegistryOnline(false);
+      }
+    };
+
+    void checkRegistry();
+    const timer = window.setInterval(() => void checkRegistry(), 2000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -1619,6 +1639,18 @@ function App() {
             : <div className="download-queue-empty">IMPORT A CIVITAI LINK FILE OR START A MODEL DOWNLOAD.</div>}
         </div>
         <div className="sidebar-foot">
+          <div
+            className={`registry-indicator ${registryOnline === null ? 'checking' : registryOnline ? 'online' : 'offline'}`}
+            role="status"
+            aria-live="polite"
+            title="Live health check of the Raphael Model Registry"
+          >
+            <span className="registry-indicator-dot" aria-hidden="true"/>
+            <span className="registry-indicator-copy">
+              <b>REGISTRY</b>
+              <em>{registryOnline === null ? 'CHECKING…' : registryOnline ? 'ONLINE' : 'OFFLINE'}</em>
+            </span>
+          </div>
           <button className="settings-trigger" aria-label="Open settings" title="SETTINGS" onClick={()=>setSettingsOpen(true)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Zm0-5.2 1 .3.7 2.1c.4.1.8.3 1.2.5l2-.9.9.7-.2 2.2c.3.3.6.6.9.9l2.2-.2.7.9-.9 2c.2.4.4.8.5 1.2l2.1.7.3 1-.3 1-2.1.7a7.4 7.4 0 0 1-.5 1.2l.9 2-.7.9-2.2-.2c-.3.3-.6.6-.9.9l.2 2.2-.9.7-2-.9c-.4.2-.8.4-1.2.5l-.7 2.1-1 .3-1-.3-.7-2.1a7.4 7.4 0 0 1-1.2-.5l-2 .9-.9-.7.2-2.2a7.2 7.2 0 0 1-.9-.9l-2.2.2-.7-.9.9-2c-.2-.4-.4-.8-.5-1.2l-2.1-.7-.3-1 .3-1 2.1-.7c.1-.4.3-.8.5-1.2l-.9-2 .7-.9 2.2.2c.3-.3.6-.6.9-.9l-.2-2.2.9-.7 2 .9c.4-.2.8-.4 1.2-.5l.7-2.1 1-.3Z"/></svg>
         </button>
