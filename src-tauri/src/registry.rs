@@ -475,6 +475,7 @@ fn local_http_registry_endpoint(base_url: &str) -> Result<(String, u16), Registr
     }
 
     let host = parsed.host_str().unwrap_or_default();
+    let host = host.trim_matches(['[', ']']);
     let bind = match host {
         "localhost" | "127.0.0.1" => "127.0.0.1".to_string(),
         "::1" => "::1".to_string(),
