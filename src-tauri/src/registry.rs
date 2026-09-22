@@ -137,7 +137,7 @@ impl RegistryClient {
     }
 
     pub(crate) async fn ensure_running(&self) -> Result<(), RegistryError> {
-        if self.health().await {
+        if self.is_healthy().await {
             return Ok(());
         }
 
@@ -166,7 +166,7 @@ impl RegistryClient {
 
         let ready = timeout(REGISTRY_STARTUP_TIMEOUT, async {
             loop {
-                if self.health().await {
+                if self.is_healthy().await {
                     return Ok::<(), RegistryError>(());
                 }
                 sleep(REGISTRY_STARTUP_POLL).await;
@@ -187,7 +187,7 @@ impl RegistryClient {
         }
     }
 
-    async fn health(&self) -> bool {
+    pub(crate) async fn is_healthy(&self) -> bool {
         self.client
             .get(format!("{}/health", self.base_url))
             .send()
