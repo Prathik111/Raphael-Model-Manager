@@ -59,6 +59,19 @@ export interface ExamplesRefreshProgress {
   error: string | null;
 }
 
+export interface ModelTagsRefreshProgress {
+  current: number;
+  total: number;
+  model_id: number | null;
+  model_name: string | null;
+  updated_models: number;
+  protected_models: number;
+  failed_models: number;
+  status: string;
+  done: boolean;
+  error: string | null;
+}
+
 export interface ModelImagesResponse {
   images: ModelImage[];
   has_more: boolean;
