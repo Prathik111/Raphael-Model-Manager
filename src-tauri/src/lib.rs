@@ -383,6 +383,7 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
         civitai_version_id INTEGER,
         civitai_url TEXT,
         civitai_name TEXT,
+        civitai_name_user_modified INTEGER NOT NULL DEFAULT 0,
         version_name TEXT,
         base_model TEXT,
         creator TEXT,
@@ -436,6 +437,8 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
     if has_tag_lock==0 { c.execute("ALTER TABLE models ADD COLUMN tags_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     let has_type_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='model_type_user_modified'",[],|r|r.get(0))?;
     if has_type_lock==0 { c.execute("ALTER TABLE models ADD COLUMN model_type_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
+    let has_name_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='civitai_name_user_modified'",[],|r|r.get(0))?;
+    if has_name_lock==0 { c.execute("ALTER TABLE models ADD COLUMN civitai_name_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     let has_description_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='description_user_modified'",[],|r|r.get(0))?;
     if has_description_lock==0 { c.execute("ALTER TABLE models ADD COLUMN description_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     let has_cover_path:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_path'",[],|r|r.get(0))?;
@@ -803,23 +806,23 @@ async fn hydrate_local_model_from_registry(
         .unwrap_or_default();
 
     let c = open_db(&app.app_data)?;
-    let description_user_modified: bool = c
-        .query_row(
-            "SELECT description_user_modified FROM models WHERE id=?1",
-            [local_id],
-            |r| r.get::<_, i64>(0),
-        )?
-        != 0;
+    let (name_user_modified, description_user_modified): (bool, bool) = c.query_row(
+        "SELECT civitai_name_user_modified,description_user_modified FROM models WHERE id=?1",
+        [local_id],
+        |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0)),
+    )?;
+    let local_name: Option<String> = c.query_row(
+        "SELECT civitai_name FROM models WHERE id=?1",
+        [local_id],
+        |r| r.get(0),
+    )?;
+    let name = if name_user_modified { local_name } else { model.name.clone() };
     let local_description: Option<String> = c.query_row(
         "SELECT description FROM models WHERE id=?1",
         [local_id],
         |r| r.get(0),
     )?;
-    let description = if description_user_modified {
-        local_description
-    } else {
-        model.description.clone()
-    };
+    let description = if description_user_modified { local_description } else { model.description.clone() };
 
     c.execute(
         "UPDATE models
@@ -846,7 +849,7 @@ async fn hydrate_local_model_from_registry(
             civitai_model_id,
             civitai_version_id,
             civitai_url,
-            model.name,
+            name,
             version_name,
             base_model,
             model.creator,
@@ -1068,15 +1071,16 @@ async fn apply_civitai_metadata_to_registry(
     creator: Option<&str>,
 ) -> AppResult<(String, String)> {
     let _ = sync_local_model_to_registry(app, local_id).await?;
-    let (registry_model_id, tags_user_modified, description_user_modified) = {
+    let (registry_model_id, tags_user_modified, description_user_modified, name_user_modified) = {
         let c = open_db(&app.app_data)?;
         c.query_row(
-            "SELECT registry_model_id,tags_user_modified,description_user_modified FROM models WHERE id=?1",
+            "SELECT registry_model_id,tags_user_modified,description_user_modified,civitai_name_user_modified FROM models WHERE id=?1",
             [local_id],
             |r| Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)? != 0,
                 r.get::<_, i64>(2)? != 0,
+                r.get::<_, i64>(3)? != 0,
             )),
         )?
     };
@@ -1093,11 +1097,13 @@ async fn apply_civitai_metadata_to_registry(
     };
 
     let mut model_patch = json!({
-        "name": model.get("name").and_then(Value::as_str),
         "model_type": model_type,
         "creator": creator,
         "base_model": version.get("baseModel").and_then(Value::as_str)
     });
+    if !name_user_modified {
+        model_patch["name"] = json!(model.get("name").and_then(Value::as_str));
+    }
     if !description_user_modified {
         model_patch["description"] = json!(description);
     }
