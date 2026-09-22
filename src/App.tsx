@@ -1766,7 +1766,7 @@ function App() {
     const primePagination = async () => {
       try {
         const remoteHasMore = await api.syncModelGallery(modelId,20);
-        const result = await api.getImages(modelId,1000);
+        const result = await api.getImages(modelId,120);
         if(cancelled) return;
         setImages(result.images);
         setGalleryHasMore(remoteHasMore || Boolean(selected?.civitai_model_id));
@@ -1849,7 +1849,7 @@ function App() {
     setGalleryFetchBusy(true);
     try {
       const more=await api.loadMoreModelExamples(modelId);
-      const next=await api.getImages(modelId,1000);
+      const next=await api.getImages(modelId,120);
       if(selectedIdRef.current!==modelId) return;
       setImages(next.images);
       setGalleryHasMore(more);
