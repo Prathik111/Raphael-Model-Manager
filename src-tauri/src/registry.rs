@@ -503,15 +503,14 @@ fn spawn_registry_cargo(
     token_file: &Path,
 ) -> Result<tokio::process::Child, RegistryError> {
     let mut command = Command::new("cargo");
-    command.args([
-        "run",
-        "--manifest-path",
-        &manifest.to_string_lossy(),
-        "-p",
-        "registry-server",
-        "--",
-        "server",
-    ]);
+    command
+        .arg("run")
+        .arg("--manifest-path")
+        .arg(manifest)
+        .arg("-p")
+        .arg("registry-server")
+        .arg("--")
+        .arg("server");
     configure_registry_command(&mut command, bind, port, data_dir, token_file);
     Ok(command.spawn()?)
 }
@@ -543,23 +542,49 @@ fn configure_registry_command(
 }
 
 fn find_registry_executable() -> Option<PathBuf> {
+    let binary_name = if cfg!(windows) {
+        "raphael-registry.exe"
+    } else {
+        "raphael-registry"
+    };
     let mut candidates = Vec::new();
 
     if let Ok(current_exe) = env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            candidates.push(parent.join(binary_name));
+            candidates.push(parent.join("resources").join(binary_name));
+        }
+
         for ancestor in current_exe.ancestors() {
             if ancestor.file_name().and_then(|name| name.to_str()) == Some("Raphael-Model-Manager") {
                 if let Some(projects) = ancestor.parent() {
-                    candidates.push(projects.join("Raphael-Model-Registry").join("target/debug/raphael-registry.exe"));
-                    candidates.push(projects.join("Raphael-Model-Registry").join("target/release/raphael-registry.exe"));
+                    candidates.push(
+                        projects
+                            .join("Raphael-Model-Registry")
+                            .join("target/debug")
+                            .join(binary_name),
+                    );
+                    candidates.push(
+                        projects
+                            .join("Raphael-Model-Registry")
+                            .join("target/release")
+                            .join(binary_name),
+                    );
                 }
             }
         }
     }
 
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../Raphael-Model-Registry/target/debug/raphael-registry.exe"));
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../Raphael-Model-Registry/target/release/raphael-registry.exe"));
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Raphael-Model-Registry/target/debug")
+            .join(binary_name),
+    );
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Raphael-Model-Registry/target/release")
+            .join(binary_name),
+    );
 
     candidates.into_iter().find(|path| path.is_file())
 }
