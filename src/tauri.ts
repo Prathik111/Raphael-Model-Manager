@@ -1,4 +1,4 @@
-import { invoke, convertFileSrc } from '@tauri-apps/api/core';
+import { invoke, convertFileSrc, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import type {
@@ -17,7 +17,7 @@ import type {
   CacheOperationResult,
 } from './types';
 
-export const isWebApp = typeof window !== 'undefined' && !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+export const isWebApp = typeof window !== 'undefined' && !isTauri();
 
 const WEB_REQUEST_TIMEOUT_MS = 10_000;
 const WEB_STATUS_TIMEOUT_MS = 4_000;
