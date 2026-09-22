@@ -1094,6 +1094,10 @@ function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, r
   const [editingSource, setEditingSource] = useState(false);
   const [linkBusy, setLinkBusy] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
+  const [editingDescription, setEditingDescription] = useState(false);
+  const [descriptionDraft, setDescriptionDraft] = useState(model.description || '');
+  const [descriptionBusy, setDescriptionBusy] = useState(false);
+  const [descriptionError, setDescriptionError] = useState<string | null>(null);
   const [promptCopyState, setPromptCopyState] = useState<'idle'|'copied'|'error'>('idle');
 
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -1105,7 +1109,10 @@ function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, r
   useEffect(() => {
     setCivitaiUrl(model.civitai_url || '');
     setEditingSource(false);
-  }, [model.id, model.civitai_url]);
+    setDescriptionDraft(model.description || '');
+    setEditingDescription(false);
+    setDescriptionError(null);
+  }, [model.id, model.civitai_url, model.description]);
 
   const refreshSource = async () => {
     if (refreshBusy || linkBusy) return;
@@ -1171,7 +1178,79 @@ function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, r
     </div>
     <div className="inspector-tabs">{(['overview','examples','files'] as const).map(t=><button className={tab===t?'active':''} onClick={()=>setTab(t)} key={t}>{t.toUpperCase()}</button>)}</div>
     {tab==='overview' && <div className="inspector-scroll">
-      <section><div className="section-head">DESCRIPTION</div><p className="description">{model.description || 'No description cached from Civitai.'}</p></section>
+      <section>
+        <div className="section-head section-head-row">
+          <span>DESCRIPTION</span>
+          <button
+            type="button"
+            className="text-btn description-edit-btn"
+            onClick={() => {
+              setDescriptionDraft(model.description || '');
+              setDescriptionError(null);
+              setEditingDescription(true);
+            }}
+            disabled={descriptionBusy}
+          >
+            EDIT
+          </button>
+        </div>
+        {editingDescription
+          ? <div className="description-editor">
+              <textarea
+                className="description-input"
+                value={descriptionDraft}
+                onChange={event => {
+                  setDescriptionDraft(event.target.value);
+                  setDescriptionError(null);
+                }}
+                placeholder="Add a description for this model…"
+                rows={7}
+                maxLength={12000}
+                autoFocus
+                disabled={descriptionBusy}
+              />
+              <div className="description-editor-meta">
+                <span>{descriptionDraft.length}/12000</span>
+                <span>LOCAL EDIT · PRESERVED ACROSS CIVITAI REFRESH</span>
+              </div>
+              {descriptionError ? <div className="error-box">{descriptionError}</div> : null}
+              <div className="description-editor-actions">
+                <button
+                  type="button"
+                  className="text-btn"
+                  onClick={() => {
+                    setEditingDescription(false);
+                    setDescriptionDraft(model.description || '');
+                    setDescriptionError(null);
+                  }}
+                  disabled={descriptionBusy}
+                >
+                  CANCEL
+                </button>
+                <button
+                  type="button"
+                  className="primary-btn small"
+                  onClick={async () => {
+                    if (descriptionBusy) return;
+                    setDescriptionBusy(true);
+                    setDescriptionError(null);
+                    try {
+                      await api.setModelDescription(model.id, descriptionDraft);
+                      setEditingDescription(false);
+                    } catch (error) {
+                      setDescriptionError(String(error));
+                    } finally {
+                      setDescriptionBusy(false);
+                    }
+                  }}
+                  disabled={descriptionBusy}
+                >
+                  {descriptionBusy ? 'SAVING…' : 'SAVE DESCRIPTION'}
+                </button>
+              </div>
+            </div>
+          : <p className="description">{model.description || 'No description cached from Civitai.'}</p>}
+      </section>
       <section><div className="section-head">ACTIVATION PROMPTS</div>{promptText ? <><div className="prompt-box">{promptText}</div><div className="prompt-actions"><button type="button" className="prompt-copy-btn" onClick={()=>void copyActivationPrompts()}>{promptCopyState === 'copied' ? 'COPIED' : promptCopyState === 'error' ? 'COPY FAILED' : 'COPY ALL ACTIVATION PROMPTS'}</button>{promptCopyState === 'copied' ? <span className="prompt-copy-status" aria-live="polite">COPIED TO CLIPBOARD</span> : null}</div></> : <div className="empty-inline">No activation prompts were published for this version.</div>}</section>
       <section><div className="section-head section-head-row"><span>TAGS</span><span className="section-action">EDITABLE</span></div><TagEditor model={model} allTags={allTags} onSave={onSaveTags} onFilter={onFilterTag}/></section>
       <section><div className="section-head">LOCATION</div><div className="mono-box">{model.path}</div><button className="text-btn" disabled={api.isWebApp} title={api.isWebApp ? 'Opening the Windows file manager is available only in the desktop app' : undefined} onClick={()=>api.openFolder(model.path)}>{api.isWebApp ? 'OPEN FOLDER · DESKTOP' : 'OPEN FOLDER'}</button></section>
