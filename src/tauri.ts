@@ -21,10 +21,15 @@ const WEB_REQUEST_TIMEOUT_MS = 10_000;
 const WEB_STATUS_TIMEOUT_MS = 4_000;
 const WEB_TOKEN_STORAGE_KEY = 'raphael.webToken';
 
+function isTauriRuntime(): boolean {
+  if (typeof window === 'undefined') return false;
+  return '__TAURI_INTERNALS__' in window;
+}
+
 function isTauriDevWindow(): boolean {
   if (typeof window === 'undefined') return false;
   try {
-    return new URLSearchParams(window.location.search).get('tauri_dev') === '1';
+    return isTauriRuntime() && new URLSearchParams(window.location.search).get('tauri_dev') === '1';
   } catch {
     return false;
   }
@@ -44,7 +49,7 @@ function hasWebAccessToken(): boolean {
   }
 }
 
-export const isWebApp = hasWebAccessToken();
+export const isWebApp = !isTauriRuntime();
 
 function useWebTransport(): boolean {
   return isWebApp;
@@ -205,8 +210,12 @@ export const api = {
   getState: () => command<AppState>('get_app_state'),
   checkRegistryHealth: () => command<boolean>('check_registry_health'),
   chooseModelsFolder: async () => {
-    if (isWebApp) throw new Error('Choose the models folder from the Raphael desktop app on the host PC.');
-    const result = await open({ directory: true, multiple: false, title: 'Select your ComfyUI models folder' });
+    if (!isTauriRuntime()) throw new Error('Folder browsing is available only in the Raphael desktop app. Launch Raphael Model Manager with Tauri instead of opening the web page directly.');
+    const result = await open({
+      directory: true,
+      multiple: false,
+      title: 'Select your ComfyUI models folder',
+    });
     return Array.isArray(result) ? result[0] ?? null : result;
   },
   chooseDirectory: async (defaultPath?: string) => {
