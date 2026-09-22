@@ -174,7 +174,7 @@ impl RegistryClient {
 
         let ready = timeout(REGISTRY_STARTUP_TIMEOUT, async {
             loop {
-                if self.is_healthy().await {
+                if self.is_authenticated().await {
                     return Ok::<(), RegistryError>(());
                 }
                 sleep(REGISTRY_STARTUP_POLL).await;
@@ -224,10 +224,12 @@ impl RegistryClient {
             }
         }
 
-        let mut token_files = vec![self.token_file.clone()];
-        for lock_file in self.registry_lock_candidates() {
+        let mut token_files = self.token_file_candidates();
+        for lock_file in self.registry_lock_candidates(&token_files) {
             if let Some(token_file) = token_file_from_lock(&lock_file) {
-                token_files.push(token_file);
+                if !token_files.contains(&token_file) {
+                    token_files.push(token_file);
+                }
             }
         }
 
@@ -244,15 +246,60 @@ impl RegistryClient {
         Err(RegistryError::MissingToken)
     }
 
-    fn registry_lock_candidates(&self) -> Vec<PathBuf> {
+    fn token_file_candidates(&self) -> Vec<PathBuf> {
         let mut candidates = Vec::new();
 
-        if let Some(parent) = self.token_file.parent() {
-            candidates.push(parent.join("registry.lock"));
-        }
+        let mut push_unique = |path: PathBuf| {
+            if !candidates.contains(&path) {
+                candidates.push(path);
+            }
+        };
+
+        push_unique(self.token_file.clone());
 
         if let Some(data_dir) = env::var_os("RAPHAEL_REGISTRY_DATA_DIR") {
-            candidates.push(PathBuf::from(data_dir).join("registry.lock"));
+            push_unique(PathBuf::from(data_dir).join("registry.token"));
+        }
+
+        if let Some(database) = env::var_os("RAPHAEL_REGISTRY_DATABASE") {
+            if let Some(parent) = Path::new(&database).parent() {
+                push_unique(parent.join("registry.token"));
+            }
+        }
+
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            push_unique(
+                PathBuf::from(local_app_data)
+                    .join("Raphael")
+                    .join("ModelRegistry")
+                    .join("data")
+                    .join("registry.token"),
+            );
+        }
+
+        if let Some(app_data) = env::var_os("APPDATA") {
+            push_unique(
+                PathBuf::from(app_data)
+                    .join("Raphael")
+                    .join("ModelRegistry")
+                    .join("data")
+                    .join("registry.token"),
+            );
+        }
+
+        candidates
+    }
+
+    fn registry_lock_candidates(&self, token_files: &[PathBuf]) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+
+        for token_file in token_files {
+            if let Some(parent) = token_file.parent() {
+                let lock = parent.join("registry.lock");
+                if !candidates.contains(&lock) {
+                    candidates.push(lock);
+                }
+            }
         }
 
         candidates
@@ -721,6 +768,29 @@ mod tests {
     fn default_token_path_uses_app_data_when_localappdata_is_missing() {
         std::env::remove_var("LOCALAPPDATA");
         assert!(default_token_path(Path::new("app")).ends_with("registry.token"));
+    }
+
+    #[test]
+    fn lock_token_path_is_resolved_relative_to_lock_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "raphael-registry-lock-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let lock = dir.join("registry.lock");
+        fs::write(
+            &lock,
+            r#"{"token_file":"registry.token"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            token_file_from_lock(&lock),
+            Some(dir.join("registry.token"))
+        );
+
+        let _ = fs::remove_file(lock);
+        let _ = fs::remove_dir(dir);
     }
 
     #[test]
