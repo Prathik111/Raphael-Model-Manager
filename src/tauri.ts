@@ -17,7 +17,30 @@ import type {
   TagRefreshResult,
 } from './types';
 
-export const isWebApp = typeof window !== 'undefined' && !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+function isTauriDevWindow(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return new URLSearchParams(window.location.search).get('tauri_dev') === '1';
+  } catch {
+    return false;
+  }
+}
+
+function hasWebAccessToken(): boolean {
+  if (typeof window === 'undefined' || isTauriDevWindow()) return false;
+  try {
+    if (window.sessionStorage.getItem(WEB_TOKEN_STORAGE_KEY)) return true;
+
+    const rawHash = window.location.hash.startsWith('#')
+      ? window.location.hash.slice(1)
+      : window.location.hash;
+    return Boolean(new URLSearchParams(rawHash).get('access_token'));
+  } catch {
+    return false;
+  }
+}
+
+export const isWebApp = hasWebAccessToken();
 
 const WEB_REQUEST_TIMEOUT_MS = 10_000;
 const WEB_STATUS_TIMEOUT_MS = 4_000;
