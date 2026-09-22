@@ -282,9 +282,8 @@ pub struct TagRefreshResult {
     pub failures: i64,
 }
 
-#[tauri::command]
-pub(crate) async fn refetch_all_model_tags(
-    app: State<'_, AppStateInner>,
+pub(crate) async fn refetch_all_model_tags_inner(
+    app: &AppStateInner,
     handle: AppHandle,
 ) -> AppResult<TagRefreshResult> {
     let candidates: Vec<(i64, String, Vec<String>)> = {
@@ -370,6 +369,14 @@ pub(crate) async fn refetch_all_model_tags(
 
     emit_models_changed(&handle);
     Ok(result)
+}
+
+#[tauri::command]
+pub(crate) async fn refetch_all_model_tags(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+) -> AppResult<TagRefreshResult> {
+    refetch_all_model_tags_inner(app.inner(), handle).await
 }
 
 pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
