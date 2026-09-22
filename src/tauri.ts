@@ -209,6 +209,8 @@ export const api = {
   addSubfolderTags: () => isWebApp ? webTaskCommand<number>('add_subfolder_tags') : command<number>('add_subfolder_tags'),
   setModelTags: (id: number, tags: string[]) =>
     command<ModelRecord>('set_model_tags', { id, tags }),
+  setModelDescription: (id: number, description: string) =>
+    command<ModelRecord>('set_model_description', { id, description }),
   setModelType: (id: number, modelType: string) =>
     command<ModelRecord>('set_model_type', { id, modelType }),
   setModelCoverPosition: (id: number, x: number, y: number) =>
