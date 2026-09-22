@@ -173,6 +173,60 @@ pub(crate) async fn set_model_tags(
     set_model_tags_inner(app.inner(), handle, id, tags).await
 }
 
+#[tauri::command]
+pub(crate) async fn set_model_description(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    description: String,
+) -> AppResult<ModelRecord> {
+    let description = description.trim().to_string();
+    let _ = sync_local_model_to_registry(app.inner(), id).await?;
+
+    let registry_model_id: String = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id FROM models WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?
+    };
+
+    let registry_model = app.registry.get_model(&registry_model_id).await?;
+    app.registry
+        .update_model(
+            &registry_model_id,
+            registry_model.revision,
+            serde_json::json!({
+                "description": if description.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(description.clone())
+                }
+            }),
+        )
+        .await?;
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models SET description=?2,description_user_modified=1,updated_at=?3 WHERE id=?1",
+        rusqlite::params![
+            id,
+            if description.is_empty() {
+                None::<String>
+            } else {
+                Some(description)
+            },
+            now()
+        ],
+    )?;
+    drop(c);
+
+    let rec = model_by_id(&open_db(&app.app_data)?, id)?;
+    emit_models_changed(&handle);
+    Ok(rec)
+}
+
 pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
     let c = open_db(&app.app_data)?;
     let rows: Vec<(i64, String, String)> = {
