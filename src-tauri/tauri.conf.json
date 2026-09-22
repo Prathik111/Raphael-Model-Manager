@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run prepare:reference && npm run dev:supervised",
     "beforeBuildCommand": "npm run prepare:reference && npm run build",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://localhost:1420/?tauri_dev=1",
     "frontendDist": "../dist"
   },
   "app": {
