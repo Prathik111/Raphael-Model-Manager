@@ -309,7 +309,7 @@ pub(crate) async fn refetch_all_model_tags_inner(
     };
 
     for (id, url, local_tags) in candidates {
-        let (model, version) = match fetch_model_and_version(&app, &url).await {
+        let (model, version) = match fetch_model_and_version(app, &url).await {
             Ok(value) => value,
             Err(_) => {
                 result.failures += 1;
@@ -319,7 +319,7 @@ pub(crate) async fn refetch_all_model_tags_inner(
 
         let fetched_tags = civitai_model_tags(&model, &version);
 
-        if sync_local_model_to_registry(&app, id).await.is_err() {
+        if sync_local_model_to_registry(app, id).await.is_err() {
             result.failures += 1;
             continue;
         }
@@ -345,10 +345,10 @@ pub(crate) async fn refetch_all_model_tags_inner(
             .count() as i64;
 
         for tag in &merged {
-            if !registry_tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag)) {
-                if app.registry.add_tag(&registry_model_id, tag).await.is_err() {
-                    result.failures += 1;
-                }
+            if !registry_tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag))
+                && app.registry.add_tag(&registry_model_id, tag).await.is_err()
+            {
+                result.failures += 1;
             }
         }
 
