@@ -156,6 +156,8 @@ impl RegistryClient {
             spawn_registry_executable(&executable, &bind, port, &data_dir, &self.token_file)?
         } else if let Some(executable) = find_registry_executable() {
             spawn_registry_executable(&executable, &bind, port, &data_dir, &self.token_file)?
+        } else if let Some(executable) = registry_command_on_path() {
+            spawn_registry_executable(&executable, &bind, port, &data_dir, &self.token_file)?
         } else if let Some(manifest) = find_registry_workspace_manifest() {
             spawn_registry_cargo(&manifest, &bind, port, &data_dir, &self.token_file)?
         } else {
@@ -539,6 +541,20 @@ fn configure_registry_command(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
+}
+
+fn registry_command_on_path() -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "raphael-registry.exe"
+    } else {
+        "raphael-registry"
+    };
+
+    std::env::var_os("PATH")?.to_str().and_then(|path| {
+        std::env::split_paths(path)
+            .map(|entry| entry.join(name))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 fn find_registry_executable() -> Option<PathBuf> {
