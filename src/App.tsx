@@ -1411,10 +1411,20 @@ function App() {
   const [state,setState]=useState<AppState|null>(null); const [models,setModels]=useState<ModelRecord[]>([]); const [selectedId,setSelectedId]=useState<number|null>(null);
   useEffect(() => {
     if (!state) return;
+
     const loader = document.getElementById('initial-loader');
     if (!loader) return;
-    loader.classList.add('is-ready');
-    const timer = window.setTimeout(() => loader.remove(), 260);
+
+    const startedAt = performance.now();
+    const minimumVisibleMs = api.isWebApp ? 700 : 1200;
+    const elapsed = performance.now() - startedAt;
+    const remaining = Math.max(0, minimumVisibleMs - elapsed);
+
+    const timer = window.setTimeout(() => {
+      loader.classList.add('is-ready');
+      window.setTimeout(() => loader.remove(), 260);
+    }, remaining);
+
     return () => window.clearTimeout(timer);
   }, [state]);
   const refreshGeneration = useRef(0);
