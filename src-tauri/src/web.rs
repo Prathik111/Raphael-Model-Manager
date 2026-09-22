@@ -369,10 +369,11 @@ fn web_url(access_token: &str) -> String {
 }
 
 fn generate_access_token() -> AppResult<String> {
-    let mut bytes = [0u8; 32];
+    let mut bytes = [0u8; 4];
     getrandom::fill(&mut bytes)
         .map_err(|error| AppError::Invalid(format!("Could not generate web access token: {error}")))?;
-    Ok(hex::encode(bytes))
+    let value = 100_000 + (u32::from_le_bytes(bytes) % 900_000);
+    Ok(value.to_string())
 }
 
 fn cookie_token(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -1178,12 +1179,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_access_tokens_are_256_bit_hex_values() {
-        let first = generate_access_token().expect("token generation should succeed");
-        let second = generate_access_token().expect("token generation should succeed");
-        assert_eq!(first.len(), 64);
-        assert!(first.chars().all(|value| value.is_ascii_hexdigit()));
-        assert_ne!(first, second);
+    fn generated_access_tokens_are_six_digit_numbers() {
+        for _ in 0..100 {
+            let token = generate_access_token().expect("token generation should succeed");
+            assert_eq!(token.len(), 6);
+            assert!(token.chars().all(|value| value.is_ascii_digit()));
+            let value: u32 = token.parse().expect("token should be numeric");
+            assert!((100_000..=999_999).contains(&value));
+        }
     }
 
     #[test]
