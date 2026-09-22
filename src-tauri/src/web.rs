@@ -719,8 +719,8 @@ async fn task_start_handler(
             "refetch_all_model_tags" => {
                 let task_handle = handle.clone();
                 Box::pin(async move {
-                    let value = refetch_all_model_tags(
-                        tauri::State::from(&app),
+                    let value = refetch_all_model_tags_inner(
+                        &app,
                         task_handle,
                     ).await?;
                     serde_json::to_value(value)
