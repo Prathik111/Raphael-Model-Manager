@@ -84,6 +84,14 @@ By default Raphael connects to:
 http://127.0.0.1:43217
 ```
 
+At startup, the Manager first checks the Registry `/health` endpoint. If the local Registry is not already running, it automatically starts it and waits for the health check to succeed before beginning the initial Registry synchronization.
+
+For development, the Manager automatically looks for a sibling `Raphael-Model-Registry` checkout and can start its `raphael-registry` binary or fall back to `cargo run -p registry-server -- server`. For an installed build, set the executable explicitly when the Registry binary is not on the system PATH:
+
+```powershell
+$env:RAPHAEL_REGISTRY_EXECUTABLE = "C:\path\to\raphael-registry.exe"
+```
+
 Override the connection with:
 
 ```powershell
@@ -91,5 +99,7 @@ $env:RAPHAEL_REGISTRY_URL = "http://127.0.0.1:43217"
 $env:RAPHAEL_REGISTRY_TOKEN_FILE = "C:\path\to\registry.token"
 # or use RAPHAEL_REGISTRY_AUTH_TOKEN for an explicit bearer token
 ```
+
+Automatic startup is intentionally limited to a local HTTP Registry endpoint. Remote and HTTPS Registry deployments remain externally managed.
 
 Raphael does not open the Registry SQLite database directly. All Registry mutations go through the `/api/v1` HTTP contract.
