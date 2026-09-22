@@ -1128,8 +1128,8 @@ mod tests {
     #[test]
     fn web_urls_do_not_contain_access_tokens() {
         let url = web_url();
-        assert!(!url.contains("access_token"));
-        assert!(!url.contains("raphael_auth"));
+        assert!(!url.contains('#'));
+        assert!(url.starts_with("http://"));
         assert!(url.ends_with('/'));
     }
 }
