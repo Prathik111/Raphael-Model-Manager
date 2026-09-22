@@ -1,4 +1,4 @@
-import { invoke, convertFileSrc, isTauri } from '@tauri-apps/api/core';
+import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import type {
@@ -21,8 +21,17 @@ const WEB_REQUEST_TIMEOUT_MS = 10_000;
 const WEB_STATUS_TIMEOUT_MS = 4_000;
 const WEB_TOKEN_STORAGE_KEY = 'raphael.webToken';
 
-function hasWebAccessToken(): boolean {
+function isTauriDevWindow(): boolean {
   if (typeof window === 'undefined') return false;
+  try {
+    return new URLSearchParams(window.location.search).get('tauri_dev') === '1';
+  } catch {
+    return false;
+  }
+}
+
+function hasWebAccessToken(): boolean {
+  if (typeof window === 'undefined' || isTauriDevWindow()) return false;
   try {
     if (window.sessionStorage.getItem(WEB_TOKEN_STORAGE_KEY)) return true;
 
@@ -35,7 +44,7 @@ function hasWebAccessToken(): boolean {
   }
 }
 
-export const isWebApp = !isTauri() && hasWebAccessToken();
+export const isWebApp = hasWebAccessToken();
 
 function useWebTransport(): boolean {
   return isWebApp;
