@@ -299,7 +299,7 @@ pub(crate) async fn refetch_all_model_tags(
             let tags = serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default();
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, tags))
         })?;
-        rows.collect::<Result<Vec<_>, _>>()?
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
     let mut result = TagRefreshResult {
@@ -320,7 +320,10 @@ pub(crate) async fn refetch_all_model_tags(
 
         let fetched_tags = civitai_model_tags(&model, &version);
 
-        let _ = sync_local_model_to_registry(&app, id).await;
+        if sync_local_model_to_registry(&app, id).await.is_err() {
+            result.failures += 1;
+            continue;
+        }
         let registry_model_id: String = {
             let c = open_db(&app.app_data)?;
             c.query_row(
