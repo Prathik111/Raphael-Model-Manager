@@ -754,7 +754,7 @@ fn local_model_type(model_type: &str) -> String {
         "checkpoint" => "Checkpoint",
         "lora" => "LoRA",
         "vae" => "VAE",
-        "controlnet" => "ControlNet",
+        "controlnet" | "control_net" => "ControlNet",
         "embedding" => "Embedding",
         "upscaler" => "Upscaler",
         "text_encoder" => "Text Encoder",
@@ -995,7 +995,7 @@ async fn sync_local_model_to_registry(
         {
             (
                 app.registry
-                    .create_model(
+                    .create_model_with_legacy_type_fallback(
                         &deterministic_id,
                         local.civitai_name.as_deref().unwrap_or(&local.filename),
                         registry_model_type(&local.model_type),
@@ -4098,7 +4098,14 @@ pub fn run() {
         .expect("error while running Raphael Model Manager");
 }
 
-#[cfg(test)]
+#[test]
+    fn registry_controlnet_type_accepts_legacy_server_spelling() {
+        assert_eq!(registry_model_type("ControlNet"), "controlnet");
+        assert_eq!(local_model_type("controlnet"), "ControlNet");
+        assert_eq!(local_model_type("control_net"), "ControlNet");
+    }
+
+    #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
