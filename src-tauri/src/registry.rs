@@ -54,6 +54,14 @@ pub(crate) struct RegistryModel {
     pub extensions: Value,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct RegistrySearchResult {
+    pub items: Vec<RegistryModel>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub(crate) struct RegistryVersion {
     pub id: String,
