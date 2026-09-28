@@ -35,8 +35,27 @@ function isTauriDevWindow(): boolean {
   }
 }
 
+function isDesktopOrigin(): boolean {
+  if (typeof window === 'undefined') return false;
+
+  const { protocol, hostname } = window.location;
+  return (
+    protocol === 'tauri:' ||
+    protocol === 'asset:' ||
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname === '[::1]'
+  );
+}
+
 function hasWebAccessToken(): boolean {
-  if (typeof window === 'undefined' || isTauriDevWindow()) return false;
+  if (typeof window === 'undefined') return false;
+
+  if (isDesktopOrigin()) {
+    window.sessionStorage.removeItem(WEB_TOKEN_STORAGE_KEY);
+    return false;
+  }
+
   try {
     if (window.sessionStorage.getItem(WEB_TOKEN_STORAGE_KEY)) return true;
 
@@ -49,7 +68,7 @@ function hasWebAccessToken(): boolean {
   }
 }
 
-export const isWebApp = !isTauriRuntime();
+export const isWebApp = !isDesktopOrigin() && hasWebAccessToken();
 
 function useWebTransport(): boolean {
   return isWebApp;
