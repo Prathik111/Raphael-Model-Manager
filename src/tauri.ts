@@ -24,14 +24,6 @@ function isTauriRuntime(): boolean {
   return '__TAURI_INTERNALS__' in window;
 }
 
-function isTauriDevWindow(): boolean {
-  if (typeof window === 'undefined') return false;
-  try {
-    return isTauriRuntime() && new URLSearchParams(window.location.search).get('tauri_dev') === '1';
-  } catch {
-    return false;
-  }
-}
 
 function isDesktopOrigin(): boolean {
   if (typeof window === 'undefined') return false;
@@ -51,7 +43,6 @@ export const isWebApp = !isDesktopOrigin();
 function useWebTransport(): boolean {
   return isWebApp;
 }
-
 
 async function webFetch(
   url: string,
