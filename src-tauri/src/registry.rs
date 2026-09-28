@@ -318,6 +318,49 @@ impl RegistryClient {
         .await
     }
 
+    /// Create a model while tolerating the pre-canonical Registry spelling
+    /// `control_net` used by older local Registry binaries.
+    pub(crate) async fn create_model_with_legacy_type_fallback(
+        &self,
+        id: &str,
+        name: &str,
+        model_type: &str,
+        creator: Option<&str>,
+        description: Option<&str>,
+        base_model: Option<&str>,
+        extensions: Value,
+    ) -> Result<RegistryModel, RegistryError> {
+        match self
+            .create_model(
+                id,
+                name,
+                model_type,
+                creator,
+                description,
+                base_model,
+                extensions.clone(),
+            )
+            .await
+        {
+            Err(RegistryError::Api { status: StatusCode::UNPROCESSABLE_ENTITY, message })
+                if model_type == "controlnet"
+                    && message.contains("unknown variant")
+                    && message.contains("control_net")
+            => self
+                .create_model(
+                    id,
+                    name,
+                    "control_net",
+                    creator,
+                    description,
+                    base_model,
+                    extensions,
+                )
+                .await,
+            result => result,
+        }
+    }
+
     pub(crate) async fn update_model(
         &self,
         id: &str,
