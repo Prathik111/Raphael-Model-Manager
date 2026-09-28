@@ -859,6 +859,95 @@ async fn hydrate_local_model_from_registry(
     model_by_id(&c, local_id)
 }
 
+async fn sync_registry_model_assets(
+    app: &AppStateInner,
+    registry_model_id: &str,
+    thumbnail_path: Option<&str>,
+    cover_path: Option<&str>,
+) {
+    let assets = match app.registry.assets(registry_model_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "Raphael Model Registry asset lookup failed for {registry_model_id}: {error}"
+            );
+            return;
+        }
+    };
+
+    let mut has_thumbnail = assets.iter().any(|asset| {
+        asset.kind.eq_ignore_ascii_case("thumbnail")
+    });
+    let mut has_cover = assets.iter().any(|asset| {
+        asset.kind.eq_ignore_ascii_case("cover")
+    });
+
+    let uploads = [
+        ("thumbnail", thumbnail_path, &mut has_thumbnail),
+        ("cover", cover_path, &mut has_cover),
+    ];
+
+    for (kind, path, present) in uploads {
+        if *present {
+            continue;
+        }
+
+        let Some(path) = path.map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let source_path = Path::new(path);
+        if !source_path.is_file() {
+            continue;
+        }
+
+        let bytes = match fs::read(source_path) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => continue,
+            Err(error) => {
+                eprintln!(
+                    "Raphael Model Registry could not read {kind} asset {}: {error}",
+                    source_path.display()
+                );
+                continue;
+            }
+        };
+
+        let content_type = match source_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("png") => "image/png",
+            Some("webp") => "image/webp",
+            Some("gif") => "image/gif",
+            Some("avif") => "image/avif",
+            _ => "application/octet-stream",
+        };
+
+        match app.registry
+            .upload_asset_content(
+                registry_model_id,
+                kind,
+                Some(path),
+                content_type,
+                bytes,
+            )
+            .await
+        {
+            Ok(_) => {
+                *present = true;
+            }
+            Err(error) => {
+                eprintln!(
+                    "Raphael Model Registry could not upload {kind} asset for {registry_model_id}: {error}"
+                );
+            }
+        }
+    }
+}
+
 async fn sync_local_model_to_registry(
     app: &AppStateInner,
     local_id: i64,
@@ -1046,6 +1135,24 @@ async fn sync_local_model_to_registry(
             ],
         )?;
     }
+
+    let (thumbnail_path, cover_path) = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT thumbnail_path,cover_path FROM models WHERE id=?1",
+            [local_id],
+            |r| Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            )),
+        )?
+    };
+    sync_registry_model_assets(
+        app,
+        &registry_model.id,
+        thumbnail_path.as_deref(),
+        cover_path.as_deref(),
+    ).await;
 
     hydrate_local_model_from_registry(
         app,
