@@ -24,7 +24,7 @@
     "three": "0.128.0"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "2.11.4",
+    "@tauri-apps/cli": "2.11.5",
     "@types/dompurify": "^3.2.0",
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
