@@ -102,6 +102,19 @@ pub(crate) struct RegistrySource {
     pub metadata: Value,
 }
 
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub(crate) struct RegistryAsset {
+    pub id: String,
+    pub model_id: String,
+    pub kind: String,
+    pub path: String,
+    pub source: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct RegistryEvent {
     pub id: i64,
@@ -440,6 +453,35 @@ impl RegistryClient {
             &format!("/api/v1/models/{model_id}/sources"),
         )?)
         .await
+    }
+
+    pub(crate) async fn assets(&self, model_id: &str) -> Result<Vec<RegistryAsset>, RegistryError> {
+        self.send_json(self.request(Method::GET, &format!("/api/v1/models/{model_id}/assets"))?).await
+    }
+
+    pub(crate) async fn upload_asset_content(
+        &self,
+        model_id: &str,
+        kind: &str,
+        source: Option<&str>,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<RegistryAsset, RegistryError> {
+        let mut request = self.request(
+            Method::POST,
+            &format!("/api/v1/models/{model_id}/assets/content"),
+        )?
+        .header("content-type", content_type)
+        .header("x-raphael-asset-kind", kind)
+        .body(bytes);
+        if let Some(source) = source {
+            request = request.header("x-raphael-asset-source", source);
+        }
+        self.send_json(request).await
+    }
+
+    pub(crate) fn asset_content_url(&self, model_id: &str, asset_id: &str) -> String {
+        format!("{}/api/v1/models/{model_id}/assets/{asset_id}/content", self.base_url)
     }
 
     pub(crate) async fn events(&self, after_id: i64) -> Result<Vec<RegistryEvent>, RegistryError> {
