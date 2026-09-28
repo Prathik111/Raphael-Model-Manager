@@ -475,6 +475,45 @@ impl RegistryClient {
         self.send_json(self.request(Method::GET, &format!("/api/v1/models/{model_id}/assets"))?).await
     }
 
+    pub(crate) async fn delete_asset(
+        &self,
+        model_id: &str,
+        asset_id: &str,
+    ) -> Result<(), RegistryError> {
+        self.send_empty(self.request(
+            Method::DELETE,
+            &format!("/api/v1/models/{model_id}/assets/{asset_id}"),
+        )?)
+        .await
+    }
+
+    pub(crate) async fn asset_content(
+        &self,
+        model_id: &str,
+        asset_id: &str,
+    ) -> Result<(String, Vec<u8>), RegistryError> {
+        let response = self
+            .request(
+                Method::GET,
+                &format!("/api/v1/models/{model_id}/assets/{asset_id}/content"),
+            )?
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let message = response.text().await.unwrap_or_default();
+            return Err(RegistryError::Api { status, message });
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = response.bytes().await?.to_vec();
+        Ok((content_type, bytes))
+    }
+
     pub(crate) async fn upload_asset_content(
         &self,
         model_id: &str,
