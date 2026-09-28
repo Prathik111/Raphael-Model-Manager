@@ -1188,6 +1188,7 @@ fn spawn_registry_sync(app: AppStateInner, handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
         retry_pending_registry_file_removals(&retry_state).await;
     });
+
     {
         let mut running = match app.registry_sync_running.lock() {
             Ok(guard) => guard,
@@ -1200,30 +1201,59 @@ fn spawn_registry_sync(app: AppStateInner, handle: AppHandle) {
     }
 
     tauri::async_runtime::spawn(async move {
-        let ids: Vec<i64> = match open_db(&app.app_data).and_then(|c| {
-            let mut stmt = c.prepare("SELECT id FROM models ORDER BY id")?;
-            let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
-            Ok(rows.filter_map(Result::ok).collect())
-        }) {
-            Ok(ids) => ids,
-            Err(_) => {
-                if let Ok(mut running) = app.registry_sync_running.lock() {
-                    *running = false;
-                }
+        let sync_result = async {
+            // A watcher event can arrive after the Registry process has exited.
+            // Re-establish the canonical Registry before attempting writes.
+            if let Err(error) = app.registry.ensure_running().await {
+                eprintln!("Raphael Model Registry sync could not start Registry: {error}");
                 return;
+            }
+
+            let ids: Vec<i64> = match open_db(&app.app_data).and_then(|c| {
+                let mut stmt = c.prepare("SELECT id FROM models ORDER BY id")?;
+                let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+                Ok(rows.filter_map(Result::ok).collect())
+            }) {
+                Ok(ids) => ids,
+                Err(error) => {
+                    eprintln!("Raphael Model Registry sync could not read local models: {error}");
+                    return;
+                }
+            };
+
+            let mut changed = false;
+
+            for id in ids {
+                let mut last_error: Option<String> = None;
+                for attempt in 1..=3 {
+                    match sync_local_model_to_registry(&app, id).await {
+                        Ok(_) => {
+                            changed = true;
+                            last_error = None;
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = Some(error.to_string());
+                            if attempt < 3 {
+                                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(error) = last_error {
+                    eprintln!(
+                        "Raphael Model Registry sync failed for local model {id} after 3 attempts: {error}"
+                    );
+                }
+            }
+
+            if changed {
+                emit_models_changed(&handle);
             }
         };
 
-        let mut changed = false;
-        for id in ids {
-            if sync_local_model_to_registry(&app, id).await.is_ok() {
-                changed = true;
-            }
-        }
-
-        if changed {
-            emit_models_changed(&handle);
-        }
+        sync_result.await;
 
         if let Ok(mut running) = app.registry_sync_running.lock() {
             *running = false;
