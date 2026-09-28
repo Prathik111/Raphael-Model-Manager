@@ -260,6 +260,22 @@ impl RegistryClient {
     }
 
 
+    pub(crate) async fn search_models(
+        &self,
+        query: Option<&str>,
+        model_type: Option<&str>,
+        tag: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<RegistrySearchResult, RegistryError> {
+        let mut request = self.request(Method::GET, "/api/v1/models")?
+            .query(&[("limit", limit.max(1).min(200)), ("offset", offset.max(0))]);
+        if let Some(value) = query { request = request.query(&[("q", value)]); }
+        if let Some(value) = model_type { request = request.query(&[("model_type", value)]); }
+        if let Some(value) = tag { request = request.query(&[("tag", value)]); }
+        self.send_json(request).await
+    }
+
     pub(crate) async fn get_model(&self, id: &str) -> Result<RegistryModel, RegistryError> {
         self.send_json(self.request(Method::GET, &format!("/api/v1/models/{id}"))?).await
     }
