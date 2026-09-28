@@ -1195,7 +1195,7 @@ async fn apply_civitai_metadata_to_registry(
         registry_model_type(&local_type).to_string()
     };
 
-    app.registry.update_model(
+    app.registry.update_model_with_legacy_type_fallback(
         &registry_model_id,
         registry_model.revision,
         json!({
