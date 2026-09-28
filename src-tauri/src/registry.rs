@@ -55,6 +55,7 @@ pub(crate) struct RegistryModel {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct RegistrySearchResult {
     pub items: Vec<RegistryModel>,
     pub total: i64,
@@ -111,6 +112,7 @@ pub(crate) struct RegistrySource {
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct RegistryAsset {
     pub id: String,
     pub model_id: String,
@@ -268,6 +270,7 @@ impl RegistryClient {
     }
 
 
+    #[allow(dead_code)]
     pub(crate) async fn search_models(
         &self,
         query: Option<&str>,
@@ -277,7 +280,7 @@ impl RegistryClient {
         offset: i64,
     ) -> Result<RegistrySearchResult, RegistryError> {
         let mut request = self.request(Method::GET, "/api/v1/models")?
-            .query(&[("limit", limit.max(1).min(200)), ("offset", offset.max(0))]);
+            .query(&[("limit", limit.clamp(1, 200)), ("offset", offset.max(0))]);
         if let Some(value) = query { request = request.query(&[("q", value)]); }
         if let Some(value) = model_type { request = request.query(&[("model_type", value)]); }
         if let Some(value) = tag { request = request.query(&[("tag", value)]); }
@@ -479,10 +482,12 @@ impl RegistryClient {
         .await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn assets(&self, model_id: &str) -> Result<Vec<RegistryAsset>, RegistryError> {
         self.send_json(self.request(Method::GET, &format!("/api/v1/models/{model_id}/assets"))?).await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn delete_asset(
         &self,
         model_id: &str,
@@ -495,6 +500,7 @@ impl RegistryClient {
         .await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn asset_content(
         &self,
         model_id: &str,
@@ -522,6 +528,7 @@ impl RegistryClient {
         Ok((content_type, bytes))
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn upload_asset_content(
         &self,
         model_id: &str,
@@ -543,6 +550,7 @@ impl RegistryClient {
         self.send_json(request).await
     }
 
+    #[allow(dead_code)]
     pub(crate) fn asset_content_url(&self, model_id: &str, asset_id: &str) -> String {
         format!("{}/api/v1/models/{model_id}/assets/{asset_id}/content", self.base_url)
     }
