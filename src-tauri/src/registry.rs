@@ -394,6 +394,32 @@ impl RegistryClient {
         unreachable!("registry model update retry loop always returns")
     }
 
+    pub(crate) async fn update_model_with_legacy_type_fallback(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        patch: Value,
+    ) -> Result<RegistryModel, RegistryError> {
+        match self.update_model(id, expected_revision, patch.clone()).await {
+            Err(RegistryError::Api { status: StatusCode::UNPROCESSABLE_ENTITY, message })
+                if patch
+                    .get("model_type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == "controlnet")
+                    && message.contains("unknown variant")
+                    && message.contains("control_net")
+            => {
+                let mut legacy_patch = match patch {
+                    Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                legacy_patch.insert("model_type".into(), json!("control_net"));
+                self.update_model(id, expected_revision, Value::Object(legacy_patch)).await
+            }
+            result => result,
+        }
+    }
+
     pub(crate) async fn versions(&self, id: &str) -> Result<Vec<RegistryVersion>, RegistryError> {
         self.send_json(self.request(Method::GET, &format!("/api/v1/models/{id}/versions"))?)
             .await
