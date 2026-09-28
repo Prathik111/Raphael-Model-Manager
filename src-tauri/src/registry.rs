@@ -54,6 +54,15 @@ pub(crate) struct RegistryModel {
     pub extensions: Value,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct RegistrySearchResult {
+    pub items: Vec<RegistryModel>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub(crate) struct RegistryVersion {
     pub id: String,
@@ -100,6 +109,20 @@ pub(crate) struct RegistrySource {
     pub imported_at: i64,
     #[serde(default)]
     pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct RegistryAsset {
+    pub id: String,
+    pub model_id: String,
+    pub kind: String,
+    pub path: String,
+    pub source: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -246,6 +269,23 @@ impl RegistryClient {
         Err(RegistryError::Api { status, message })
     }
 
+
+    #[allow(dead_code)]
+    pub(crate) async fn search_models(
+        &self,
+        query: Option<&str>,
+        model_type: Option<&str>,
+        tag: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<RegistrySearchResult, RegistryError> {
+        let mut request = self.request(Method::GET, "/api/v1/models")?
+            .query(&[("limit", limit.clamp(1, 200)), ("offset", offset.max(0))]);
+        if let Some(value) = query { request = request.query(&[("q", value)]); }
+        if let Some(value) = model_type { request = request.query(&[("model_type", value)]); }
+        if let Some(value) = tag { request = request.query(&[("tag", value)]); }
+        self.send_json(request).await
+    }
 
     pub(crate) async fn get_model(&self, id: &str) -> Result<RegistryModel, RegistryError> {
         self.send_json(self.request(Method::GET, &format!("/api/v1/models/{id}"))?).await
@@ -440,6 +480,79 @@ impl RegistryClient {
             &format!("/api/v1/models/{model_id}/sources"),
         )?)
         .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn assets(&self, model_id: &str) -> Result<Vec<RegistryAsset>, RegistryError> {
+        self.send_json(self.request(Method::GET, &format!("/api/v1/models/{model_id}/assets"))?).await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn delete_asset(
+        &self,
+        model_id: &str,
+        asset_id: &str,
+    ) -> Result<(), RegistryError> {
+        self.send_empty(self.request(
+            Method::DELETE,
+            &format!("/api/v1/models/{model_id}/assets/{asset_id}"),
+        )?)
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn asset_content(
+        &self,
+        model_id: &str,
+        asset_id: &str,
+    ) -> Result<(String, Vec<u8>), RegistryError> {
+        let response = self
+            .request(
+                Method::GET,
+                &format!("/api/v1/models/{model_id}/assets/{asset_id}/content"),
+            )?
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let message = response.text().await.unwrap_or_default();
+            return Err(RegistryError::Api { status, message });
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = response.bytes().await?.to_vec();
+        Ok((content_type, bytes))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn upload_asset_content(
+        &self,
+        model_id: &str,
+        kind: &str,
+        source: Option<&str>,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<RegistryAsset, RegistryError> {
+        let mut request = self.request(
+            Method::POST,
+            &format!("/api/v1/models/{model_id}/assets/content"),
+        )?
+        .header("content-type", content_type)
+        .header("x-raphael-asset-kind", kind)
+        .body(bytes);
+        if let Some(source) = source {
+            request = request.header("x-raphael-asset-source", source);
+        }
+        self.send_json(request).await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn asset_content_url(&self, model_id: &str, asset_id: &str) -> String {
+        format!("{}/api/v1/models/{model_id}/assets/{asset_id}/content", self.base_url)
     }
 
     pub(crate) async fn events(&self, after_id: i64) -> Result<Vec<RegistryEvent>, RegistryError> {
