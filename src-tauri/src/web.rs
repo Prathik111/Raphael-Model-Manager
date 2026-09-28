@@ -1091,7 +1091,7 @@ mod tests {
     fn web_urls_use_host_ip_and_port_without_credentials() {
         let url = web_url();
         assert!(url.starts_with("http://"));
-        assert!(!url.contains("#access_token="));
-        assert!(!url.contains("?access_token="));
+        assert!(!url.contains('#'));
+        assert!(!url.contains('?'));
     }
 }
