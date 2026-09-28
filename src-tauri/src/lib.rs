@@ -4098,18 +4098,18 @@ pub fn run() {
         .expect("error while running Raphael Model Manager");
 }
 
-#[test]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+
+    #[test]
     fn registry_controlnet_type_accepts_legacy_server_spelling() {
         assert_eq!(registry_model_type("ControlNet"), "controlnet");
         assert_eq!(local_model_type("controlnet"), "ControlNet");
         assert_eq!(local_model_type("control_net"), "ControlNet");
     }
-
-    #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
     fn test_state(app_data: PathBuf, models_root: PathBuf) -> AppStateInner {
         AppStateInner {
             app_data: app_data.clone(),
