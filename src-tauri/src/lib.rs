@@ -456,6 +456,10 @@ fn initialize_db_schema(c: &Connection) -> AppResult<()> {
     if has_tag_lock==0 { c.execute("ALTER TABLE models ADD COLUMN tags_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     let has_type_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='model_type_user_modified'",[],|r|r.get(0))?;
     if has_type_lock==0 { c.execute("ALTER TABLE models ADD COLUMN model_type_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
+    let has_name_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='name_user_modified'",[],|r|r.get(0))?;
+    if has_name_lock==0 { c.execute("ALTER TABLE models ADD COLUMN name_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
+    let has_description_lock:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='description_user_modified'",[],|r|r.get(0))?;
+    if has_description_lock==0 { c.execute("ALTER TABLE models ADD COLUMN description_user_modified INTEGER NOT NULL DEFAULT 0",[])?; }
     let has_cover_path:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_path'",[],|r|r.get(0))?;
     if has_cover_path==0 { c.execute("ALTER TABLE models ADD COLUMN cover_path TEXT",[])?; }
     let has_cover_x:i64=c.query_row("SELECT COUNT(*) FROM pragma_table_info('models') WHERE name='cover_position_x'",[],|r|r.get(0))?;
