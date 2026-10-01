@@ -11,6 +11,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     process::Command,
+    sync::Mutex as AsyncMutex,
     time::{sleep, timeout},
 };
 use url::Url;
@@ -136,6 +137,7 @@ pub(crate) struct RegistryClient {
     base_url: String,
     token_file: PathBuf,
     client: Client,
+    startup_lock: std::sync::Arc<AsyncMutex<()>>,
 }
 
 impl RegistryClient {
@@ -156,10 +158,19 @@ impl RegistryClient {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()?,
+            startup_lock: std::sync::Arc::new(AsyncMutex::new(())),
         })
     }
 
     pub(crate) async fn ensure_running(&self) -> Result<(), RegistryError> {
+        if self.is_healthy().await {
+            return Ok(());
+        }
+
+        let _startup_guard = self.startup_lock.lock().await;
+
+        // Another Manager operation may have started the Registry while this
+        // task was waiting for the startup lock.
         if self.is_healthy().await {
             return Ok(());
         }
@@ -247,7 +258,19 @@ impl RegistryClient {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<T, RegistryError> {
-        let response = request.send().await?;
+        let retry = request.try_clone();
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) if error.is_connect() => {
+                self.ensure_running().await?;
+                retry
+                    .ok_or_else(|| RegistryError::Http(error))?
+                    .send()
+                    .await?
+            }
+            Err(error) => return Err(RegistryError::Http(error)),
+        };
+
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -260,7 +283,19 @@ impl RegistryClient {
     }
 
     async fn send_empty(&self, request: reqwest::RequestBuilder) -> Result<(), RegistryError> {
-        let response = request.send().await?;
+        let retry = request.try_clone();
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) if error.is_connect() => {
+                self.ensure_running().await?;
+                retry
+                    .ok_or_else(|| RegistryError::Http(error))?
+                    .send()
+                    .await?
+            }
+            Err(error) => return Err(RegistryError::Http(error)),
+        };
+
         let status = response.status();
         if status.is_success() {
             return Ok(());
@@ -575,13 +610,23 @@ impl RegistryClient {
         model_id: &str,
         asset_id: &str,
     ) -> Result<(String, Vec<u8>), RegistryError> {
-        let response = self
-            .request(
-                Method::GET,
-                &format!("/api/v1/models/{model_id}/assets/{asset_id}/content"),
-            )?
-            .send()
-            .await?;
+        let request = self.request(
+            Method::GET,
+            &format!("/api/v1/models/{model_id}/assets/{asset_id}/content"),
+        )?;
+        let retry = request.try_clone();
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) if error.is_connect() => {
+                self.ensure_running().await?;
+                retry
+                    .ok_or_else(|| RegistryError::Http(error))?
+                    .send()
+                    .await?
+            }
+            Err(error) => return Err(RegistryError::Http(error)),
+        };
+
         let status = response.status();
         if !status.is_success() {
             let message = response.text().await.unwrap_or_default();
