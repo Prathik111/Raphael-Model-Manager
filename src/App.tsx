@@ -1293,7 +1293,7 @@ function Inspector({ model, images, allTags, galleryHasMore, galleryFetchBusy, r
     </div>
     <div className="inspector-tabs">{(['overview','examples','files'] as const).map(t=><button className={tab===t?'active':''} onClick={()=>setTab(t)} key={t}>{t.toUpperCase()}</button>)}</div>
     {tab==='overview' && <div className="inspector-scroll">
-      <section><div className="section-head">DESCRIPTION</div><p className="description">{model.description || 'No description cached from Civitai.'}</p></section>
+      <section><div className="section-head section-head-row"><span>MODEL DETAILS</span><span className="section-action">EDITABLE</span></div><MetadataEditor model={model} onSave={onSaveMetadata}/></section>
       <section><div className="section-head">ACTIVATION PROMPTS</div>{promptText ? <><div className="prompt-box">{promptText}</div><button className="text-btn" onClick={()=>navigator.clipboard?.writeText(promptText)}>COPY ALL</button></> : <div className="empty-inline">No activation prompts were published for this version.</div>}</section>
       <section><div className="section-head section-head-row"><span>TAGS</span><span className="section-action">EDITABLE</span></div><TagEditor model={model} allTags={allTags} onSave={onSaveTags} onFilter={onFilterTag}/></section>
       <section><div className="section-head">LOCATION</div><div className="mono-box">{model.path}</div><button className="text-btn" disabled={api.isWebApp} title={api.isWebApp ? 'Opening the Windows file manager is available only in the desktop app' : undefined} onClick={()=>api.openFolder(model.path)}>{api.isWebApp ? 'OPEN FOLDER · DESKTOP' : 'OPEN FOLDER'}</button></section>
