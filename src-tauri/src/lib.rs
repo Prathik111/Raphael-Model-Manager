@@ -2683,55 +2683,234 @@ async fn download_file(
     task_id: &str,
     path: PathBuf,
 ) -> AppResult<(PathBuf, i64, String)> {
+    const MAX_ATTEMPTS: usize = 6;
+    const RETRY_BASE_SECS: u64 = 2;
+
     fs::create_dir_all(target_dir)?;
     let client = civitai_client(app)?;
-    let mut req = client.get(url);
-    if let Some(t) = token() {
-        req = req.bearer_auth(t);
-    }
-
-    let res = req.send().await?;
-    if !res.status().is_success() {
-        return Err(AppError::Api(format!("Download failed: {}", res.status())));
-    }
-    let response_total = res.content_length().map(|x| x as i64);
-    set_download_progress(&progress, task_id, |p| {
-        p.phase = "DOWNLOADING".into();
-        p.total_bytes = response_total;
-        p.percent = response_total.filter(|x| *x > 0).map(|_| 0.0);
-        p.error = None;
-    });
-
     let partial = path.with_extension(format!(
         "{}.part",
         path.extension().and_then(|x| x.to_str()).unwrap_or("bin")
     ));
-    let mut file = File::create(&partial)?;
-    let mut stream = res.bytes_stream();
-    let mut total = 0i64;
-    let mut hasher = Sha256::new();
 
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
-        total += bytes.len() as i64;
-        hasher.update(&bytes);
-        file.write_all(&bytes)?;
-        set_download_progress(&progress, task_id, |p| {
-            p.downloaded_bytes = total;
-            p.total_bytes = response_total.or(p.total_bytes);
-            p.percent = p.total_bytes
-                .filter(|x| *x > 0)
-                .map(|x| (total as f64 / x as f64 * 100.0).clamp(0.0, 100.0));
-        });
+    let mut downloaded = fs::metadata(&partial)
+        .ok()
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let mut total_size: Option<i64> = None;
+    let mut attempt = 0usize;
+
+    set_download_progress(&progress, task_id, |p| {
+        p.phase = if downloaded > 0 {
+            "RESUMING".into()
+        } else {
+            "DOWNLOADING".into()
+        };
+        p.downloaded_bytes = downloaded as i64;
+        p.error = None;
+    });
+
+    while downloaded == 0 || attempt < MAX_ATTEMPTS {
+        attempt += 1;
+
+        let mut req = client.get(url);
+        if let Some(t) = token() {
+            req = req.bearer_auth(t);
+        }
+        if downloaded > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={downloaded}-"));
+        }
+
+        let response = match req.send().await {
+            Ok(response) => response,
+            Err(error) if attempt < MAX_ATTEMPTS => {
+                set_download_progress(&progress, task_id, |p| {
+                    p.phase = format!("RETRYING ({attempt}/{MAX_ATTEMPTS})");
+                    p.error = Some(format!("Network error: {error}"));
+                });
+                tokio::time::sleep(Duration::from_secs(
+                    RETRY_BASE_SECS.saturating_mul(attempt as u64),
+                ))
+                .await;
+                continue;
+            }
+            Err(error) => return Err(AppError::Network(error)),
+        };
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE && downloaded > 0 {
+            // The saved partial file is no longer compatible with the remote
+            // object. Restart cleanly rather than looping on byte-range errors.
+            let _ = fs::remove_file(&partial);
+            downloaded = 0;
+            total_size = None;
+            if attempt < MAX_ATTEMPTS {
+                set_download_progress(&progress, task_id, |p| {
+                    p.phase = format!("RESTARTING ({attempt}/{MAX_ATTEMPTS})");
+                    p.downloaded_bytes = 0;
+                    p.error = Some("Civitai rejected the resume range; restarting download".into());
+                });
+                tokio::time::sleep(Duration::from_secs(RETRY_BASE_SECS)).await;
+                continue;
+            }
+        }
+
+        if status.is_success() {
+            let resuming = downloaded > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+
+            if downloaded > 0 && !resuming {
+                // Some storage endpoints ignore Range and return the complete
+                // object with 200. Appending that would corrupt the model, so
+                // restart from byte 0.
+                downloaded = 0;
+                total_size = None;
+                let _ = fs::remove_file(&partial);
+            }
+
+            let response_total = if resuming {
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_content_range_total)
+                    .or_else(|| {
+                        response
+                            .content_length()
+                            .and_then(|remaining| downloaded.checked_add(remaining as u64))
+                            .map(|value| value as i64)
+                    })
+            } else {
+                response.content_length().map(|value| value as i64)
+            };
+
+            if response_total.is_some() {
+                total_size = response_total.or(total_size);
+            }
+
+            set_download_progress(&progress, task_id, |p| {
+                p.phase = if resuming {
+                    "RESUMING".into()
+                } else {
+                    "DOWNLOADING".into()
+                };
+                p.downloaded_bytes = downloaded as i64;
+                p.total_bytes = total_size.or(p.total_bytes);
+                p.percent = p.total_bytes
+                    .filter(|x| *x > 0)
+                    .map(|x| (downloaded as f64 / x as f64 * 100.0).clamp(0.0, 100.0));
+                p.error = None;
+            });
+
+            let mut file = if resuming {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&partial)?
+            } else {
+                File::create(&partial)?
+            };
+
+            let mut stream = response.bytes_stream();
+            let stream_result = async {
+                while let Some(chunk) = stream.next().await {
+                    let bytes = chunk?;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+
+                    file.write_all(&bytes)?;
+                    downloaded = downloaded.saturating_add(bytes.len() as u64);
+
+                    let current = downloaded as i64;
+                    set_download_progress(&progress, task_id, |p| {
+                        p.downloaded_bytes = current;
+                        p.total_bytes = total_size.or(p.total_bytes);
+                        p.percent = p.total_bytes
+                            .filter(|x| *x > 0)
+                            .map(|x| (current as f64 / x as f64 * 100.0).clamp(0.0, 100.0));
+                    });
+                }
+
+                file.flush()?;
+                Ok::<(), AppError>(())
+            }
+            .await;
+
+            match stream_result {
+                Ok(()) => break,
+                Err(AppError::Network(error)) if attempt < MAX_ATTEMPTS => {
+                    set_download_progress(&progress, task_id, |p| {
+                        p.phase = format!("RETRYING ({attempt}/{MAX_ATTEMPTS})");
+                        p.error = Some(format!("Connection interrupted; resuming: {error}"));
+                    });
+                    tokio::time::sleep(Duration::from_secs(
+                        RETRY_BASE_SECS.saturating_mul(attempt as u64),
+                    ))
+                    .await;
+                    continue;
+                }
+                Err(AppError::Io(error)) if attempt < MAX_ATTEMPTS => {
+                    // Retry transient file-stream write/flush failures as well.
+                    // The partial file is retained so a later attempt resumes.
+                    set_download_progress(&progress, task_id, |p| {
+                        p.phase = format!("RETRYING ({attempt}/{MAX_ATTEMPTS})");
+                        p.error = Some(format!("Download I/O interrupted; resuming: {error}"));
+                    });
+                    tokio::time::sleep(Duration::from_secs(
+                        RETRY_BASE_SECS.saturating_mul(attempt as u64),
+                    ))
+                    .await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error();
+
+            if retryable && attempt < MAX_ATTEMPTS {
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(RETRY_BASE_SECS.saturating_mul(attempt as u64))
+                    .clamp(1, 60);
+
+                set_download_progress(&progress, task_id, |p| {
+                    p.phase = format!("RETRYING ({attempt}/{MAX_ATTEMPTS})");
+                    p.error = Some(format!("Civitai returned {status}; retrying in {retry_after}s"));
+                });
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                continue;
+            }
+
+            return Err(AppError::Api(format!(
+                "Civitai download failed with HTTP {status}. The download URL may have expired or been denied."
+            )));
+        }
     }
 
-    file.flush()?;
+    let actual_size = fs::metadata(&partial)
+        .map(|m| m.len())
+        .map_err(AppError::Io)?;
+
+    if actual_size == 0 {
+        let _ = fs::remove_file(&partial);
+        return Err(AppError::Api("Civitai returned an empty model file".into()));
+    }
+
     set_download_progress(&progress, task_id, |p| {
-        p.downloaded_bytes = total;
+        p.downloaded_bytes = actual_size as i64;
+        p.total_bytes = total_size.or(p.total_bytes);
         p.percent = Some(100.0);
         p.phase = "VERIFYING".into();
+        p.error = None;
     });
-    let actual_sha256 = hex::encode(hasher.finalize());
+
+    let actual_sha256 = sha256_file(&partial)?;
 
     if let Some(expected) = expected_sha256 {
         if actual_sha256 != expected.to_ascii_lowercase() {
@@ -2746,7 +2925,32 @@ async fn download_file(
         let _ = fs::remove_file(&partial);
         return Err(AppError::Io(error));
     }
-    Ok((path, total, actual_sha256))
+
+    Ok((path, actual_size as i64, actual_sha256))
+}
+
+fn parse_content_range_total(value: &str) -> Option<i64> {
+    let total = value.rsplit('/').next()?.trim();
+    if total == "*" {
+        return None;
+    }
+    total.parse::<i64>().ok().filter(|value| *value > 0)
+}
+
+fn sha256_file(path: &Path) -> AppResult<String> {
+    let mut file = BufReader::new(File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hex::encode(hasher.finalize()))
 }
 
 
@@ -2890,16 +3094,38 @@ async fn install_civitai_model(
             set_download_progress(&task_progress, &task_id, |p| { p.phase = "QUEUED".into(); });
             let (path, size, hash) = {
                 let _slot = acquire_download_slot(&state).await?;
-                set_download_progress(&task_progress, &task_id, |p| { p.phase = "STARTING".into(); });
+                set_download_progress(&task_progress, &task_id, |p| {
+                    p.phase = "STARTING".into();
+                    p.error = None;
+                });
+
+                let (fresh_url, fresh_sha256) = match fetch_model_and_version(&state, &url).await {
+                    Ok((_fresh_model, fresh_version)) => {
+                        let (fresh_url, _fresh_size, _fresh_filename, fresh_sha256) =
+                            selected_file(&fresh_version)
+                                .ok_or_else(|| AppError::Api(
+                                    "No downloadable public file found for this Civitai version".into()
+                                ))?;
+                        (fresh_url, fresh_sha256)
+                    }
+                    Err(error) => {
+                        set_download_progress(&task_progress, &task_id, |p| {
+                            p.phase = "RETRYING METADATA".into();
+                            p.error = Some(error.to_string());
+                        });
+                        (dl.clone(), sha256.clone())
+                    }
+                };
+
                 download_file(
-                &state,
-                &dl,
-                &target,
-                &filename,
-                sha256.as_deref(),
-                task_progress.clone(),
-                &task_id,
-                reserved_path.clone(),
+                    &state,
+                    &fresh_url,
+                    &target,
+                    &filename,
+                    fresh_sha256.as_deref().or(sha256.as_deref()),
+                    task_progress.clone(),
+                    &task_id,
+                    reserved_path.clone(),
                 ).await?
             };
 
@@ -4307,6 +4533,14 @@ mod tests {
         );
         assert!(model_id_and_version("https://example.com/models/12345").is_err());
         assert!(model_id_and_version("https://civitai.com/images/12345").is_err());
+    }
+
+    #[test]
+    fn content_range_total_is_parsed() {
+        assert_eq!(parse_content_range_total("bytes 100-199/1000"), Some(1000));
+        assert_eq!(parse_content_range_total("bytes */1000"), Some(1000));
+        assert_eq!(parse_content_range_total("bytes 100-199/*"), None);
+        assert_eq!(parse_content_range_total("not-a-range"), None);
     }
 
     #[test]
