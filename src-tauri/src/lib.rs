@@ -1435,10 +1435,10 @@ fn civitai_client(_app: &AppStateInner) -> AppResult<Client> {
         // Civitai serves binary assets directly. Disable automatic content
         // decoding and request the identity encoding so malformed CDN
         // Content-Encoding headers cannot break the response stream.
-        .gzip(false)
-        .brotli(false)
-        .zstd(false)
-        .deflate(false)
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
         .build()?)
 }
 
@@ -1448,10 +1448,10 @@ fn civitai_download_client() -> AppResult<Client> {
         // A model download can legitimately take many minutes or hours.
         // Use a bounded connection timeout but no whole-request deadline.
         .connect_timeout(Duration::from_secs(30))
-        .gzip(false)
-        .brotli(false)
-        .zstd(false)
-        .deflate(false)
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
         .build()?)
 }
 fn token() -> Option<String> {
