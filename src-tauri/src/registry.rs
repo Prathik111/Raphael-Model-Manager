@@ -38,6 +38,8 @@ pub(crate) enum RegistryError {
     ExecutableNotFound,
     #[error("Registry did not become available before the startup timeout")]
     StartupTimeout,
+    #[error("Registry is running but does not provide the required Raphael asset API")]
+    IncompatibleApi,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -163,16 +165,22 @@ impl RegistryClient {
     }
 
     pub(crate) async fn ensure_running(&self) -> Result<(), RegistryError> {
-        if self.is_healthy().await {
+        if self.is_ready().await {
             return Ok(());
         }
 
         let _startup_guard = self.startup_lock.lock().await;
 
-        // Another Manager operation may have started the Registry while this
-        // task was waiting for the startup lock.
-        if self.is_healthy().await {
+        // Another Manager operation may have started or repaired the Registry
+        // while this task was waiting for the startup lock.
+        if self.is_ready().await {
             return Ok(());
+        }
+
+        // A healthy process that fails the capability check is an older local
+        // Registry binary. Replace it before starting the current one.
+        if self.is_healthy().await {
+            self.stop_stale_local_registry_locked().await?;
         }
 
         let (bind, port) = local_http_registry_endpoint(&self.base_url)?;
@@ -200,9 +208,17 @@ impl RegistryClient {
 
         let ready = timeout(REGISTRY_STARTUP_TIMEOUT, async {
             loop {
-                if self.is_healthy().await {
+                if self.is_ready().await {
                     return Ok::<(), RegistryError>(());
                 }
+
+                // The listener is healthy as soon as an old incompatible
+                // binary starts, so fail fast instead of waiting 180 seconds.
+                if self.is_healthy().await && !self.has_required_asset_api().await {
+                    let _ = child.kill().await;
+                    return Err(RegistryError::IncompatibleApi);
+                }
+
                 sleep(REGISTRY_STARTUP_POLL).await;
             }
         })
@@ -228,6 +244,28 @@ impl RegistryClient {
             .await
             .map(|response| response.status().is_success())
             .unwrap_or(false)
+    }
+
+    async fn has_required_asset_api(&self) -> bool {
+        self.client
+            .get(format!("{}/api/v1/capabilities", self.base_url))
+            .send()
+            .await
+            .ok()
+            .and_then(|response| async {
+                if !response.status().is_success() {
+                    return None;
+                }
+                response.json::<RegistryCapabilities>().await.ok()
+            }.await)
+            .map(|capabilities| {
+                capabilities.api_version == "v1" && capabilities.asset_content_upload
+            })
+            .unwrap_or(false)
+    }
+
+    async fn is_ready(&self) -> bool {
+        self.is_healthy().await && self.has_required_asset_api().await
     }
 
     fn token(&self) -> Result<String, RegistryError> {
@@ -666,8 +704,8 @@ impl RegistryClient {
             Err(RegistryError::Api { status, .. }) if status == StatusCode::NOT_FOUND => {
                 // A previous Registry binary can still be healthy on the port
                 // while not implementing the canonical binary asset endpoint.
-                // Replace that stale local instance with the current Registry
-                // executable/source and retry once.
+                // Serialize replacement so concurrent uploads cannot kill the
+                // newly-started Registry underneath each other.
                 self.restart_stale_local_registry().await?;
 
                 let mut retry = self
@@ -685,6 +723,25 @@ impl RegistryClient {
     }
 
     async fn restart_stale_local_registry(&self) -> Result<(), RegistryError> {
+        let _startup_guard = self.startup_lock.lock().await;
+
+        // Another concurrent uploader may already have repaired the Registry.
+        if self.is_ready().await {
+            return Ok(());
+        }
+
+        if !self.is_healthy().await {
+            drop(_startup_guard);
+            return self.ensure_running().await;
+        }
+
+        self.stop_stale_local_registry_locked().await?;
+
+        drop(_startup_guard);
+        self.ensure_running().await
+    }
+
+    async fn stop_stale_local_registry_locked(&self) -> Result<(), RegistryError> {
         let (bind, _port) = local_http_registry_endpoint(&self.base_url)?;
         let pid_path = self
             .token_file
@@ -721,7 +778,7 @@ impl RegistryClient {
             sleep(Duration::from_millis(150)).await;
         }
 
-        self.ensure_running().await
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -894,14 +951,11 @@ fn find_registry_executable() -> Option<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(current_exe) = env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            candidates.push(parent.join(binary_name));
-            candidates.push(parent.join("resources").join(binary_name));
-        }
-
         for ancestor in current_exe.ancestors() {
             if ancestor.file_name().and_then(|name| name.to_str()) == Some("Raphael-Model-Manager") {
                 if let Some(projects) = ancestor.parent() {
+                    // Development builds should prefer the local Registry
+                    // workspace binary so source changes are used immediately.
                     candidates.push(
                         projects
                             .join("Raphael-Model-Registry")
@@ -917,6 +971,16 @@ fn find_registry_executable() -> Option<PathBuf> {
                 }
             }
         }
+
+        // Packaged Manager builds keep the bundled Registry beside the app.
+        candidates.push(current_exe.parent().unwrap_or_else(|| Path::new(".")).join(binary_name));
+        candidates.push(
+            current_exe
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("resources")
+                .join(binary_name),
+        );
     }
 
     candidates.push(
