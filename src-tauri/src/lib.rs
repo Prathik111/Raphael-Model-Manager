@@ -2958,23 +2958,6 @@ fn parse_content_range_total(value: &str) -> Option<i64> {
     total.parse::<i64>().ok().filter(|value| *value > 0)
 }
 
-fn sha256_file(path: &Path) -> AppResult<String> {
-    let mut file = BufReader::new(File::open(path)?);
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
-
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok(hex::encode(hasher.finalize()))
-}
-
-
 #[tauri::command]
 async fn install_civitai_model(
     app: State<'_, AppStateInner>,
