@@ -255,9 +255,7 @@ export const api = {
   setParallelDownloads: (value: number) =>
     command<number>('set_parallel_downloads', { value }),
   setModelMetadata: (id: number, name: string, description: string) =>
-    useWebTransport()
-      ? webTaskCommand<ModelRecord>('set_model_metadata', { id, name, description })
-      : command<ModelRecord>('set_model_metadata', { id, name, description }),
+    command<ModelRecord>('set_model_metadata', { id, name, description }),
   clearDownloadProgress: (taskId: string) =>
     command<void>('clear_download_progress', { taskId }),
   refreshModel: (id: number) =>
