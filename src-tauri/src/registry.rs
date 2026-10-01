@@ -651,17 +651,77 @@ impl RegistryClient {
         content_type: &str,
         bytes: Vec<u8>,
     ) -> Result<RegistryAsset, RegistryError> {
-        let mut request = self.request(
-            Method::POST,
-            &format!("/api/v1/models/{model_id}/assets/content"),
-        )?
-        .header("content-type", content_type)
-        .header("x-raphael-asset-kind", kind)
-        .body(bytes);
+        let path = format!("/api/v1/models/{model_id}/assets/content");
+        let mut request = self
+            .request(Method::POST, &path)?
+            .header("content-type", content_type)
+            .header("x-raphael-asset-kind", kind)
+            .body(bytes.clone());
         if let Some(source) = source {
             request = request.header("x-raphael-asset-source", source);
         }
-        self.send_json(request).await
+
+        match self.send_json(request).await {
+            Ok(asset) => Ok(asset),
+            Err(RegistryError::Api { status, .. }) if status == StatusCode::NOT_FOUND => {
+                // A previous Registry binary can still be healthy on the port
+                // while not implementing the canonical binary asset endpoint.
+                // Replace that stale local instance with the current Registry
+                // executable/source and retry once.
+                self.restart_stale_local_registry().await?;
+
+                let mut retry = self
+                    .request(Method::POST, &path)?
+                    .header("content-type", content_type)
+                    .header("x-raphael-asset-kind", kind)
+                    .body(bytes);
+                if let Some(source) = source {
+                    retry = retry.header("x-raphael-asset-source", source);
+                }
+                self.send_json(retry).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn restart_stale_local_registry(&self) -> Result<(), RegistryError> {
+        let (bind, _port) = local_http_registry_endpoint(&self.base_url)?;
+        let pid_path = self
+            .token_file
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| RegistryError::ExecutableNotFound)?
+            .join("registry.pid");
+
+        let pid = fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+
+        if let Some(pid) = pid {
+            if pid != std::process::id() {
+                terminate_local_registry_process(pid).await?;
+            }
+        } else if self.is_healthy().await {
+            return Err(RegistryError::Api {
+                status: StatusCode::CONFLICT,
+                message: format!(
+                    "Registry at {bind} is healthy but does not expose the current asset API, and its managed PID could not be determined"
+                ),
+            });
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while self.is_healthy().await {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(RegistryError::Api {
+                    status: StatusCode::CONFLICT,
+                    message: "The stale local Registry process could not be stopped".into(),
+                });
+            }
+            sleep(Duration::from_millis(150)).await;
+        }
+
+        self.ensure_running().await
     }
 
     #[allow(dead_code)]
@@ -784,6 +844,47 @@ fn registry_command_on_path() -> Option<PathBuf> {
     })
 }
 
+async fn terminate_local_registry_process(pid: u32) -> Result<(), RegistryError> {
+    #[cfg(windows)]
+    {
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .await?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(RegistryError::Api {
+            status: StatusCode::CONFLICT,
+            message: format!("taskkill could not terminate Registry process {pid}"),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        let status = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .await?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(RegistryError::Api {
+            status: StatusCode::CONFLICT,
+            message: format!("kill could not terminate Registry process {pid}"),
+        });
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        Err(RegistryError::Api {
+            status: StatusCode::CONFLICT,
+            message: "Automatic stale Registry replacement is unsupported on this platform".into(),
+        })
+    }
+}
+
 fn find_registry_executable() -> Option<PathBuf> {
     let binary_name = if cfg!(windows) {
         "raphael-registry.exe"
@@ -881,6 +982,13 @@ fn default_token_path(app_data: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_pid_path_is_next_to_token_file() {
+        let token = Path::new(r"C:\Users\test\AppData\Local\Raphael\ModelRegistry\data\registry.token");
+        let pid = token.parent().unwrap().join("registry.pid");
+        assert!(pid.ends_with("ModelRegistry\\data\\registry.pid"));
+    }
 
     #[test]
     fn default_token_path_uses_app_data_when_localappdata_is_missing() {
