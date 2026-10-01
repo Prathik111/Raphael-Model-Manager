@@ -140,7 +140,7 @@ pub(crate) async fn set_model_tags_inner(
 
     let existing = app.registry.tags(&registry_model_id).await?;
     for tag in existing.iter().filter(|tag| !normalized.iter().any(|value| value.eq_ignore_ascii_case(tag))) {
-        let _ = app.registry.remove_tag(&registry_model_id, tag).await;
+        app.registry.remove_tag(&registry_model_id, tag).await?;
     }
     for tag in &normalized {
         if !existing.iter().any(|value| value.eq_ignore_ascii_case(tag)) {
@@ -150,8 +150,14 @@ pub(crate) async fn set_model_tags_inner(
 
     let c = open_db(&app.app_data)?;
     c.execute(
-        "UPDATE models SET tags_user_modified=1,updated_at=?2 WHERE id=?1",
-        params![id, now()],
+        "UPDATE models
+         SET tags_json=?2,tags_user_modified=1,updated_at=?3
+         WHERE id=?1",
+        params![
+            id,
+            serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".into()),
+            now()
+        ],
     )?;
     drop(c);
 
