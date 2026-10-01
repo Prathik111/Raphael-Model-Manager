@@ -1179,12 +1179,17 @@ async fn apply_civitai_metadata_to_registry(
     creator: Option<&str>,
 ) -> AppResult<(String, String)> {
     let _ = sync_local_model_to_registry(app, local_id).await?;
-    let (registry_model_id, tags_user_modified) = {
+    let (registry_model_id, tags_user_modified, name_user_modified, description_user_modified) = {
         let c = open_db(&app.app_data)?;
         c.query_row(
-            "SELECT registry_model_id,tags_user_modified FROM models WHERE id=?1",
+            "SELECT registry_model_id,tags_user_modified,name_user_modified,description_user_modified FROM models WHERE id=?1",
             [local_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, i64>(2)? != 0,
+                r.get::<_, i64>(3)? != 0,
+            )),
         )?
     };
 
