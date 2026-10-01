@@ -176,6 +176,89 @@ pub(crate) async fn set_model_tags(
     set_model_tags_inner(app.inner(), handle, id, tags).await
 }
 
+#[tauri::command]
+pub(crate) async fn set_model_metadata(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    name: String,
+    description: String,
+) -> AppResult<ModelRecord> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::Invalid("Model name cannot be empty".into()));
+    }
+
+    let description = description.trim().to_string();
+    let current = {
+        let c = open_db(&app.app_data)?;
+        model_by_id(&c, id)?
+    };
+
+    let current_name = current
+        .civitai_name
+        .clone()
+        .unwrap_or_else(|| current.filename.clone());
+    let current_description = current.description.clone().unwrap_or_default();
+    let name_changed = name != current_name;
+    let description_changed = description != current_description;
+
+    if !name_changed && !description_changed {
+        return Ok(current);
+    }
+
+    let _ = sync_local_model_to_registry(app.inner(), id).await?;
+
+    let registry_model_id = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id FROM models WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?
+    };
+    let registry_model = app.registry.get_model(&registry_model_id).await?;
+
+    let mut patch = serde_json::Map::new();
+    if name_changed {
+        patch.insert("name".into(), json!(name));
+    }
+    if description_changed {
+        patch.insert(
+            "description".into(),
+            if description.is_empty() { Value::Null } else { json!(description) },
+        );
+    }
+
+    app.registry
+        .update_model(&registry_model_id, registry_model.revision, Value::Object(patch))
+        .await?;
+
+    let c = open_db(&app.app_data)?;
+    c.execute(
+        "UPDATE models
+         SET civitai_name=CASE WHEN ?2 THEN ?3 ELSE civitai_name END,
+             description=CASE WHEN ?4 THEN ?5 ELSE description END,
+             name_user_modified=CASE WHEN ?2 THEN 1 ELSE name_user_modified END,
+             description_user_modified=CASE WHEN ?4 THEN 1 ELSE description_user_modified END,
+             updated_at=?6
+         WHERE id=?1",
+        params![
+            id,
+            name_changed,
+            name,
+            description_changed,
+            if description.is_empty() { None::<String> } else { Some(description) },
+            now()
+        ],
+    )?;
+    drop(c);
+
+    let rec = hydrate_local_model_from_registry(app.inner(), id, &registry_model_id, None).await?;
+    emit_models_changed(&handle);
+    Ok(rec)
+}
+
 pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
     let c = open_db(&app.app_data)?;
     let rows: Vec<(i64, String, String)> = {
