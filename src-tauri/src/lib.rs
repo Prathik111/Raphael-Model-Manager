@@ -1204,16 +1204,24 @@ async fn apply_civitai_metadata_to_registry(
         registry_model_type(&local_type).to_string()
     };
 
+    let mut metadata_patch = json!({
+        "model_type": model_type,
+        "creator": creator,
+        "base_model": version.get("baseModel").and_then(Value::as_str)
+    });
+    if !name_user_modified {
+        metadata_patch["name"] = model.get("name").cloned().unwrap_or(Value::Null);
+    }
+    if !description_user_modified {
+        metadata_patch["description"] = description
+            .map(|value| Value::String(value.to_string()))
+            .unwrap_or(Value::Null);
+    }
+
     app.registry.update_model_with_legacy_type_fallback(
         &registry_model_id,
         registry_model.revision,
-        json!({
-            "name": model.get("name").and_then(Value::as_str),
-            "model_type": model_type,
-            "creator": creator,
-            "description": description,
-            "base_model": version.get("baseModel").and_then(Value::as_str)
-        }),
+        metadata_patch,
     ).await?;
 
     let external_version_id = version
