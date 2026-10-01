@@ -2902,6 +2902,16 @@ async fn download_file(
         return Err(AppError::Api("Civitai returned an empty model file".into()));
     }
 
+    if let Some(expected_total) = total_size {
+        if actual_size as i64 != expected_total {
+            let _ = fs::remove_file(&partial);
+            return Err(AppError::Api(format!(
+                "Civitai download ended early: received {} bytes, expected {} bytes",
+                actual_size, expected_total
+            )));
+        }
+    }
+
     set_download_progress(&progress, task_id, |p| {
         p.downloaded_bytes = actual_size as i64;
         p.total_bytes = total_size.or(p.total_bytes);
@@ -2927,6 +2937,17 @@ async fn download_file(
     }
 
     Ok((path, actual_size as i64, actual_sha256))
+}
+
+fn download_error_needs_fresh_url(error: &AppError) -> bool {
+    match error {
+        AppError::Api(message) => {
+            message.contains("HTTP 401")
+                || message.contains("HTTP 403")
+                || message.contains("HTTP 404")
+        }
+        _ => false,
+    }
 }
 
 fn parse_content_range_total(value: &str) -> Option<i64> {
@@ -3117,7 +3138,7 @@ async fn install_civitai_model(
                     }
                 };
 
-                download_file(
+                match download_file(
                     &state,
                     &fresh_url,
                     &target,
@@ -3126,7 +3147,35 @@ async fn install_civitai_model(
                     task_progress.clone(),
                     &task_id,
                     reserved_path.clone(),
-                ).await?
+                ).await {
+                    Ok(result) => result,
+                    Err(first_error) if download_error_needs_fresh_url(&first_error) => {
+                        set_download_progress(&task_progress, &task_id, |p| {
+                            p.phase = "REFRESHING DOWNLOAD URL".into();
+                            p.error = Some(first_error.to_string());
+                        });
+
+                        let (_model, refreshed_version) =
+                            fetch_model_and_version(&state, &url).await?;
+                        let (refreshed_url, _refreshed_size, _refreshed_name, refreshed_sha256) =
+                            selected_file(&refreshed_version)
+                                .ok_or_else(|| AppError::Api(
+                                    "Civitai returned no downloadable file when refreshing the download URL".into()
+                                ))?;
+
+                        download_file(
+                            &state,
+                            &refreshed_url,
+                            &target,
+                            &filename,
+                            refreshed_sha256.as_deref().or(sha256.as_deref()),
+                            task_progress.clone(),
+                            &task_id,
+                            reserved_path.clone(),
+                        ).await?
+                    }
+                    Err(error) => return Err(error),
+                }
             };
 
             set_download_progress(&task_progress, &task_id, |p| {
