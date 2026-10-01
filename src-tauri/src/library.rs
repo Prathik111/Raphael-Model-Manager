@@ -226,7 +226,7 @@ pub(crate) async fn set_model_metadata(
     if description_changed {
         patch.insert(
             "description".into(),
-            if description.is_empty() { Value::Null } else { json!(description) },
+            if description.is_empty() { Value::Null } else { json!(description.clone()) },
         );
     }
 
