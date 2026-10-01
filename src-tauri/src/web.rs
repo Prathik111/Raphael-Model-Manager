@@ -255,6 +255,13 @@ struct TagsArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct ModelMetadataArgs {
+    id: i64,
+    name: String,
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TypeArgs {
     id: i64,
     #[serde(rename = "modelType")]
