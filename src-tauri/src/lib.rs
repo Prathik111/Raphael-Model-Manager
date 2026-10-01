@@ -1491,7 +1491,10 @@ async fn download_cached_thumbnail(
     }
 
     let client = civitai_client(app)?;
-    let mut req = client.get(url);
+    let mut req = client.get(url).header(
+        "Accept",
+        "image/avif,image/webp,image/jpeg,image/png;q=0.9,*/*;q=0.1",
+    );
     if let Some(t) = token() {
         req = req.bearer_auth(t);
     }
@@ -1501,6 +1504,12 @@ async fn download_cached_thumbnail(
         return Ok(None);
     }
 
+    let content_type = res
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
     let bytes = read_remote_image_bytes(res)
         .await
         .map_err(AppError::Invalid)?;
@@ -1508,7 +1517,7 @@ async fn download_cached_thumbnail(
         return Ok(None);
     }
 
-    let format = detect_image_format_from_bytes(&bytes)?;
+    let format = detect_remote_image_format(&bytes, content_type.as_deref())?;
     let ext = image_format_extension(format)
         .ok_or_else(|| AppError::Invalid("Civitai returned an unsupported thumbnail format".into()))?;
     let final_path = directory.join(format!("thumbnail-{key}.{ext}"));
@@ -1560,7 +1569,15 @@ async fn ensure_model_thumbnail(
     }
 
     if let Some(url) = remote {
-        return download_cached_thumbnail(app, &root, &url).await;
+        match download_cached_thumbnail(app, &root, &url).await {
+            Ok(path) => return Ok(path),
+            Err(error) => {
+                eprintln!(
+                    "Raphael Model Manager could not cache Civitai model thumbnail {}: {error}",
+                    url
+                );
+            }
+        }
     }
 
     let client = civitai_client(app)?;
@@ -1582,7 +1599,15 @@ async fn ensure_model_thumbnail(
             let value = &tail[content_pos + 9..];
             if let Some(end) = value.find('"') {
                 let image_url = &value[..end];
-                return download_cached_thumbnail(app, &root, image_url).await;
+                match download_cached_thumbnail(app, &root, image_url).await {
+                    Ok(path) => return Ok(path),
+                    Err(error) => {
+                        eprintln!(
+                            "Raphael Model Manager could not cache Civitai page thumbnail {}: {error}",
+                            image_url
+                        );
+                    }
+                }
             }
         }
     }
@@ -1671,6 +1696,12 @@ async fn download_featured_image(
         );
     }
 
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
     let bytes = match read_remote_image_bytes(response).await {
         Ok(value) => value,
         Err(error) => return (image_id, FeaturedDownloadResult::ReadFailed(error)),
@@ -1680,7 +1711,7 @@ async fn download_featured_image(
         return (image_id, FeaturedDownloadResult::EmptyResponse);
     }
 
-    let detected_format = match detect_image_format_from_bytes(&bytes) {
+    let detected_format = match detect_remote_image_format(&bytes, content_type.as_deref()) {
         Ok(value) => value,
         Err(error) => return (image_id, FeaturedDownloadResult::InvalidImage(error.to_string())),
     };
@@ -2304,6 +2335,45 @@ fn detect_image_format_from_bytes(bytes: &[u8]) -> AppResult<ImageFormat> {
     reader
         .format()
         .ok_or_else(|| AppError::Invalid("Could not determine image format from image data".into()))
+}
+
+fn image_format_from_content_type(content_type: Option<&str>) -> Option<ImageFormat> {
+    let mime = content_type?
+        .split(';')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+
+    match mime.as_str() {
+        "image/jpeg" | "image/jpg" => Some(ImageFormat::Jpeg),
+        "image/png" => Some(ImageFormat::Png),
+        "image/webp" => Some(ImageFormat::WebP),
+        "image/avif" => Some(ImageFormat::Avif),
+        _ => None,
+    }
+}
+
+fn detect_remote_image_format(
+    bytes: &[u8],
+    content_type: Option<&str>,
+) -> AppResult<ImageFormat> {
+    if let Ok(format) = detect_image_format_from_bytes(bytes) {
+        return Ok(format);
+    }
+
+    if let Some(format) = image_format_from_content_type(content_type) {
+        image::load_from_memory_with_format(bytes, format).map_err(|error| {
+            AppError::Invalid(format!(
+                "Civitai returned an invalid {} image: {error}",
+                content_type.unwrap_or("image")
+            ))
+        })?;
+        return Ok(format);
+    }
+
+    Err(AppError::Invalid(
+        "Could not determine image format from Civitai image data".into(),
+    ))
 }
 
 fn decode_image_file(path: &Path) -> AppResult<image::DynamicImage> {
@@ -3004,22 +3074,24 @@ async fn download_gallery_image(
         Ok(value) => value,
         Err(_) => return (image_id, None),
     };
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
     let bytes = match read_remote_image_bytes(response).await {
         Ok(value) if !value.is_empty() => value,
         _ => return (image_id, None),
     };
 
-    let guessed_ext = remote
-        .split('?')
-        .next()
-        .and_then(|x| Path::new(x).extension())
-        .and_then(|x| x.to_str())
-        .unwrap_or("jpg");
-
-    let ext = detect_image_format_from_bytes(&bytes)
+    let ext = match detect_remote_image_format(&bytes, content_type.as_deref())
         .ok()
         .and_then(image_format_extension)
-        .unwrap_or(guessed_ext);
+    {
+        Some(ext) => ext,
+        None => return (image_id, None),
+    };
 
     let local = cache.join(format!("{image_id}.{ext}"));
     if fs::write(&local, &bytes).is_err() {
@@ -4402,6 +4474,28 @@ mod tests {
         let state = ExamplesRefreshState::default();
         assert!(!state.running);
         assert!(state.progress.is_none());
+    }
+
+    #[test]
+    fn civitai_image_content_types_map_to_supported_formats() {
+        assert_eq!(
+            image_format_from_content_type(Some("image/jpeg; charset=binary")),
+            Some(ImageFormat::Jpeg)
+        );
+        assert_eq!(
+            image_format_from_content_type(Some("image/png")),
+            Some(ImageFormat::Png)
+        );
+        assert_eq!(
+            image_format_from_content_type(Some("image/webp")),
+            Some(ImageFormat::WebP)
+        );
+        assert_eq!(
+            image_format_from_content_type(Some("image/avif")),
+            Some(ImageFormat::Avif)
+        );
+        assert_eq!(image_format_from_content_type(Some("text/html")), None);
+        assert_eq!(image_format_from_content_type(None), None);
     }
 
     #[test]
