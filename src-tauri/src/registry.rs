@@ -129,6 +129,12 @@ pub(crate) struct RegistryAsset {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+struct RegistryCapabilities {
+    api_version: String,
+    asset_content_upload: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct RegistryEvent {
     pub id: i64,
     pub model_id: Option<String>,
@@ -247,21 +253,26 @@ impl RegistryClient {
     }
 
     async fn has_required_asset_api(&self) -> bool {
-        self.client
+        let response = match self
+            .client
             .get(format!("{}/api/v1/capabilities", self.base_url))
             .send()
             .await
-            .ok()
-            .and_then(|response| async {
-                if !response.status().is_success() {
-                    return None;
-                }
-                response.json::<RegistryCapabilities>().await.ok()
-            }.await)
-            .map(|capabilities| {
+        {
+            Ok(response) => response,
+            Err(_) => return false,
+        };
+
+        if !response.status().is_success() {
+            return false;
+        }
+
+        match response.json::<RegistryCapabilities>().await {
+            Ok(capabilities) => {
                 capabilities.api_version == "v1" && capabilities.asset_content_upload
-            })
-            .unwrap_or(false)
+            }
+            Err(_) => false,
+        }
     }
 
     async fn is_ready(&self) -> bool {
