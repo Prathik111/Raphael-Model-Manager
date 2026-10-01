@@ -739,7 +739,7 @@ fn registry_model_type(model_type: &str) -> &'static str {
         "Checkpoint" => "checkpoint",
         "LoRA" => "lora",
         "VAE" => "vae",
-        "ControlNet" => "controlnet",
+        "ControlNet" => "control_net",
         "Embedding" => "embedding",
         "Upscaler" => "upscaler",
         "Text Encoder" => "text_encoder",
@@ -4106,7 +4106,7 @@ mod tests {
 
     #[test]
     fn registry_controlnet_type_accepts_legacy_server_spelling() {
-        assert_eq!(registry_model_type("ControlNet"), "controlnet");
+        assert_eq!(registry_model_type("ControlNet"), "control_net");
         assert_eq!(local_model_type("controlnet"), "ControlNet");
         assert_eq!(local_model_type("control_net"), "ControlNet");
     }
