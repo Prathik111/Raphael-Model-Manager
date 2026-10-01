@@ -570,6 +570,48 @@ fn sha256_file(path: &Path) -> AppResult<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+async fn sha256_file_with_progress(
+    path: PathBuf,
+    progress: Arc<Mutex<Vec<DownloadProgress>>>,
+    task_id: String,
+) -> AppResult<String> {
+    tokio::task::spawn_blocking(move || -> Result<String, io::Error> {
+        let total = fs::metadata(&path)?.len();
+        let mut reader = BufReader::new(File::open(&path)?);
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 4 * 1024 * 1024];
+        let mut hashed = 0u64;
+
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+
+            hasher.update(&buffer[..read]);
+            hashed = hashed.saturating_add(read as u64);
+
+            let current = hashed as i64;
+            set_download_progress(&progress, &task_id, |p| {
+                p.phase = "VERIFYING".into();
+                p.downloaded_bytes = current;
+                p.total_bytes = Some(total as i64);
+                p.percent = if total > 0 {
+                    Some((hashed as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+                } else {
+                    Some(100.0)
+                };
+                p.error = None;
+            });
+        }
+
+        Ok(hex::encode(hasher.finalize()))
+    })
+    .await
+    .map_err(|error| AppError::Api(format!("SHA256 verification worker failed: {error}")))?
+    .map_err(AppError::Io)
+}
+
 fn scan_root(app: &AppStateInner, root: &Path) -> AppResult<Vec<RegistryRemoval>> {
     let _guard = app.scan_lock.lock().unwrap();
     let c = open_db(&app.app_data)?;
@@ -1387,9 +1429,17 @@ fn spawn_registry_sync(app: AppStateInner, handle: AppHandle) {
 
 
 fn civitai_client(_app: &AppStateInner) -> AppResult<Client> {
-    let mut b=Client::builder().user_agent(USER_AGENT).timeout(Duration::from_secs(30));
-    let _ = &mut b;
-    Ok(b.build()?)
+    Ok(Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(30))
+        // Civitai serves binary assets directly. Disable automatic content
+        // decoding and request the identity encoding so malformed CDN
+        // Content-Encoding headers cannot break the response stream.
+        .gzip(false)
+        .brotli(false)
+        .zstd(false)
+        .deflate(false)
+        .build()?)
 }
 fn token() -> Option<String> {
     keyring::Entry::new("Raphael Model Manager", "civitai").ok().and_then(|e| e.get_password().ok())
@@ -1508,10 +1558,13 @@ async fn download_cached_thumbnail(
     }
 
     let client = civitai_client(app)?;
-    let mut req = client.get(url).header(
-        "Accept",
-        "image/avif,image/webp,image/jpeg,image/png;q=0.9,*/*;q=0.1",
-    );
+    let mut req = client
+        .get(url)
+        .header(
+            "Accept",
+            "image/avif,image/webp,image/jpeg,image/png;q=0.9,*/*;q=0.1",
+        )
+        .header("Accept-Encoding", "identity");
     if let Some(t) = token() {
         req = req.bearer_auth(t);
     }
@@ -2942,7 +2995,20 @@ async fn download_file(
         p.error = None;
     });
 
-    let actual_sha256 = sha256_file(&partial)?;
+    let actual_sha256 = sha256_file_with_progress(
+        partial.clone(),
+        progress.clone(),
+        task_id.to_string(),
+    )
+    .await?;
+
+    set_download_progress(&progress, task_id, |p| {
+        p.phase = "VERIFYING".into();
+        p.downloaded_bytes = actual_size as i64;
+        p.total_bytes = Some(total_size.unwrap_or(actual_size as i64));
+        p.percent = Some(100.0);
+        p.error = None;
+    });
 
     if let Some(expected) = expected_sha256 {
         if actual_sha256 != expected.to_ascii_lowercase() {
