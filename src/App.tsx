@@ -922,6 +922,62 @@ function Gallery({ model, images, hasMore, fetchBusy, onChooseThumbnail, onFetch
 }
 
 
+function MetadataEditor({ model, onSave }: { model: ModelRecord; onSave: (name: string, description: string) => Promise<void> }) {
+  const [name, setName] = useState(model.civitai_name || model.filename);
+  const [description, setDescription] = useState(model.description || '');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setName(model.civitai_name || model.filename);
+    setDescription(model.description || '');
+    setSaveError(null);
+  }, [model.id, model.civitai_name, model.filename, model.description]);
+
+  const save = async () => {
+    const nextName = name.trim();
+    if (!nextName || saving) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await onSave(nextName, description);
+    } catch (error) {
+      setSaveError(String(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <div className="metadata-editor">
+    <label>
+      <span>NAME</span>
+      <input
+        value={name}
+        onChange={e => { setName(e.target.value); setSaveError(null); }}
+        disabled={saving}
+        placeholder="Model name"
+      />
+    </label>
+    <label>
+      <span>DESCRIPTION</span>
+      <textarea
+        value={description}
+        onChange={e => { setDescription(e.target.value); setSaveError(null); }}
+        disabled={saving}
+        placeholder="Model description"
+        rows={6}
+      />
+    </label>
+    {saveError ? <div className="error-box tag-save-error">{saveError}</div> : null}
+    <div className="metadata-editor-footer">
+      <span>{saving ? 'SAVING…' : 'LOCAL + REGISTRY'}</span>
+      <button className="primary-btn small" onClick={() => void save()} disabled={saving || !name.trim()}>
+        {saving ? 'SAVING…' : 'SAVE CHANGES'}
+      </button>
+    </div>
+  </div>;
+}
+
 function TagEditor({ model, allTags, onSave, onFilter }: { model: ModelRecord; allTags: TagRecord[]; onSave: (tags: string[])=>Promise<void>; onFilter: (tag: string)=>void }) {
   const [draft, setDraft] = useState<string[]>(model.tags);
   const [input, setInput] = useState('');
