@@ -1470,12 +1470,29 @@ fn canonical_civitai_url(source:&str,model_id:Option<i64>,version_id:Option<i64>
 fn json_strings(v:Option<&Value>)->Vec<String>{v.and_then(Value::as_array).map(|a|a.iter().filter_map(|x|x.as_str().map(str::to_string)).collect()).unwrap_or_default()}
 fn strip_html(s:&str)->String{let mut out=String::with_capacity(s.len());let mut in_tag=false;for ch in s.chars(){match ch{ '<'=>in_tag=true,'>'=>in_tag=false,_ if !in_tag=>out.push(ch),_=>{}}}out.replace("&nbsp;"," ").replace("&amp;","&").replace("&lt;","<").replace("&gt;",">")}
 
+fn is_probable_video_url(url: &str) -> bool {
+    let path = Url::parse(url)
+        .ok()
+        .map(|parsed| parsed.path().to_ascii_lowercase())
+        .unwrap_or_else(|| url.to_ascii_lowercase());
+
+    [".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+}
+
 async fn download_cached_thumbnail(
     app: &AppStateInner,
     directory: &Path,
     url: &str,
 ) -> AppResult<Option<String>> {
     fs::create_dir_all(directory)?;
+
+    // Civitai can expose creator media as video files. They are valid remote
+    // media but cannot be used as an image thumbnail.
+    if is_probable_video_url(url) {
+        return Ok(None);
+    }
 
     let digest = Sha256::digest(url.as_bytes());
     let key = hex::encode(&digest[..8]);
@@ -1509,6 +1526,13 @@ async fn download_cached_thumbnail(
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+
+    if content_type
+        .as_deref()
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("video/"))
+    {
+        return Ok(None);
+    }
 
     let bytes = read_remote_image_bytes(res)
         .await
@@ -1549,9 +1573,8 @@ async fn ensure_model_thumbnail(
         .and_then(Value::as_array)
         .and_then(|a| {
             a.iter().find_map(|x| {
-                x.get("url")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
+                let url = x.get("url").and_then(Value::as_str)?;
+                (!is_probable_video_url(url)).then(|| url.to_string())
             })
         });
 
@@ -1561,9 +1584,8 @@ async fn ensure_model_thumbnail(
             .and_then(Value::as_array)
             .and_then(|a| {
                 a.iter().find_map(|x| {
-                    x.get("url")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
+                    let url = x.get("url").and_then(Value::as_str)?;
+                    (!is_probable_video_url(url)).then(|| url.to_string())
                 })
             });
     }
