@@ -762,6 +762,11 @@ async fn command_handler(
             let args: TagsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             set_model_tags(handle.state(), handle.clone(), args.id, args.tags).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
+        "set_model_metadata" => {
+            let args: ModelMetadataArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            set_model_metadata(handle.state(), handle.clone(), args.id, args.name, args.description).await
+                .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        }
         "set_model_type" => {
             let args: TypeArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             set_model_type(handle.state(), handle.clone(), args.id, args.model_type).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
