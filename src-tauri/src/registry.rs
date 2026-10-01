@@ -202,6 +202,18 @@ impl RegistryClient {
                 return Err(RegistryError::ExecutableNotFound);
             }
             spawn_registry_executable(&executable, &bind, port, &data_dir, &self.token_file)?
+        } else if cfg!(debug_assertions) {
+            // Development mode: prefer the Registry workspace source so a
+            // stale target/debug binary cannot mask Registry source changes.
+            if let Some(manifest) = find_registry_workspace_manifest() {
+                spawn_registry_cargo(&manifest, &bind, port, &data_dir, &self.token_file)?
+            } else if let Some(executable) = find_registry_executable() {
+                spawn_registry_executable(&executable, &bind, port, &data_dir, &self.token_file)?
+            } else if let Some(executable) = registry_command_on_path() {
+                spawn_registry_executable(&executable, &bind, port, &data_dir, &self.token_file)?
+            } else {
+                return Err(RegistryError::ExecutableNotFound);
+            }
         } else if let Some(executable) = find_registry_executable() {
             spawn_registry_executable(&executable, &bind, port, &data_dir, &self.token_file)?
         } else if let Some(executable) = registry_command_on_path() {
