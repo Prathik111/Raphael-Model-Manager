@@ -1441,6 +1441,19 @@ fn civitai_client(_app: &AppStateInner) -> AppResult<Client> {
         .deflate(false)
         .build()?)
 }
+
+fn civitai_download_client() -> AppResult<Client> {
+    Ok(Client::builder()
+        .user_agent(USER_AGENT)
+        // A model download can legitimately take many minutes or hours.
+        // Use a bounded connection timeout but no whole-request deadline.
+        .connect_timeout(Duration::from_secs(30))
+        .gzip(false)
+        .brotli(false)
+        .zstd(false)
+        .deflate(false)
+        .build()?)
+}
 fn token() -> Option<String> {
     keyring::Entry::new("Raphael Model Manager", "civitai").ok().and_then(|e| e.get_password().ok())
 }
@@ -2762,7 +2775,7 @@ async fn download_file(
     const RETRY_BASE_SECS: u64 = 2;
 
     fs::create_dir_all(target_dir)?;
-    let client = civitai_client(app)?;
+    let client = civitai_download_client()?;
     let partial = path.with_extension(format!(
         "{}.part",
         path.extension().and_then(|x| x.to_str()).unwrap_or("bin")
