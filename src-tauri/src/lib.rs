@@ -1034,7 +1034,7 @@ async fn sync_local_model_to_registry(
         }
     });
 
-    let (registry_model, created_new) = match app.registry.get_model(&deterministic_id).await {
+    let (mut registry_model, created_new) = match app.registry.get_model(&deterministic_id).await {
         Ok(model) => (model, false),
         Err(crate::registry::RegistryError::Api { status, .. })
             if status == reqwest::StatusCode::NOT_FOUND =>
@@ -1058,6 +1058,26 @@ async fn sync_local_model_to_registry(
         }
         Err(error) => return Err(error.into()),
     };
+
+    // The Manager's current model type is authoritative. Reconcile it back
+    // into the Registry so a model cannot remain locally classified as a
+    // Checkpoint while the Registry still stores it as "other" (or another
+    // stale type), which would hide it from typed Registry consumers such as
+    // Raphael Image Generator.
+    if !created_new {
+        let desired_registry_type = registry_model_type(&local.model_type);
+        if registry_model.model_type != desired_registry_type {
+            registry_model = app.registry
+                .update_model_with_legacy_type_fallback(
+                    &registry_model.id,
+                    registry_model.revision,
+                    json!({
+                        "model_type": desired_registry_type,
+                    }),
+                )
+                .await?;
+        }
+    }
 
     let mut registry_version_id = existing_registry_version_id;
 
