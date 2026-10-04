@@ -880,7 +880,7 @@ async fn hydrate_local_model_from_registry(
              base_model=?10,
              creator=?11,
              description=?12,
-             tags_json=?13,
+             tags_json=CASE WHEN tags_user_modified=1 THEN tags_json ELSE ?13 END,
              activation_json=?14,
              updated_at=?15
          WHERE id=?1",
