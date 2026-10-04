@@ -127,43 +127,44 @@ pub(crate) async fn set_model_tags_inner(
     tags: Vec<String>,
 ) -> AppResult<ModelRecord> {
     let normalized = normalize_tags(tags);
-    let _ = sync_local_model_to_registry(app, id).await?;
 
-    let registry_model_id: String = {
+    // Commit the user's intent locally first. The local flag is deliberately
+    // written before any Registry operation so a concurrent/background sync
+    // sees the new authoritative tags instead of the previous snapshot.
+    {
         let c = open_db(&app.app_data)?;
-        c.query_row(
-            "SELECT registry_model_id FROM models WHERE id=?1",
-            [id],
-            |r| r.get::<_, String>(0),
-        )?
-    };
-
-    let existing = app.registry.tags(&registry_model_id).await?;
-    for tag in existing.iter().filter(|tag| !normalized.iter().any(|value| value.eq_ignore_ascii_case(tag))) {
-        app.registry.remove_tag(&registry_model_id, tag).await?;
-    }
-    for tag in &normalized {
-        if !existing.iter().any(|value| value.eq_ignore_ascii_case(tag)) {
-            app.registry.add_tag(&registry_model_id, tag).await?;
-        }
+        c.execute(
+            "UPDATE models
+             SET tags_json=?2,tags_user_modified=1,updated_at=?3
+             WHERE id=?1",
+            params![
+                id,
+                serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".into()),
+                now()
+            ],
+        )?;
     }
 
-    let c = open_db(&app.app_data)?;
-    c.execute(
-        "UPDATE models
-         SET tags_json=?2,tags_user_modified=1,updated_at=?3
-         WHERE id=?1",
-        params![
-            id,
-            serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".into()),
-            now()
-        ],
-    )?;
-    drop(c);
-
-    let rec = hydrate_local_model_from_registry(app, id, &registry_model_id, None).await?;
+    // sync_local_model_to_registry is the single reconciliation path. It
+    // reads tags_user_modified=1 and mirrors exactly these tags to the
+    // canonical Registry, then hydrates the local projection from the
+    // Registry's confirmed state.
+    let rec = sync_local_model_to_registry(app, id).await?;
     emit_models_changed(&handle);
     Ok(rec)
+}
+
+#[cfg(test)]
+mod tag_save_regression_tests {
+    use super::*;
+
+    #[test]
+    fn user_tag_normalization_is_stable() {
+        assert_eq!(
+            normalize_tags(vec![" Anime ".into(), "anime".into(), "Character".into()]),
+            vec!["Anime".to_string(), "Character".to_string()]
+        );
+    }
 }
 
 #[tauri::command]
@@ -259,7 +260,7 @@ pub(crate) async fn set_model_metadata(
     Ok(rec)
 }
 
-pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
+pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<Vec<i64>> {
     let c = open_db(&app.app_data)?;
     let rows: Vec<(i64, String, String)> = {
         let mut stmt = c.prepare("SELECT id,relative_path,tags_json FROM models")?;
@@ -275,7 +276,7 @@ pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
         rows
     };
 
-    let mut updated = 0_i64;
+    let mut updated = Vec::<i64>::new();
     for (id, relative_path, raw_tags) in rows {
         let parts: Vec<&str> = relative_path
             .split('/')
@@ -308,16 +309,27 @@ pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
                 now()
             ],
         )?;
-        updated += 1;
+        updated.push(id);
     }
 
     Ok(updated)
 }
 
 #[tauri::command]
-pub(crate) fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult<i64> {
-    let updated = add_subfolder_tags_inner(&app)?;
-    spawn_registry_sync(app.inner().clone(), handle.clone());
+pub(crate) async fn add_subfolder_tags(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+) -> AppResult<i64> {
+    let updated = add_subfolder_tags_inner(app.inner())?;
+
+    // Do not merely enqueue the normal registry sync here. That sync is
+    // intentionally coalesced and can already be running. Persist the exact
+    // models changed by this operation immediately so a busy sync cannot
+    // cause the new folder tags to be skipped.
+    for id in &updated {
+        sync_local_model_to_registry(app.inner(), *id).await?;
+    }
+
     emit_models_changed(&handle);
-    Ok(updated)
+    Ok(updated.len() as i64)
 }

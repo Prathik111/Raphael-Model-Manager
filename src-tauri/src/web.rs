@@ -633,11 +633,12 @@ async fn task_start_handler(
                 })
             }
             "add_subfolder_tags" => {
-                let task_handle = handle.clone();
                 Box::pin(async move {
                     let value = crate::add_subfolder_tags_inner(&app)?;
-                    crate::spawn_registry_sync(app.clone(), task_handle.clone());
-                    serde_json::to_value(value)
+                    for id in &value {
+                        crate::sync_local_model_to_registry(&app, *id).await?;
+                    }
+                    serde_json::to_value(value.len() as i64)
                         .map_err(|error| AppError::Invalid(error.to_string()))
                 })
             },
@@ -757,7 +758,10 @@ async fn command_handler(
         }
         "get_library_counts" => get_library_counts(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
         "get_tags" => get_tags(handle.state()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
-        "add_subfolder_tags" => add_subfolder_tags(handle.state(), handle.clone()).and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string()))),
+        "add_subfolder_tags" => {
+            add_subfolder_tags(handle.state(), handle.clone()).await
+                .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        }
         "set_model_tags" => {
             let args: TagsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             set_model_tags(handle.state(), handle.clone(), args.id, args.tags).await.and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
