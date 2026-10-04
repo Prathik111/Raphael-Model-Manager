@@ -260,7 +260,7 @@ pub(crate) async fn set_model_metadata(
     Ok(rec)
 }
 
-pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
+pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<Vec<i64>> {
     let c = open_db(&app.app_data)?;
     let rows: Vec<(i64, String, String)> = {
         let mut stmt = c.prepare("SELECT id,relative_path,tags_json FROM models")?;
@@ -276,7 +276,7 @@ pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
         rows
     };
 
-    let mut updated = 0_i64;
+    let mut updated = Vec::<i64>::new();
     for (id, relative_path, raw_tags) in rows {
         let parts: Vec<&str> = relative_path
             .split('/')
@@ -309,16 +309,27 @@ pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<i64> {
                 now()
             ],
         )?;
-        updated += 1;
+        updated.push(id);
     }
 
     Ok(updated)
 }
 
 #[tauri::command]
-pub(crate) fn add_subfolder_tags(app: State<AppStateInner>, handle: AppHandle) -> AppResult<i64> {
-    let updated = add_subfolder_tags_inner(&app)?;
-    spawn_registry_sync(app.inner().clone(), handle.clone());
+pub(crate) async fn add_subfolder_tags(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+) -> AppResult<i64> {
+    let updated = add_subfolder_tags_inner(app.inner())?;
+
+    // Do not merely enqueue the normal registry sync here. That sync is
+    // intentionally coalesced and can already be running. Persist the exact
+    // models changed by this operation immediately so a busy sync cannot
+    // cause the new folder tags to be skipped.
+    for id in &updated {
+        sync_local_model_to_registry(app.inner(), *id).await?;
+    }
+
     emit_models_changed(&handle);
-    Ok(updated)
+    Ok(updated.len() as i64)
 }
