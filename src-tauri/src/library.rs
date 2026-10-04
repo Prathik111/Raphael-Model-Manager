@@ -127,43 +127,76 @@ pub(crate) async fn set_model_tags_inner(
     tags: Vec<String>,
 ) -> AppResult<ModelRecord> {
     let normalized = normalize_tags(tags);
-    let _ = sync_local_model_to_registry(app, id).await?;
 
-    let registry_model_id: String = {
+    // Commit the user's intent locally first. The local flag is deliberately
+    // written before any Registry operation so a concurrent/background sync
+    // sees the new authoritative tags instead of the previous snapshot.
+    {
         let c = open_db(&app.app_data)?;
-        c.query_row(
-            "SELECT registry_model_id FROM models WHERE id=?1",
-            [id],
-            |r| r.get::<_, String>(0),
-        )?
-    };
-
-    let existing = app.registry.tags(&registry_model_id).await?;
-    for tag in existing.iter().filter(|tag| !normalized.iter().any(|value| value.eq_ignore_ascii_case(tag))) {
-        app.registry.remove_tag(&registry_model_id, tag).await?;
-    }
-    for tag in &normalized {
-        if !existing.iter().any(|value| value.eq_ignore_ascii_case(tag)) {
-            app.registry.add_tag(&registry_model_id, tag).await?;
-        }
+        c.execute(
+            "UPDATE models
+             SET tags_json=?2,tags_user_modified=1,updated_at=?3
+             WHERE id=?1",
+            params![
+                id,
+                serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".into()),
+                now()
+            ],
+        )?;
     }
 
-    let c = open_db(&app.app_data)?;
-    c.execute(
-        "UPDATE models
-         SET tags_json=?2,tags_user_modified=1,updated_at=?3
-         WHERE id=?1",
-        params![
-            id,
-            serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".into()),
-            now()
-        ],
-    )?;
-    drop(c);
-
-    let rec = hydrate_local_model_from_registry(app, id, &registry_model_id, None).await?;
+    // sync_local_model_to_registry is the single reconciliation path. It
+    // reads tags_user_modified=1 and mirrors exactly these tags to the
+    // canonical Registry, then hydrates the local projection from the
+    // Registry's confirmed state.
+    let rec = sync_local_model_to_registry(app, id).await?;
     emit_models_changed(&handle);
     Ok(rec)
+}
+
+#[cfg(test)]
+mod tag_save_regression_tests {
+    use super::*;
+
+    #[test]
+    fn user_tag_write_marks_local_row_before_registry_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path().join("app");
+        let root = temp.path().join("models");
+        fs::create_dir_all(root.join("checkpoints")).unwrap();
+        fs::write(root.join("checkpoints/test.safetensors"), b"checkpoint").unwrap();
+
+        let state = test_state(app_data.clone(), root.clone());
+        scan_root(&state, &root).unwrap();
+
+        let id: i64 = {
+            let db = open_db(&app_data).unwrap();
+            db.query_row("SELECT id FROM models LIMIT 1", [], |r| r.get(0)).unwrap()
+        };
+
+        let tags = normalize_tags(vec![" Anime ".into(), "anime".into(), "Character".into()]);
+        {
+            let db = open_db(&app_data).unwrap();
+            db.execute(
+                "UPDATE models SET tags_json=?2,tags_user_modified=1 WHERE id=?1",
+                params![
+                    id,
+                    serde_json::to_string(&tags).unwrap(),
+                ],
+            ).unwrap();
+        }
+
+        let db = open_db(&app_data).unwrap();
+        let (stored, user_modified): (String, i64) = db
+            .query_row(
+                "SELECT tags_json,tags_user_modified FROM models WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Vec<String>>(&stored).unwrap(), tags);
+        assert_eq!(user_modified, 1);
+    }
 }
 
 #[tauri::command]
