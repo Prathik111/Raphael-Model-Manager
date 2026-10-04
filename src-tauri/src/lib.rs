@@ -998,19 +998,20 @@ async fn sync_local_model_to_registry(
     app: &AppStateInner,
     local_id: i64,
 ) -> AppResult<ModelRecord> {
-    let (local, existing_registry_model_id, existing_registry_version_id, existing_registry_file_id) = {
+    let (local, existing_registry_model_id, existing_registry_version_id, existing_registry_file_id, tags_user_modified) = {
         let c = open_db(&app.app_data)?;
         let local = model_by_id(&c, local_id)?;
         let ids = c.query_row(
-            "SELECT registry_model_id,registry_version_id,registry_file_id FROM models WHERE id=?1",
+            "SELECT registry_model_id,registry_version_id,registry_file_id,tags_user_modified FROM models WHERE id=?1",
             [local_id],
             |r| Ok((
                 r.get::<_, Option<String>>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)? != 0,
             )),
         )?;
-        (local, ids.0, ids.1, ids.2)
+        (local, ids.0, ids.1, ids.2, ids.3)
     };
 
     let source_hash = match local.source_hash.clone().filter(|value| !value.trim().is_empty()) {
@@ -1131,7 +1132,26 @@ async fn sync_local_model_to_registry(
 
     if created_new {
         for tag in normalize_tags(local.tags.clone()) {
-            let _ = app.registry.add_tag(&registry_model.id, &tag).await;
+            app.registry.add_tag(&registry_model.id, &tag).await?;
+        }
+    } else if tags_user_modified {
+        // User-assigned Manager tags are authoritative. Reconcile them back
+        // into the Registry before hydrating the local projection again;
+        // otherwise a background Registry sync can silently restore stale
+        // Registry tags over the user's edits.
+        let desired_tags = normalize_tags(local.tags.clone());
+        let existing_tags = app.registry.tags(&registry_model.id).await?;
+
+        for tag in existing_tags.iter().filter(|tag| {
+            !desired_tags.iter().any(|value| value.eq_ignore_ascii_case(tag))
+        }) {
+            app.registry.remove_tag(&registry_model.id, tag).await?;
+        }
+
+        for tag in &desired_tags {
+            if !existing_tags.iter().any(|value| value.eq_ignore_ascii_case(tag)) {
+                app.registry.add_tag(&registry_model.id, tag).await?;
+            }
         }
     }
 
