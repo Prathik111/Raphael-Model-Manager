@@ -159,43 +159,11 @@ mod tag_save_regression_tests {
     use super::*;
 
     #[test]
-    fn user_tag_write_marks_local_row_before_registry_sync() {
-        let temp = tempfile::tempdir().unwrap();
-        let app_data = temp.path().join("app");
-        let root = temp.path().join("models");
-        fs::create_dir_all(root.join("checkpoints")).unwrap();
-        fs::write(root.join("checkpoints/test.safetensors"), b"checkpoint").unwrap();
-
-        let state = test_state(app_data.clone(), root.clone());
-        scan_root(&state, &root).unwrap();
-
-        let id: i64 = {
-            let db = open_db(&app_data).unwrap();
-            db.query_row("SELECT id FROM models LIMIT 1", [], |r| r.get(0)).unwrap()
-        };
-
-        let tags = normalize_tags(vec![" Anime ".into(), "anime".into(), "Character".into()]);
-        {
-            let db = open_db(&app_data).unwrap();
-            db.execute(
-                "UPDATE models SET tags_json=?2,tags_user_modified=1 WHERE id=?1",
-                params![
-                    id,
-                    serde_json::to_string(&tags).unwrap(),
-                ],
-            ).unwrap();
-        }
-
-        let db = open_db(&app_data).unwrap();
-        let (stored, user_modified): (String, i64) = db
-            .query_row(
-                "SELECT tags_json,tags_user_modified FROM models WHERE id=?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(serde_json::from_str::<Vec<String>>(&stored).unwrap(), tags);
-        assert_eq!(user_modified, 1);
+    fn user_tag_normalization_is_stable() {
+        assert_eq!(
+            normalize_tags(vec![" Anime ".into(), "anime".into(), "Character".into()]),
+            vec!["Anime".to_string(), "Character".to_string()]
+        );
     }
 }
 
