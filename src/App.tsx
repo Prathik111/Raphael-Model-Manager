@@ -1006,14 +1006,18 @@ function TagEditor({ model, allTags, onSave, onFilter }: { model: ModelRecord; a
     const value = raw.trim();
     if (!value || draft.some(tag => tag.toLowerCase() === value.toLowerCase()) || saving) return;
     const next = [...draft, value];
-    setDraft(next); setInput('');
-    if (api.isWebApp) void persist(next);
+    setDraft(next);
+    setInput('');
+    // Tag assignment is a persistence action in both desktop and web modes.
+    // Do not leave the change only in component-local React state, because
+    // switching to another model unmounts this editor.
+    void persist(next);
   };
   const remove = (tag: string) => {
     if (saving) return;
     const next = draft.filter(existing => existing !== tag);
     setDraft(next);
-    if (api.isWebApp) void persist(next);
+    void persist(next);
   };
   const save = async () => persist(draft);
 
@@ -1034,8 +1038,8 @@ function TagEditor({ model, allTags, onSave, onFilter }: { model: ModelRecord; a
     </div> : null}
     {saveError ? <div className="error-box tag-save-error">{saveError}</div> : null}
     <div className="tag-editor-footer">
-      <span>{api.isWebApp ? 'AUTO-SAVES' : `${draft.length} TAG${draft.length === 1 ? '' : 'S'}`}</span>
-      {!api.isWebApp ? <button className="text-btn" onClick={save} disabled={saving}>{saving ? 'SAVING…' : 'SAVE TAGS'}</button> : <span className="tag-save-state">{saving ? 'SYNCING…' : 'SYNCED'}</span>}
+      <span>{saving ? 'SAVING…' : 'AUTO-SAVES'}</span>
+      <button className="text-btn" onClick={save} disabled={saving}>{saving ? 'SAVING…' : 'SAVE NOW'}</button>
     </div>
   </div>;
 }
