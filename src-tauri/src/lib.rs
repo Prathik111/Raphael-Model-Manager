@@ -2802,7 +2802,7 @@ async fn preview_civitai_import(
 
 #[allow(clippy::too_many_arguments)]
 async fn download_file(
-    app: &AppStateInner,
+    _app: &AppStateInner,
     url: &str,
     target_dir: &Path,
     _preferred_name: &str,
