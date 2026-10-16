@@ -36,7 +36,7 @@ use crate::{
     prune_cache_images, prune_cache_images_inner, clean_cache_orphans, clean_cache_orphans_inner,
     get_tags, install_civitai_model, link_model_civitai, link_model_civitai_inner, list_models, preview_civitai_import, preview_civitai_import_inner,
     refresh_all_examples, get_examples_refresh_status, refresh_all_model_tags, get_model_tags_refresh_status, load_more_model_examples, get_example_load_amount, set_example_load_amount, refresh_model_civitai, refresh_model_civitai_inner, reset_model_cover, set_civitai_token, set_model_cover_position, set_model_cover_from_image,
-    set_model_metadata, set_model_tags, set_model_type, sync_model_gallery, sync_gallery_inner,
+    set_model_activation_prompts, set_model_metadata, set_model_tags, set_model_type, sync_model_gallery, sync_gallery_inner,
     is_civitai_token_set, open_db, read_example_load_amount, AppError, AppResult, CivitaiImportPreview, ModelRecord,
 };
 
@@ -259,6 +259,12 @@ struct ModelMetadataArgs {
     id: i64,
     name: String,
     description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivationPromptsArgs {
+    id: i64,
+    prompts: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -769,6 +775,11 @@ async fn command_handler(
         "set_model_metadata" => {
             let args: ModelMetadataArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
             set_model_metadata(handle.state(), handle.clone(), args.id, args.name, args.description).await
+                .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
+        }
+        "set_model_activation_prompts" => {
+            let args: ActivationPromptsArgs = match arg(args) { Ok(value) => value, Err(error) => return response_err(error) };
+            set_model_activation_prompts(handle.state(), handle.clone(), args.id, args.prompts).await
                 .and_then(|value| serde_json::to_value(value).map_err(|e| AppError::Invalid(e.to_string())))
         }
         "set_model_type" => {

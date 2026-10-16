@@ -256,6 +256,8 @@ export const api = {
     command<number>('set_parallel_downloads', { value }),
   setModelMetadata: (id: number, name: string, description: string) =>
     command<ModelRecord>('set_model_metadata', { id, name, description }),
+  setModelActivationPrompts: (id: number, prompts: string[]) =>
+    command<ModelRecord>('set_model_activation_prompts', { id, prompts }),
   clearDownloadProgress: (taskId: string) =>
     command<void>('clear_download_progress', { taskId }),
   refreshModel: (id: number) =>

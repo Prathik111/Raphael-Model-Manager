@@ -260,6 +260,89 @@ pub(crate) async fn set_model_metadata(
     Ok(rec)
 }
 
+
+#[tauri::command]
+pub(crate) async fn set_model_activation_prompts(
+    app: State<'_, AppStateInner>,
+    handle: AppHandle,
+    id: i64,
+    prompts: Vec<String>,
+) -> AppResult<ModelRecord> {
+    let prompts: Vec<String> = prompts
+        .into_iter()
+        .map(|prompt| prompt.trim().to_string())
+        .filter(|prompt| !prompt.is_empty())
+        .collect();
+
+    // Sync first to resolve canonical Registry model/version identifiers.
+    // Activation prompts are version metadata, so persist them on the
+    // Registry version instead of changing only the local SQLite projection.
+    let current = sync_local_model_to_registry(app.inner(), id).await?;
+    let (registry_model_id, registry_version_id) = {
+        let c = open_db(&app.app_data)?;
+        c.query_row(
+            "SELECT registry_model_id,registry_version_id FROM models WHERE id=?1",
+            [id],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            )),
+        )?
+    };
+
+    let versions = app.registry.versions(&registry_model_id).await?;
+    let external_version = current.civitai_version_id.map(|value| value.to_string());
+    let selected_version = registry_version_id
+        .as_deref()
+        .and_then(|version_id| versions.iter().find(|version| version.id == version_id))
+        .or_else(|| {
+            external_version.as_deref().and_then(|external| {
+                versions.iter().find(|version| {
+                    version.source_version_id.as_deref() == Some(external)
+                })
+            })
+        })
+        .or_else(|| versions.first())
+        .cloned();
+
+    let version_id = if let Some(version) = selected_version {
+        if version.activation_prompts != prompts {
+            app.registry
+                .update_version(
+                    &registry_model_id,
+                    &version.id,
+                    version.revision,
+                    json!({ "activation_prompts": prompts.clone() }),
+                )
+                .await?;
+        }
+        version.id
+    } else {
+        app.registry
+            .create_version(
+                &registry_model_id,
+                json!({
+                    "version_name": current.version_name,
+                    "base_model": current.base_model,
+                    "activation_prompts": prompts,
+                    "metadata": {}
+                }),
+            )
+            .await?
+            .id
+    };
+
+    let record = hydrate_local_model_from_registry(
+        app.inner(),
+        id,
+        &registry_model_id,
+        Some(&version_id),
+    )
+    .await?;
+    emit_models_changed(&handle);
+    Ok(record)
+}
+
 pub(crate) fn add_subfolder_tags_inner(app: &AppStateInner) -> AppResult<Vec<i64>> {
     let c = open_db(&app.app_data)?;
     let rows: Vec<(i64, String, String)> = {
