@@ -4641,7 +4641,7 @@ mod tests {
         scan_root(&state, &root).unwrap();
 
         let updated = add_subfolder_tags_inner(&state).unwrap();
-        assert_eq!(updated, 2);
+        assert_eq!(updated.len(), 2);
 
         let db = open_db(&app_data).unwrap();
         let checkpoints_tags: String = db
